@@ -1,38 +1,94 @@
 // SPDX-FileCopyrightText: 2026 Swift Raccoon
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! DPLUS network activity survey via the NJ6N DPLUSMON feed.
+//! Bounded HTTP activity polling and an append-only survey archive.
 //!
-//! DPLUSMON (`nj6n.com/dplusmon`) republishes every transmission on
-//! the DPLUS (REF reflector) network as a rolling ~30-row last-heard
-//! table. Polling that one volunteer-run endpoint is the gentlest way
-//! to measure per-reflector voice activity: no reflector is probed,
-//! no client slot consumed. The feed is a sliding window, so history
-//! evaporates unless archived: every fetch is stored verbatim, parsed
-//! events append to a deduplicated JSONL log, and every poll writes a
-//! provenance record (including a gap-risk flag when the window may
-//! have overflowed between polls).
+//! Responses are published before parsing. Event identity is committed only
+//! after its JSON line is flushed. Poll starts are separated by at least
+//! 30 seconds, including cancelled or failed attempts. The feed is an observed
+//! window, so the archive and ranking describe received rows rather than a
+//! complete network census.
 
-use std::collections::HashSet;
-use std::io::Write as _;
+use std::collections::{HashMap, HashSet};
+use std::fs::{File, OpenOptions};
+use std::io::{self, BufRead as _, Read as _, Seek as _, Write as _};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use dstar_gateway_core::RoutingCallsign;
 use serde::{Deserialize, Serialize};
+
+use crate::http::HttpResponse;
+use crate::writer::{WriteError, WriteOperation};
 
 /// The DPLUSMON query endpoint (unfiltered: all gateways).
 const FEED_URL: &str = "https://nj6n.com/dplusmon/query-dplusdb.php?mycall=&gateway=";
 
-/// Identify ourselves honestly: tool, version, operator contact.
-const USER_AGENT: &str = concat!(
-    "stargazer-survey/",
-    env!("CARGO_PKG_VERSION"),
-    " (amateur radio activity research)"
-);
-
-/// Minimum allowed poll interval. The feed's own web UI polls every
-/// 15 s per viewer; the poller never goes below twice that.
+/// Minimum number of seconds between poll starts, an application service policy.
 pub const MIN_INTERVAL_SECS: u64 = 30;
+
+/// Positive resource limits for network responses, archived lines and identities.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SurveyLimits {
+    max_seen: NonZeroUsize,
+    response_bytes: NonZeroUsize,
+    line_bytes: NonZeroUsize,
+}
+
+impl SurveyLimits {
+    /// Bound retained identities; default response and JSON-line bounds are 1 MiB.
+    #[must_use]
+    pub const fn new(max_seen: NonZeroUsize) -> Self {
+        Self {
+            max_seen,
+            response_bytes: const { NonZeroUsize::new(1_048_576).unwrap() },
+            line_bytes: const { NonZeroUsize::new(1_048_576).unwrap() },
+        }
+    }
+
+    /// Set the maximum bytes accepted in one complete HTTP response.
+    #[must_use]
+    pub const fn with_response_bytes(mut self, maximum: NonZeroUsize) -> Self {
+        self.response_bytes = maximum;
+        self
+    }
+
+    /// Set the maximum JSON bytes per archive line, excluding its newline.
+    #[must_use]
+    pub const fn with_line_bytes(mut self, maximum: NonZeroUsize) -> Self {
+        self.line_bytes = maximum;
+        self
+    }
+
+    /// Return the maximum distinct archived identities retained in memory.
+    #[must_use]
+    pub const fn max_seen(self) -> NonZeroUsize {
+        self.max_seen
+    }
+
+    /// Return the maximum response body size.
+    #[must_use]
+    pub const fn response_bytes(self) -> NonZeroUsize {
+        self.response_bytes
+    }
+
+    /// Return the maximum JSON bytes per line.
+    #[must_use]
+    pub const fn line_bytes(self) -> NonZeroUsize {
+        self.line_bytes
+    }
+}
+
+/// Event identity independent of poll time, with unambiguous field boundaries.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ActivityKey {
+    timestamp: DateTime<Utc>,
+    gateway: String,
+    mycall: String,
+    rpt1: String,
+}
 
 /// One transmission event parsed from the feed.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -60,14 +116,19 @@ pub struct ActivityEvent {
 impl ActivityEvent {
     /// Stable dedupe key across polls.
     #[must_use]
-    pub fn key(&self) -> String {
-        format!(
-            "{}|{}|{}|{}",
-            self.ts.timestamp(),
-            self.gateway,
-            self.mycall,
-            self.rpt1
-        )
+    pub fn key(&self) -> ActivityKey {
+        ActivityKey::from(self)
+    }
+}
+
+impl From<&ActivityEvent> for ActivityKey {
+    fn from(event: &ActivityEvent) -> Self {
+        Self {
+            timestamp: event.ts,
+            gateway: event.gateway.clone(),
+            mycall: event.mycall.clone(),
+            rpt1: event.rpt1.clone(),
+        }
     }
 }
 
@@ -95,7 +156,35 @@ pub struct PollRecord {
     /// newest row); rows may have been missed.
     pub gap_risk: bool,
     /// Fetch/parse error, if the poll failed.
-    pub error: Option<String>,
+    error: Option<String>,
+    /// Live typed fetch/status failure; historical JSON retains the error text.
+    #[serde(skip)]
+    failure: Option<std::sync::Arc<PollFailure>>,
+}
+
+impl PollRecord {
+    /// Return the persisted failure description, if any.
+    #[must_use]
+    pub fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+
+    /// Return the typed failure for a poll performed by this process.
+    #[must_use]
+    pub fn failure(&self) -> Option<&PollFailure> {
+        self.failure.as_deref()
+    }
+}
+
+/// A network failure retained alongside the poll's serializable description.
+#[derive(Debug, thiserror::Error)]
+pub enum PollFailure {
+    /// Request, response-size or allocation failure.
+    #[error("fetch: {0}")]
+    Fetch(#[source] crate::FetchError),
+    /// A complete response had a non-success status.
+    #[error("HTTP status {0}")]
+    HttpStatus(reqwest::StatusCode),
 }
 
 /// Strip HTML tags and decode the entities the feed uses.
@@ -165,7 +254,7 @@ fn split_reflector(cell: &str) -> (Option<String>, Option<char>) {
 }
 
 /// Result of parsing one feed response.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedFeed {
     /// Recognized events, newest first (feed order).
     pub events: Vec<ActivityEvent>,
@@ -173,41 +262,43 @@ pub struct ParsedFeed {
     pub parse_skips: usize,
 }
 
-/// Parse the DPLUSMON HTML table into events.
-#[must_use]
-pub fn parse_feed(html: &str, polled_at: DateTime<Utc>) -> ParsedFeed {
-    let mut events = Vec::new();
-    let mut parse_skips = 0usize;
-    for row in html.split("<tr>").skip(1) {
-        let cells = row_cells(row);
-        if cells.is_empty() {
-            continue; // header row uses <th>, not <td>
+impl ParsedFeed {
+    /// Parse the recognized DPLUSMON table grammar into events and skip counts.
+    #[must_use]
+    pub fn from_html(html: &str, polled_at: DateTime<Utc>) -> Self {
+        let mut events = Vec::new();
+        let mut parse_skips = 0usize;
+        for row in html.split("<tr>").skip(1) {
+            let cells = row_cells(row);
+            if cells.is_empty() {
+                continue; // header row uses <th>, not <td>
+            }
+            if cells.len() != 7 {
+                parse_skips += 1;
+                continue;
+            }
+            let Some(ts) = parse_feed_ts(cells.first().map_or("", String::as_str)) else {
+                parse_skips += 1;
+                continue;
+            };
+            let cell = |i: usize| cells.get(i).cloned().unwrap_or_default();
+            let (reflector, module) = split_reflector(&cell(4));
+            events.push(ActivityEvent {
+                ts,
+                gateway: cell(1),
+                mycall: cell(2),
+                urcall: cell(3),
+                reflector,
+                module,
+                rpt1: cell(5),
+                rpt2: cell(6),
+                polled_at,
+            });
         }
-        if cells.len() != 7 {
-            parse_skips += 1;
-            continue;
+        Self {
+            events,
+            parse_skips,
         }
-        let Some(ts) = parse_feed_ts(cells.first().map_or("", String::as_str)) else {
-            parse_skips += 1;
-            continue;
-        };
-        let cell = |i: usize| cells.get(i).cloned().unwrap_or_default();
-        let (reflector, module) = split_reflector(&cell(4));
-        events.push(ActivityEvent {
-            ts,
-            gateway: cell(1),
-            mycall: cell(2),
-            urcall: cell(3),
-            reflector,
-            module,
-            rpt1: cell(5),
-            rpt2: cell(6),
-            polled_at,
-        });
-    }
-    ParsedFeed {
-        events,
-        parse_skips,
     }
 }
 
@@ -247,92 +338,429 @@ impl Archive {
             .join(format!("{}.html", polled_at.format("%Y%m%dT%H%M%SZ")))
     }
 
-    /// Store one raw response verbatim (archive-first: this happens
-    /// before parsing so a parser bug can never lose data).
+    /// Publish response bytes before parsing, without replacing an earlier file.
     ///
     /// # Errors
     ///
-    /// I/O errors creating the date directory or writing the file.
-    pub fn store_raw(&self, polled_at: DateTime<Utc>, body: &[u8]) -> std::io::Result<PathBuf> {
-        let path = self.raw_path(polled_at);
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
+    /// Returns publication errors or [`ArchiveError::NameExhausted`] after 1000
+    /// occupied variants. File bytes are flushed before publication; containing
+    /// directories are synced on Unix. Other platforms omit directory syncing.
+    pub fn store_raw(
+        &self,
+        polled_at: DateTime<Utc>,
+        body: &[u8],
+    ) -> Result<PathBuf, ArchiveError> {
+        let nominal = self.raw_path(polled_at);
+        crate::writer::create_directories(
+            nominal.parent().unwrap_or_else(|| Path::new(".")),
+            &mut |_, _| Ok(()),
+        )?;
+        for variant in 0..1000 {
+            let path = if variant == 0 {
+                nominal.clone()
+            } else {
+                nominal.with_file_name(format!(
+                    "{}-{variant}.html",
+                    polled_at.format("%Y%m%dT%H%M%SZ")
+                ))
+            };
+            match crate::writer::publish_bytes(&path, body, &mut |_, _| Ok(())) {
+                Ok(()) => return Ok(path),
+                Err(WriteError::Io {
+                    source,
+                    operation: WriteOperation::CreateTemporary | WriteOperation::Publish,
+                    ..
+                }) if source.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(ArchiveError::Publication(error)),
+            }
         }
-        std::fs::write(&path, body)?;
-        Ok(path)
+        Err(ArchiveError::NameExhausted(nominal))
     }
 
-    /// Append one JSON line to a log file.
-    ///
-    /// # Errors
-    ///
-    /// I/O errors opening or writing the log.
-    fn append_line(path: &Path, line: &str) -> std::io::Result<()> {
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
+    fn append_line(
+        path: &Path,
+        value: &impl Serialize,
+        maximum: NonZeroUsize,
+    ) -> Result<(), ArchiveError> {
+        let mut line = BoundedLine {
+            bytes: Vec::new(),
+            maximum,
+            exceeded: false,
+        };
+        if let Err(source) = serde_json::to_writer(&mut line, value) {
+            return Err(if line.exceeded {
+                ArchiveError::LineTooLong {
+                    path: path.to_owned(),
+                    maximum,
+                }
+            } else {
+                ArchiveError::Serialize {
+                    path: path.to_owned(),
+                    source,
+                }
+            });
         }
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
-        writeln!(f, "{line}")
+        append_bytes(path, &line.bytes, io::Write::write_all)
     }
 
-    /// Append events to the activity log.
+    /// Append and flush one complete event, bounded by `maximum` JSON bytes.
     ///
     /// # Errors
     ///
-    /// Serialization or I/O errors.
-    pub fn append_events(&self, events: &[ActivityEvent]) -> Result<(), SurveyError> {
-        for ev in events {
-            Self::append_line(&self.activity_path(), &serde_json::to_string(ev)?)?;
-        }
-        Ok(())
+    /// Returns serialization, lock or I/O failures. Failed writes are truncated
+    /// back to the original length and synced. A rollback failure is returned
+    /// with both errors; the next append rejects an unterminated tail.
+    pub fn append_event(
+        &self,
+        event: &ActivityEvent,
+        maximum: NonZeroUsize,
+    ) -> Result<(), ArchiveError> {
+        Self::append_line(&self.activity_path(), event, maximum)
     }
 
     /// Append one poll provenance record.
     ///
     /// # Errors
     ///
-    /// Serialization or I/O errors.
-    pub fn append_poll(&self, poll: &PollRecord) -> Result<(), SurveyError> {
-        Ok(Self::append_line(
-            &self.polls_path(),
-            &serde_json::to_string(poll)?,
-        )?)
+    /// Returns the same bounded, locked append failures as [`Self::append_event`].
+    pub fn append_poll(
+        &self,
+        poll: &PollRecord,
+        maximum: NonZeroUsize,
+    ) -> Result<(), ArchiveError> {
+        Self::append_line(&self.polls_path(), poll, maximum)
     }
 
-    /// Load every previously archived event (used to seed dedupe on
-    /// startup and by the report).
+    /// Stream an activity-log snapshot with at most `maximum` JSON bytes per line.
     ///
     /// # Errors
     ///
-    /// I/O errors reading the log. Unparseable lines are skipped.
-    pub fn load_events(&self) -> std::io::Result<Vec<ActivityEvent>> {
+    /// Returns opening, locking or metadata errors. Each iterator item reports
+    /// malformed, oversized or unterminated lines with its path and line number.
+    /// A missing log produces an empty iterator. Appends after snapshot creation
+    /// are excluded. The shared lock is held only while selecting the file length.
+    pub fn events(&self, maximum: NonZeroUsize) -> Result<EventLines, ArchiveError> {
         let path = self.activity_path();
-        if !path.exists() {
-            return Ok(Vec::new());
-        }
-        let text = std::fs::read_to_string(path)?;
-        Ok(text
-            .lines()
-            .filter_map(|l| serde_json::from_str(l).ok())
-            .collect())
+        let reader = match File::open(&path) {
+            Ok(file) => {
+                file.try_lock_shared()
+                    .map_err(|source| ArchiveError::Lock {
+                        path: path.clone(),
+                        source,
+                    })?;
+                let length = file.metadata().map_err(archive_io(&path))?.len();
+                file.unlock().map_err(archive_io(&path))?;
+                Some(io::BufReader::new(file.take(length)))
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(source) => return Err(ArchiveError::Io { path, source }),
+        };
+        Ok(EventLines {
+            path,
+            reader,
+            maximum,
+            line: 0,
+            finished: false,
+        })
     }
 }
+
+/// Archive operation failure; lock contention returns immediately.
+#[derive(Debug, thiserror::Error)]
+pub enum ArchiveError {
+    /// Filesystem operation failed at the named path.
+    #[error("archive {path}: {source}")]
+    Io {
+        /// Archive path.
+        path: PathBuf,
+        /// Underlying filesystem error.
+        #[source]
+        source: io::Error,
+    },
+    /// Another reader or writer holds an incompatible file lock.
+    #[error("archive lock {path}: {source}")]
+    Lock {
+        /// Archive path.
+        path: PathBuf,
+        /// Lock acquisition error.
+        #[source]
+        source: std::fs::TryLockError,
+    },
+    /// A value could not be encoded within the selected line bound.
+    #[error("serialize archive {path}: {source}")]
+    Serialize {
+        /// Archive path.
+        path: PathBuf,
+        /// Serializer or bounded-writer error.
+        #[source]
+        source: serde_json::Error,
+    },
+    /// Serialized JSON would exceed the selected line bound.
+    #[error("archive {path} exceeds {maximum} JSON bytes per line")]
+    LineTooLong {
+        /// Archive path.
+        path: PathBuf,
+        /// Selected maximum.
+        maximum: NonZeroUsize,
+    },
+    /// Existing data ends without the newline required by an append transaction.
+    #[error("archive {0} has an unterminated final line")]
+    Unterminated(PathBuf),
+    /// Failed append could not be rolled back to its starting length.
+    #[error("archive {path}: append failed ({write}); rollback failed ({rollback})")]
+    Rollback {
+        /// Archive path.
+        path: PathBuf,
+        /// Initial write or sync failure.
+        #[source]
+        write: io::Error,
+        /// Truncate or rollback-sync failure.
+        rollback: io::Error,
+    },
+    /// Raw snapshot publication failed.
+    #[error(transparent)]
+    Publication(#[from] WriteError),
+    /// All 1000 raw-snapshot filename variants were occupied.
+    #[error("raw snapshot names exhausted for {0}")]
+    NameExhausted(PathBuf),
+}
+
+fn archive_io(path: &Path) -> impl FnOnce(io::Error) -> ArchiveError + '_ {
+    |source| ArchiveError::Io {
+        path: path.to_owned(),
+        source,
+    }
+}
+
+struct BoundedLine {
+    bytes: Vec<u8>,
+    maximum: NonZeroUsize,
+    exceeded: bool,
+}
+
+impl io::Write for BoundedLine {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if self
+            .bytes
+            .len()
+            .checked_add(bytes.len())
+            .is_none_or(|len| len > self.maximum.get())
+        {
+            self.exceeded = true;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "JSON line exceeds selected byte limit",
+            ));
+        }
+        self.bytes
+            .try_reserve(bytes.len())
+            .map_err(io::Error::other)?;
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn append_bytes(
+    path: &Path,
+    bytes: &[u8],
+    mut write: impl FnMut(&mut File, &[u8]) -> io::Result<()>,
+) -> Result<(), ArchiveError> {
+    let directory = path.parent().unwrap_or_else(|| Path::new("."));
+    crate::writer::create_directories(directory, &mut |_, _| Ok(()))?;
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .map_err(archive_io(path))?;
+    file.try_lock().map_err(|source| ArchiveError::Lock {
+        path: path.to_owned(),
+        source,
+    })?;
+    #[cfg(unix)]
+    crate::writer::sync_directory(directory, WriteOperation::SyncDirectory, &mut |_, _| Ok(()))?;
+    let original = file.seek(io::SeekFrom::End(0)).map_err(archive_io(path))?;
+    if original != 0 {
+        let _position = file.seek(io::SeekFrom::End(-1)).map_err(archive_io(path))?;
+        let mut tail = [0];
+        file.read_exact(&mut tail).map_err(archive_io(path))?;
+        if tail != [b'\n'] {
+            return Err(ArchiveError::Unterminated(path.to_owned()));
+        }
+    }
+    let result = write(&mut file, bytes)
+        .and_then(|()| file.write_all(b"\n"))
+        .and_then(|()| file.sync_all());
+    if let Err(write) = result {
+        if let Err(rollback) = file.set_len(original).and_then(|()| file.sync_all()) {
+            return Err(ArchiveError::Rollback {
+                path: path.to_owned(),
+                write,
+                rollback,
+            });
+        }
+        return Err(ArchiveError::Io {
+            path: path.to_owned(),
+            source: write,
+        });
+    }
+    Ok(())
+}
+
+/// A malformed or unreadable activity-log line.
+#[derive(Debug, thiserror::Error)]
+#[error("activity log {path}, line {line}: {reason}")]
+pub struct EventReadError {
+    path: PathBuf,
+    line: u64,
+    #[source]
+    reason: EventReadReason,
+}
+
+impl EventReadError {
+    /// Return the archive path.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+    /// Return the one-based line number.
+    #[must_use]
+    pub const fn line(&self) -> u64 {
+        self.line
+    }
+    /// Return the structured line failure.
+    #[must_use]
+    pub const fn reason(&self) -> &EventReadReason {
+        &self.reason
+    }
+}
+
+/// Activity-log line failure category.
+#[derive(Debug, thiserror::Error)]
+pub enum EventReadReason {
+    /// Filesystem read failed.
+    #[error("read: {0}")]
+    Io(#[source] io::Error),
+    /// Reserving the bounded line buffer failed.
+    #[error("allocation: {0}")]
+    Allocation(#[source] std::collections::TryReserveError),
+    /// JSON could not be decoded as an event.
+    #[error("JSON: {0}")]
+    Json(#[source] serde_json::Error),
+    /// The line exceeded its selected JSON byte bound.
+    #[error("line exceeds {maximum} JSON bytes")]
+    TooLong {
+        /// Selected maximum.
+        maximum: NonZeroUsize,
+    },
+    /// The file snapshot ended before the committing newline.
+    #[error("unterminated final line")]
+    Unterminated,
+}
+
+/// A bounded, fallible activity-log snapshot iterator.
+#[derive(Debug)]
+pub struct EventLines {
+    path: PathBuf,
+    reader: Option<io::BufReader<io::Take<File>>>,
+    maximum: NonZeroUsize,
+    line: u64,
+    finished: bool,
+}
+
+impl Iterator for EventLines {
+    type Item = Result<ActivityEvent, EventReadError>;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.finished {
+            return None;
+        }
+        let reader = self.reader.as_mut()?;
+        let mut bytes = Vec::new();
+        let result = loop {
+            let available = match reader.fill_buf() {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    self.finished = true;
+                    break Err(EventReadReason::Io(error));
+                }
+            };
+            if available.is_empty() {
+                self.finished = true;
+                if bytes.is_empty() {
+                    return None;
+                }
+                break Err(EventReadReason::Unterminated);
+            }
+            let newline = available.iter().position(|byte| *byte == b'\n');
+            let count = newline.unwrap_or(available.len());
+            if bytes
+                .len()
+                .checked_add(count)
+                .is_none_or(|len| len > self.maximum.get())
+            {
+                self.finished = true;
+                break Err(EventReadReason::TooLong {
+                    maximum: self.maximum,
+                });
+            }
+            if let Err(error) = bytes.try_reserve(count) {
+                self.finished = true;
+                break Err(EventReadReason::Allocation(error));
+            }
+            bytes.extend_from_slice(available.get(..count).unwrap_or_default());
+            reader.consume(count + usize::from(newline.is_some()));
+            if newline.is_some() {
+                break serde_json::from_slice(&bytes).map_err(EventReadReason::Json);
+            }
+        };
+        self.line = self.line.saturating_add(1);
+        Some(result.map_err(|reason| EventReadError {
+            path: self.path.clone(),
+            line: self.line,
+            reason,
+        }))
+    }
+}
+
+impl std::iter::FusedIterator for EventLines {}
 
 /// Survey failures.
 #[derive(Debug, thiserror::Error)]
 pub enum SurveyError {
-    /// HTTP fetch failed.
-    #[error("fetch: {0}")]
-    Fetch(#[from] reqwest::Error),
-    /// Archive I/O failed.
-    #[error("archive io: {0}")]
-    Io(#[from] std::io::Error),
-    /// JSON encoding failed (unexpected).
-    #[error("serialize: {0}")]
-    Serialize(#[from] serde_json::Error),
+    /// HTTP client configuration failed.
+    #[error("HTTP client: {0}")]
+    Client(#[source] reqwest::Error),
+    /// The configured service endpoint could not be parsed.
+    #[error("survey endpoint: {0}")]
+    Endpoint(#[source] <reqwest::Url as std::str::FromStr>::Err),
+    /// Archive publication or append failed.
+    #[error(transparent)]
+    Archive(#[from] ArchiveError),
+    /// An existing activity-log line is invalid.
+    #[error(transparent)]
+    Event(#[from] EventReadError),
+    /// The selected identity bound would be exceeded.
+    #[error("survey identity limit reached ({maximum})")]
+    SeenLimit {
+        /// Selected maximum retained identities.
+        maximum: NonZeroUsize,
+    },
+    /// A poll was attempted before the 30-second service interval elapsed.
+    #[error("poll interval has {retry_after:?} remaining")]
+    TooSoon {
+        /// Time remaining before another poll may start.
+        retry_after: Duration,
+    },
+    /// The next monotonic poll deadline cannot be represented.
+    #[error("poll deadline cannot be represented")]
+    Deadline,
+    /// Reserving deduplication storage failed.
+    #[error("identity allocation: {0}")]
+    Allocation(#[source] std::collections::TryReserveError),
 }
 
 /// Stateful poller: fetches the feed, archives raw + events + poll
@@ -341,8 +769,11 @@ pub enum SurveyError {
 pub struct Surveyor {
     client: reqwest::Client,
     archive: Archive,
-    seen: HashSet<String>,
+    seen: HashSet<ActivityKey>,
     last_newest: Option<DateTime<Utc>>,
+    limits: SurveyLimits,
+    next_poll: Option<tokio::time::Instant>,
+    endpoint: reqwest::Url,
 }
 
 impl Surveyor {
@@ -351,27 +782,41 @@ impl Surveyor {
     ///
     /// # Errors
     ///
-    /// I/O errors reading the existing archive or building the HTTP
-    /// client.
-    pub fn new(base: &Path) -> Result<Self, SurveyError> {
+    /// Returns client configuration, archive-line, allocation or identity-limit
+    /// errors. Every archived event is read through a bounded line iterator.
+    pub fn new(
+        base: &Path,
+        limits: SurveyLimits,
+        operator: RoutingCallsign,
+    ) -> Result<Self, SurveyError> {
         let archive = Archive::new(base);
         let mut seen = HashSet::new();
         let mut last_newest = None;
-        for ev in archive.load_events()? {
+        for ev in archive.events(limits.line_bytes)? {
+            let ev = ev?;
             if last_newest.is_none_or(|n| ev.ts > n) {
                 last_newest = Some(ev.ts);
             }
-            let _unused = seen.insert(ev.key());
+            let key = ev.key();
+            if !seen.contains(&key) {
+                reserve_identity(&mut seen, limits.max_seen)?;
+                let _inserted = seen.insert(key);
+            }
         }
-        let client = reqwest::Client::builder()
-            .user_agent(USER_AGENT)
-            .timeout(std::time::Duration::from_secs(15))
-            .build()?;
+        let agent = format!(
+            "stargazer-survey/{} (operator {operator})",
+            env!("CARGO_PKG_VERSION")
+        );
+        let client =
+            crate::http::client(&agent, Duration::from_secs(15)).map_err(SurveyError::Client)?;
         Ok(Self {
             client,
             archive,
             seen,
             last_newest,
+            limits,
+            next_poll: None,
+            endpoint: FEED_URL.parse().map_err(SurveyError::Endpoint)?,
         })
     }
 
@@ -386,11 +831,13 @@ impl Surveyor {
     ///
     /// # Errors
     ///
-    /// Archive I/O errors are fatal (the archive is the point).
-    /// Fetch errors are NOT returned as `Err`; they are recorded in
-    /// the poll log and reflected in the returned record, so the
-    /// caller can back off without losing provenance.
+    /// Returns [`SurveyError::TooSoon`] within 30 seconds of a previous start,
+    /// or archive/resource failures. Network failures are returned in the poll
+    /// record, with a typed live source and persisted text. Cancellation retains
+    /// the poll deadline and any events already flushed; cancelled downloads
+    /// may lack a poll record. Local archive operations are synchronous.
     pub async fn poll_once(&mut self) -> Result<PollRecord, SurveyError> {
+        self.reserve_poll(tokio::time::Instant::now())?;
         let polled_at = Utc::now();
         let mut record = PollRecord {
             polled_at,
@@ -403,19 +850,21 @@ impl Surveyor {
             window_newest: None,
             gap_risk: false,
             error: None,
+            failure: None,
         };
 
         match self.fetch().await {
             Err(e) => {
                 record.error = Some(e.to_string());
+                record.failure = Some(std::sync::Arc::new(PollFailure::Fetch(e)));
             }
-            Ok((status, body)) => {
-                record.http_status = Some(status);
+            Ok(HttpResponse { status, body }) => {
+                record.http_status = Some(status.as_u16());
                 record.bytes = body.len();
                 // Archive-first: raw bytes land before parsing.
                 let _raw_path = self.archive.store_raw(polled_at, &body)?;
-                if status == 200 {
-                    let parsed = parse_feed(&String::from_utf8_lossy(&body), polled_at);
+                if status.is_success() {
+                    let parsed = ParsedFeed::from_html(&String::from_utf8_lossy(&body), polled_at);
                     record.rows = parsed.events.len();
                     record.parse_skips = parsed.parse_skips;
                     record.window_oldest = parsed.events.iter().map(|e| e.ts).min();
@@ -426,13 +875,7 @@ impl Surveyor {
                         !parsed.events.is_empty() && parsed.events.iter().all(|e| e.ts > prev)
                     });
 
-                    let fresh: Vec<ActivityEvent> = parsed
-                        .events
-                        .into_iter()
-                        .filter(|e| self.seen.insert(e.key()))
-                        .collect();
-                    record.new_events = fresh.len();
-                    self.archive.append_events(&fresh)?;
+                    record.new_events = self.commit_events(&parsed.events)?;
                     if let Some(newest) = record.window_newest
                         && self.last_newest.is_none_or(|n| newest > n)
                     {
@@ -440,20 +883,67 @@ impl Surveyor {
                     }
                 } else {
                     record.error = Some(format!("http status {status}"));
+                    record.failure = Some(std::sync::Arc::new(PollFailure::HttpStatus(status)));
                 }
             }
         }
 
-        self.archive.append_poll(&record)?;
+        self.archive.append_poll(&record, self.limits.line_bytes)?;
         Ok(record)
     }
 
-    async fn fetch(&self) -> Result<(u16, Vec<u8>), reqwest::Error> {
-        let resp = self.client.get(FEED_URL).send().await?;
-        let status = resp.status().as_u16();
-        let body = resp.bytes().await?;
-        Ok((status, body.to_vec()))
+    fn reserve_poll(&mut self, now: tokio::time::Instant) -> Result<(), SurveyError> {
+        if let Some(deadline) = self.next_poll
+            && now < deadline
+        {
+            return Err(SurveyError::TooSoon {
+                retry_after: deadline - now,
+            });
+        }
+        self.next_poll = Some(
+            now.checked_add(Duration::from_secs(MIN_INTERVAL_SECS))
+                .ok_or(SurveyError::Deadline)?,
+        );
+        Ok(())
     }
+
+    fn commit_events(&mut self, events: &[ActivityEvent]) -> Result<usize, SurveyError> {
+        let mut committed = 0;
+        for event in events {
+            let key = event.key();
+            if self.seen.contains(&key) {
+                continue;
+            }
+            reserve_identity(&mut self.seen, self.limits.max_seen)?;
+            self.archive.append_event(event, self.limits.line_bytes)?;
+            let _inserted = self.seen.insert(key);
+            self.last_newest = Some(
+                self.last_newest
+                    .map_or(event.ts, |previous| previous.max(event.ts)),
+            );
+            committed += 1;
+        }
+        Ok(committed)
+    }
+
+    async fn fetch(&self) -> Result<HttpResponse, crate::FetchError> {
+        crate::http::fetch(
+            &self.client,
+            self.endpoint.clone(),
+            self.limits.response_bytes,
+        )
+        .await
+    }
+}
+
+fn reserve_identity(
+    seen: &mut HashSet<ActivityKey>,
+    maximum: NonZeroUsize,
+) -> Result<(), SurveyError> {
+    if seen.len() >= maximum.get() {
+        return Err(SurveyError::SeenLimit { maximum });
+    }
+    seen.try_reserve(1).map_err(SurveyError::Allocation)
 }
 
 /// One row of the activity ranking.
@@ -472,58 +962,91 @@ pub struct ReflectorActivity {
 }
 
 /// Per-module accumulator used while ranking.
+#[derive(Debug)]
 struct Tally {
     transmissions: usize,
     callsigns: HashSet<String>,
     last_heard: DateTime<Utc>,
 }
 
-/// Rank reflector modules by observed transmissions since `since`.
-#[must_use]
-pub fn rank_activity(events: &[ActivityEvent], since: DateTime<Utc>) -> Vec<ReflectorActivity> {
-    use std::collections::HashMap;
-    let mut per: HashMap<(String, char), Tally> = HashMap::new();
-    for ev in events {
-        if ev.ts < since {
-            continue;
+/// Incremental ranking accumulator; retains grouped counters and unique callsigns.
+#[derive(Debug)]
+pub struct ActivityRanking {
+    since: DateTime<Utc>,
+    per: HashMap<(String, char), Tally>,
+}
+
+impl ActivityRanking {
+    /// Select the inclusive UTC beginning of the ranking window.
+    #[must_use]
+    pub fn new(since: DateTime<Utc>) -> Self {
+        Self {
+            since,
+            per: HashMap::new(),
         }
-        let (Some(reflector), Some(module)) = (ev.reflector.clone(), ev.module) else {
-            continue;
+    }
+
+    /// Accumulate one event; rows lacking a reflector/module are excluded.
+    pub fn observe(&mut self, event: &ActivityEvent) {
+        if event.ts < self.since {
+            return;
+        }
+        let (Some(reflector), Some(module)) = (event.reflector.as_ref(), event.module) else {
+            return;
         };
-        let callsign = ev
+        let callsign = event
             .mycall
             .split_whitespace()
             .next()
             .unwrap_or_default()
-            .to_string();
-        let entry = per.entry((reflector, module)).or_insert_with(|| Tally {
-            transmissions: 0,
-            callsigns: HashSet::new(),
-            last_heard: ev.ts,
-        });
-        entry.transmissions += 1;
-        let _unused = entry.callsigns.insert(callsign);
-        if ev.ts > entry.last_heard {
-            entry.last_heard = ev.ts;
-        }
+            .to_owned();
+        let tally = self
+            .per
+            .entry((reflector.clone(), module))
+            .or_insert_with(|| Tally {
+                transmissions: 0,
+                callsigns: HashSet::new(),
+                last_heard: event.ts,
+            });
+        tally.transmissions = tally.transmissions.saturating_add(1);
+        let _inserted = tally.callsigns.insert(callsign);
+        tally.last_heard = tally.last_heard.max(event.ts);
     }
-    let mut rows: Vec<ReflectorActivity> = per
-        .into_iter()
-        .map(|((reflector, module), tally)| ReflectorActivity {
-            reflector,
-            module,
-            transmissions: tally.transmissions,
-            distinct_callsigns: tally.callsigns.len(),
-            last_heard: tally.last_heard,
-        })
-        .collect();
-    rows.sort_by(|a, b| {
-        b.transmissions
-            .cmp(&a.transmissions)
-            .then_with(|| a.reflector.cmp(&b.reflector))
-            .then_with(|| a.module.cmp(&b.module))
-    });
-    rows
+
+    /// Return descending transmission counts, breaking ties by name and module.
+    ///
+    /// A count saturates at `usize::MAX`; unique-call storage grows with the input.
+    #[must_use]
+    pub fn into_rows(self) -> Vec<ReflectorActivity> {
+        let mut rows: Vec<_> = self
+            .per
+            .into_iter()
+            .map(|((reflector, module), tally)| ReflectorActivity {
+                reflector,
+                module,
+                transmissions: tally.transmissions,
+                distinct_callsigns: tally.callsigns.len(),
+                last_heard: tally.last_heard,
+            })
+            .collect();
+        rows.sort_by(|a, b| {
+            b.transmissions
+                .cmp(&a.transmissions)
+                .then_with(|| a.reflector.cmp(&b.reflector))
+                .then_with(|| a.module.cmp(&b.module))
+        });
+        rows
+    }
+}
+
+/// Rank reflector modules by observed transmissions since `since`.
+#[must_use]
+pub fn rank_activity(events: &[ActivityEvent], since: DateTime<Utc>) -> Vec<ReflectorActivity> {
+    let mut ranking = ActivityRanking::new(since);
+    for event in events {
+        ranking.observe(event);
+    }
+    ranking.into_rows()
 }
 
 #[cfg(test)]
@@ -532,9 +1055,7 @@ mod tests {
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-    /// Three real rows sampled from the live feed:
-    /// a reflector transmission, a local-gateway transmission with an
-    /// empty Reflector cell, and a mycall with a note suffix.
+    /// Rows covering reflector routing, a local gateway and a note suffix.
     const FIXTURE: &str = concat!(
         "<table><caption>dplus Last Heard</caption>",
         "<tr><th>Date / Time</th><th>Gateway</th><th>MyCall</th><th>UrCall</th>",
@@ -563,7 +1084,7 @@ mod tests {
 
     #[test]
     fn parses_real_feed_rows() -> TestResult {
-        let parsed = parse_feed(FIXTURE, t0());
+        let parsed = ParsedFeed::from_html(FIXTURE, t0());
         assert_eq!(parsed.events.len(), 3);
         assert_eq!(parsed.parse_skips, 0);
 
@@ -604,19 +1125,19 @@ mod tests {
 
     #[test]
     fn dedupe_key_is_stable_across_polls() {
-        let a = parse_feed(FIXTURE, t0());
-        let b = parse_feed(
+        let a = ParsedFeed::from_html(FIXTURE, t0());
+        let b = ParsedFeed::from_html(
             FIXTURE,
             DateTime::<Utc>::UNIX_EPOCH + chrono::TimeDelta::seconds(60),
         );
-        let ka: Vec<String> = a.events.iter().map(ActivityEvent::key).collect();
-        let kb: Vec<String> = b.events.iter().map(ActivityEvent::key).collect();
+        let ka: Vec<ActivityKey> = a.events.iter().map(ActivityEvent::key).collect();
+        let kb: Vec<ActivityKey> = b.events.iter().map(ActivityEvent::key).collect();
         assert_eq!(ka, kb, "polled_at must not affect identity");
     }
 
     #[test]
     fn ranking_counts_and_sorts() -> TestResult {
-        let parsed = parse_feed(FIXTURE, t0());
+        let parsed = ParsedFeed::from_html(FIXTURE, t0());
         let ranked = rank_activity(&parsed.events, t0());
         // Two reflector rows (REF030 C, REF004 C); local gateway row excluded.
         assert_eq!(ranked.len(), 2);
@@ -630,7 +1151,7 @@ mod tests {
 
     #[test]
     fn ranking_respects_window() {
-        let parsed = parse_feed(FIXTURE, t0());
+        let parsed = ParsedFeed::from_html(FIXTURE, t0());
         let future = DateTime::<Utc>::UNIX_EPOCH + chrono::TimeDelta::days(30_000);
         assert!(rank_activity(&parsed.events, future).is_empty());
     }
@@ -639,9 +1160,12 @@ mod tests {
     fn archive_roundtrip_and_dedupe_seed() -> TestResult {
         let dir = tempfile::tempdir()?;
         let archive = Archive::new(dir.path());
-        let parsed = parse_feed(FIXTURE, t0());
-        archive.append_events(&parsed.events)?;
-        let loaded = archive.load_events()?;
+        let parsed = ParsedFeed::from_html(FIXTURE, t0());
+        let maximum = NonZeroUsize::new(4096).ok_or("maximum")?;
+        for event in &parsed.events {
+            archive.append_event(event, maximum)?;
+        }
+        let loaded = archive.events(maximum)?.collect::<Result<Vec<_>, _>>()?;
         assert_eq!(loaded.len(), 3);
         assert_eq!(loaded, parsed.events);
         Ok(())
@@ -659,5 +1183,191 @@ mod tests {
                 "got {p:?}"
             );
         }
+    }
+
+    const fn limits() -> SurveyLimits {
+        SurveyLimits::new(const { NonZeroUsize::new(100).unwrap() })
+    }
+
+    fn surveyor(base: &Path) -> Result<Surveyor, Box<dyn std::error::Error>> {
+        Ok(Surveyor::new(
+            base,
+            limits(),
+            RoutingCallsign::new("N0CALL")?,
+        )?)
+    }
+
+    #[test]
+    fn event_identity_preserves_boundaries_and_timestamp_precision() -> TestResult {
+        let parsed = ParsedFeed::from_html(FIXTURE, t0());
+        let mut left = parsed.events.first().ok_or("event")?.clone();
+        let mut right = left.clone();
+        left.gateway = "A|B".to_owned();
+        left.mycall = "C".to_owned();
+        right.gateway = "A".to_owned();
+        right.mycall = "B|C".to_owned();
+        assert_ne!(left.key(), right.key());
+        right = left.clone();
+        right.ts += chrono::TimeDelta::nanoseconds(1);
+        assert_ne!(left.key(), right.key());
+        Ok(())
+    }
+
+    #[test]
+    fn failed_append_rolls_back_bytes_and_can_be_retried() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("activity.jsonl");
+        append_bytes(&path, b"first", io::Write::write_all)?;
+        let before = std::fs::read(&path)?;
+        let result = append_bytes(&path, b"second", |file, bytes| {
+            file.write_all(bytes.get(..3).ok_or_else(|| io::Error::other("prefix"))?)?;
+            Err(io::Error::other("injected write failure"))
+        });
+        assert!(matches!(result, Err(ArchiveError::Io { .. })), "{result:?}");
+        assert_eq!(std::fs::read(&path)?, before);
+        append_bytes(&path, b"second", io::Write::write_all)?;
+        assert_eq!(std::fs::read(&path)?, b"first\nsecond\n");
+        Ok(())
+    }
+
+    #[test]
+    fn seen_state_changes_only_after_committed_append_and_deduplicates_batch() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let mut poller = surveyor(directory.path())?;
+        let events = ParsedFeed::from_html(FIXTURE, t0()).events;
+        let event = events.first().ok_or("event")?;
+        std::fs::create_dir_all(poller.archive.activity_path())?;
+        assert!(poller.commit_events(std::slice::from_ref(event)).is_err());
+        assert_eq!(poller.total_seen(), 0);
+        std::fs::remove_dir(poller.archive.activity_path())?;
+        assert_eq!(poller.commit_events(&[event.clone(), event.clone()])?, 1);
+        assert_eq!(poller.total_seen(), 1);
+        assert_eq!(
+            poller
+                .archive
+                .events(limits().line_bytes)?
+                .collect::<Result<Vec<_>, _>>()?,
+            vec![event.clone()]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn archive_lines_report_json_length_tail_and_lock_failures() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let archive = Archive::new(directory.path());
+        let event = ParsedFeed::from_html(FIXTURE, t0())
+            .events
+            .into_iter()
+            .next()
+            .ok_or("event")?;
+        archive.append_event(&event, limits().line_bytes)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(archive.activity_path())?;
+        file.try_lock()?;
+        assert!(matches!(
+            archive.append_event(&event, limits().line_bytes),
+            Err(ArchiveError::Lock { .. })
+        ));
+        file.unlock()?;
+        let mut contents = b"invalid JSON\n".to_vec();
+        contents.extend_from_slice(&serde_json::to_vec(&event)?);
+        contents.push(b'\n');
+        std::fs::write(archive.activity_path(), &contents)?;
+        let mut lines = archive.events(limits().line_bytes)?;
+        let first = lines.next().ok_or("line one")?;
+        assert!(
+            matches!(
+                first,
+                Err(EventReadError {
+                    line: 1,
+                    reason: EventReadReason::Json(_),
+                    ..
+                })
+            ),
+            "{first:?}"
+        );
+        assert_eq!(lines.next().ok_or("line two")??, event);
+        assert!(lines.next().is_none());
+        std::fs::write(archive.activity_path(), serde_json::to_vec(&event)?)?;
+        assert!(matches!(
+            archive.events(limits().line_bytes)?.next(),
+            Some(Err(EventReadError {
+                reason: EventReadReason::Unterminated,
+                ..
+            }))
+        ));
+        assert!(matches!(
+            archive.append_event(&event, limits().line_bytes),
+            Err(ArchiveError::Unterminated(_))
+        ));
+        let tiny = NonZeroUsize::new(2).ok_or("tiny")?;
+        assert!(matches!(
+            archive.events(tiny)?.next(),
+            Some(Err(EventReadError {
+                reason: EventReadReason::TooLong { .. },
+                ..
+            }))
+        ));
+        assert!(matches!(
+            archive.append_event(&event, tiny),
+            Err(ArchiveError::LineTooLong { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn raw_snapshots_never_replace_same_timestamp_and_readers_have_fixed_snapshot() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let archive = Archive::new(directory.path());
+        let first = archive.store_raw(t0(), b"first")?;
+        let second = archive.store_raw(t0(), b"second")?;
+        assert_ne!(first, second);
+        assert_eq!(std::fs::read(first)?, b"first");
+        assert_eq!(std::fs::read(second)?, b"second");
+        let events = ParsedFeed::from_html(FIXTURE, t0()).events;
+        let first = events.first().ok_or("event")?;
+        archive.append_event(first, limits().line_bytes)?;
+        let snapshot = archive.events(limits().line_bytes)?;
+        archive.append_event(events.get(1).ok_or("second event")?, limits().line_bytes)?;
+        assert_eq!(
+            snapshot.collect::<Result<Vec<_>, _>>()?,
+            vec![first.clone()]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn poll_floor_is_committed_before_network_work_and_identity_bound_is_exact() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let mut poller = surveyor(directory.path())?;
+        let start = tokio::time::Instant::now();
+        poller.reserve_poll(start)?;
+        assert!(matches!(
+            poller.reserve_poll(start + Duration::from_secs(29)),
+            Err(SurveyError::TooSoon { .. })
+        ));
+        poller.reserve_poll(start + Duration::from_secs(30))?;
+        poller.limits = SurveyLimits::new(NonZeroUsize::new(2).ok_or("limit")?);
+        let events = ParsedFeed::from_html(FIXTURE, t0()).events;
+        assert!(matches!(
+            poller.commit_events(&events),
+            Err(SurveyError::SeenLimit { .. })
+        ));
+        assert_eq!(poller.total_seen(), 2);
+        assert_eq!(
+            poller
+                .archive
+                .events(limits().line_bytes)?
+                .collect::<Result<Vec<_>, _>>()?
+                .len(),
+            2
+        );
+        poller.limits = limits();
+        assert_eq!(poller.commit_events(&events)?, 1);
+        assert_eq!(poller.total_seen(), 3);
+        Ok(())
     }
 }

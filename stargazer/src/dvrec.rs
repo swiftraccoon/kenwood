@@ -3,17 +3,9 @@
 
 //! Import reflector-published `dvrec` packet logs as recordings.
 //!
-//! The publishing daemon logs every packet of a transmission as one
-//! timestamped text line; the voice lines carry the 9 AMBE bytes and
-//! 3 slow-data bytes as hex, and a header line carries the full
-//! D-STAR routing header. A capture from a local client session of
-//! the same stream is byte-identical (verified against a live
-//! transmission frame for frame), so a transmission never captured
-//! locally (recorder offline, target disabled, or a reflector not
-//! linked) can be reconstructed from its published dvrec into
-//! the same `.ambe`/`.wav`/`.json` recording layout the live
-//! recorder writes, and from there paired with its published
-//! reference MP3 like any other recording.
+//! Recognized log lines retain nine AMBE bytes and three slow-data bytes
+//! per received frame. Import produces the same versioned archive layout
+//! as live capture, with absent live endpoint/peer metadata.
 //!
 //! Line shape (fields colon-separated after the timestamp):
 //!
@@ -23,16 +15,18 @@
 //! <ts>>c2g:20:0002:01:<sid-le>:<seq>:vd :<18 hex ambe>:<6 hex slow>#<descrambled> |ascii|
 //! ```
 //!
-//! The stream id in each line is byte-swapped relative to the id the
-//! publisher uses in filenames. A `vde` line marks end-of-stream;
-//! its payload is not treated as a voice frame.
+//! The parser swaps the two per-line stream-id bytes before filename matching.
+//! A recognized `vde` line marks end-of-stream; its payload is not a voice frame.
 
 use std::path::Path;
 
 use chrono::{DateTime, Utc};
-use dstar_gateway_core::{Callsign, DstarHeader, Module, StreamId, Suffix};
+use dstar_gateway_core::{Callsign, DstarHeader, HeaderFlags, StreamId, Suffix};
 
-use crate::capture::{CompletedRecording, EndReason, FrameRecord, StreamOrigin};
+use crate::capture::{
+    CaptureDurationLimit, CompletedRecording, EndReason, FrameRecord, StreamOrigin,
+};
+use crate::config::TargetKey;
 use crate::writer::Writer;
 
 /// Failures parsing a dvrec file.
@@ -47,27 +41,112 @@ pub enum DvrecError {
     /// The stream id was zero or unparseable.
     #[error("bad stream id")]
     BadStreamId,
+    /// A single log contains more than one nonzero stream identity.
+    #[error("dvrec stream id changed from {expected} to {actual}")]
+    MixedStream {
+        /// Identity from the first recognized line.
+        expected: StreamId,
+        /// Conflicting later identity.
+        actual: StreamId,
+    },
+    /// A routing field exceeds its fixed wire width.
+    #[error("dvrec {field:?} has {actual} bytes; width is {maximum}")]
+    FieldWidth {
+        /// Header field that cannot be represented losslessly.
+        field: HeaderField,
+        /// Supplied byte count.
+        actual: usize,
+        /// Fixed wire width.
+        maximum: usize,
+    },
+    /// A recognized header has malformed hex or missing fields.
+    #[error("malformed dvrec routing header")]
+    Header,
+    /// Voice frames exceed the caller's retained-prefix policy.
+    #[error("dvrec exceeds the configured capture frame limit")]
+    FrameLimit,
+    /// Expected codec frames cannot be represented.
+    #[error("dvrec codec frame count overflows")]
+    FrameCount,
+}
+
+/// Fixed-width routing field in a dvrec header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HeaderField {
+    /// Repeater 2, eight bytes.
+    Rpt2,
+    /// Repeater 1, eight bytes.
+    Rpt1,
+    /// Destination, eight bytes.
+    Ur,
+    /// Source, eight bytes.
+    My,
+    /// Source suffix, four bytes.
+    Suffix,
 }
 
 /// A parsed dvrec transmission.
 #[derive(Debug)]
 pub struct ParsedDvrec {
     /// Routing header from the `hdr` line.
-    pub header: DstarHeader,
+    header: DstarHeader,
     /// Stream id (filename byte order).
-    pub stream_id: StreamId,
+    stream_id: StreamId,
     /// Voice frames in log order.
-    pub frames: Vec<FrameRecord>,
+    frames: Vec<FrameRecord>,
     /// Missing frames implied by seq discontinuities (mod 21).
-    pub gaps: u64,
+    gaps: u64,
     /// First line's timestamp.
-    pub started_at: DateTime<Utc>,
+    started_at: DateTime<Utc>,
     /// Last line's timestamp (a `vde` line when present).
-    pub ended_at: DateTime<Utc>,
+    ended_at: DateTime<Utc>,
     /// True when a `vde` end-of-stream line was seen.
-    pub saw_eot: bool,
+    saw_eot: bool,
     /// Lines that did not parse as any known record.
-    pub skipped_lines: usize,
+    skipped_lines: usize,
+}
+
+impl ParsedDvrec {
+    /// Received routing header.
+    #[must_use]
+    pub const fn header(&self) -> &DstarHeader {
+        &self.header
+    }
+    /// Nonzero transmission identity in filename byte order.
+    #[must_use]
+    pub const fn stream_id(&self) -> StreamId {
+        self.stream_id
+    }
+    /// Retained raw frames in log order.
+    #[must_use]
+    pub fn frames(&self) -> &[FrameRecord] {
+        &self.frames
+    }
+    /// Inferred missing codec frames.
+    #[must_use]
+    pub const fn gaps(&self) -> u64 {
+        self.gaps
+    }
+    /// First recognized line time.
+    #[must_use]
+    pub const fn started_at(&self) -> DateTime<Utc> {
+        self.started_at
+    }
+    /// Last recognized line time, including an end marker.
+    #[must_use]
+    pub const fn ended_at(&self) -> DateTime<Utc> {
+        self.ended_at
+    }
+    /// Whether a `vde` line was present.
+    #[must_use]
+    pub const fn saw_eot(&self) -> bool {
+        self.saw_eot
+    }
+    /// Lines skipped because their record shape was unrecognized.
+    #[must_use]
+    pub const fn skipped_lines(&self) -> usize {
+        self.skipped_lines
+    }
 }
 
 fn parse_ts(s: &str) -> Option<DateTime<Utc>> {
@@ -88,12 +167,19 @@ fn hex_bytes<const N: usize>(s: &str) -> Option<[u8; N]> {
 }
 
 /// Fixed-width wire field from a text field (space-padded to `N`).
-fn wire_field<const N: usize>(s: &str) -> [u8; N] {
+fn wire_field<const N: usize>(s: &str, field: HeaderField) -> Result<[u8; N], DvrecError> {
+    if s.len() > N {
+        return Err(DvrecError::FieldWidth {
+            field,
+            actual: s.len(),
+            maximum: N,
+        });
+    }
     let mut out = [b' '; N];
     for (slot, byte) in out.iter_mut().zip(s.bytes()) {
         *slot = byte;
     }
-    out
+    Ok(out)
 }
 
 /// One tokenized log line.
@@ -102,13 +188,14 @@ struct LogLine<'a> {
     sid_filename_order: u16,
     seq: u8,
     record: &'a str,
-    payload: Vec<&'a str>,
+    payload: &'a str,
 }
 
 fn tokenize(line: &str) -> Option<LogLine<'_>> {
     let (ts_str, rest) = line.split_once('>')?;
     let ts = parse_ts(ts_str)?;
-    let fields: Vec<&str> = rest.split(':').collect();
+    let mut parts = rest.splitn(8, ':');
+    let fields: [&str; 8] = std::array::from_fn(|_| parts.next().unwrap_or_default());
     // [c2g, len, .., .., sid, seq, record, payload...]
     let sid = u16::from_str_radix(fields.get(4)?, 16).ok()?;
     let seq = u8::from_str_radix(fields.get(5)?, 16).ok()?;
@@ -118,28 +205,43 @@ fn tokenize(line: &str) -> Option<LogLine<'_>> {
         sid_filename_order: sid.swap_bytes(),
         seq,
         record,
-        payload: fields.get(7..).unwrap_or(&[]).to_vec(),
+        payload: fields.get(7)?,
     })
 }
 
-fn header_from_payload(payload: &[&str]) -> Option<DstarHeader> {
-    let flags = hex_bytes::<3>(payload.first()?)?;
-    let (my, suffix) = payload.get(4)?.split_once('/')?;
-    Some(DstarHeader {
-        flag1: flags[0],
-        flag2: flags[1],
-        flag3: flags[2],
-        rpt2: Callsign::from_wire_bytes(wire_field::<8>(payload.get(1)?)),
-        rpt1: Callsign::from_wire_bytes(wire_field::<8>(payload.get(2)?)),
-        ur_call: Callsign::from_wire_bytes(wire_field::<8>(payload.get(3)?)),
-        my_call: Callsign::from_wire_bytes(wire_field::<8>(my)),
-        my_suffix: Suffix::from_wire_bytes(wire_field::<4>(suffix)),
+fn header_from_payload(payload: &str) -> Result<DstarHeader, DvrecError> {
+    let mut parts = payload.splitn(6, ':');
+    let payload: [&str; 6] = std::array::from_fn(|_| parts.next().unwrap_or_default());
+    let flags =
+        hex_bytes::<3>(payload.first().ok_or(DvrecError::Header)?).ok_or(DvrecError::Header)?;
+    let (my, suffix) = payload
+        .get(4)
+        .ok_or(DvrecError::Header)?
+        .split_once('/')
+        .ok_or(DvrecError::Header)?;
+    Ok(DstarHeader {
+        flags: HeaderFlags::from_bytes(flags),
+        rpt2: Callsign::from_wire_bytes(wire_field::<8>(
+            payload.get(1).ok_or(DvrecError::Header)?,
+            HeaderField::Rpt2,
+        )?),
+        rpt1: Callsign::from_wire_bytes(wire_field::<8>(
+            payload.get(2).ok_or(DvrecError::Header)?,
+            HeaderField::Rpt1,
+        )?),
+        ur_call: Callsign::from_wire_bytes(wire_field::<8>(
+            payload.get(3).ok_or(DvrecError::Header)?,
+            HeaderField::Ur,
+        )?),
+        my_call: Callsign::from_wire_bytes(wire_field::<8>(my, HeaderField::My)?),
+        my_suffix: Suffix::from_wire_bytes(wire_field::<4>(suffix, HeaderField::Suffix)?),
     })
 }
 
-fn frame_from_payload(payload: &[&str], seq: u8) -> Option<FrameRecord> {
-    let ambe = hex_bytes::<9>(payload.first()?)?;
-    let slow_hex = payload.get(1)?.split('#').next()?;
+fn frame_from_payload(payload: &str, seq: u8) -> Option<FrameRecord> {
+    let (ambe, slow) = payload.split_once(':')?;
+    let ambe = hex_bytes::<9>(ambe)?;
+    let slow_hex = slow.split('#').next()?;
     let slow_data = hex_bytes::<3>(slow_hex)?;
     Some(FrameRecord {
         seq,
@@ -148,91 +250,97 @@ fn frame_from_payload(payload: &[&str], seq: u8) -> Option<FrameRecord> {
     })
 }
 
-/// Parse one dvrec text file.
-///
-/// # Errors
-///
-/// [`DvrecError`] when the log is missing its header line, carries no
-/// voice frames, or its stream id is invalid.
-pub fn parse_dvrec(text: &str) -> Result<ParsedDvrec, DvrecError> {
-    let mut header = None;
-    let mut stream_id_raw = None;
-    let mut frames: Vec<FrameRecord> = Vec::new();
-    let mut gaps = 0u64;
-    let mut prev_seq: Option<u8> = None;
-    let mut started_at = None;
-    let mut ended_at = None;
-    let mut saw_eot = false;
-    let mut skipped_lines = 0usize;
+impl ParsedDvrec {
+    /// Parse one transmission within the caller's retained-frame bound.
+    ///
+    /// Malformed unknown lines increment [`Self::skipped_lines`]. Recognized
+    /// routing fields and transmission identities must remain lossless and consistent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DvrecError`] for a missing header/voice payload, invalid or mixed
+    /// stream identities, oversized header fields or an exceeded frame bound.
+    pub fn from_text(text: &str, limit: CaptureDurationLimit) -> Result<Self, DvrecError> {
+        let mut header = None;
+        let mut stream_id = None;
+        let mut frames: Vec<FrameRecord> = Vec::new();
+        let mut gaps = 0u64;
+        let mut prev_seq: Option<u8> = None;
+        let mut started_at = None;
+        let mut ended_at = None;
+        let mut saw_eot = false;
+        let mut skipped_lines = 0usize;
 
-    for raw in text.lines() {
-        let line = raw.trim_end();
-        if line.is_empty() || line.starts_with("#DVREC") {
-            continue;
-        }
-        let Some(log) = tokenize(line) else {
-            skipped_lines += 1;
-            continue;
-        };
-        if started_at.is_none() {
-            started_at = Some(log.ts);
-        }
-        ended_at = Some(log.ts);
-        if stream_id_raw.is_none() {
-            stream_id_raw = Some(log.sid_filename_order);
-        }
-        match log.record {
-            "hdr" => {
-                if header.is_none() {
-                    match header_from_payload(&log.payload) {
-                        Some(h) => header = Some(h),
-                        None => skipped_lines += 1,
-                    }
-                }
+        for raw in text.lines() {
+            let line = raw.trim_end();
+            if line.is_empty() || line.starts_with("#DVREC") {
+                continue;
             }
-            "vd" => match frame_from_payload(&log.payload, log.seq) {
-                None => skipped_lines += 1,
-                Some(frame) => {
-                    // Shared gap accounting: guards the untrusted seq
-                    // byte (the 0x40 EOT flag can ride it) and treats a
-                    // duplicate as zero gaps. The prior local
-                    // `(seq - prev - 1).rem_euclid(21)` form yielded 20
-                    // for a repeat and ran unguarded on wild bytes.
-                    if let Some(prev) = prev_seq {
-                        gaps += crate::capture::seq_gap(prev, log.seq);
-                    }
-                    prev_seq = Some(log.seq);
-                    frames.push(frame);
+            let Some(log) = tokenize(line) else {
+                skipped_lines += 1;
+                continue;
+            };
+            if started_at.is_none() {
+                started_at = Some(log.ts);
+            }
+            ended_at = Some(log.ts);
+            let actual = StreamId::new(log.sid_filename_order).ok_or(DvrecError::BadStreamId)?;
+            if let Some(expected) = stream_id {
+                if expected != actual {
+                    return Err(DvrecError::MixedStream { expected, actual });
                 }
-            },
-            "vde" => saw_eot = true,
-            _ => skipped_lines += 1,
+            } else {
+                stream_id = Some(actual);
+            }
+            match log.record {
+                "hdr" => {
+                    let parsed = header_from_payload(log.payload)?;
+                    if header.is_none() {
+                        header = Some(parsed);
+                    }
+                }
+                "vd" => match frame_from_payload(log.payload, log.seq) {
+                    None => skipped_lines += 1,
+                    Some(frame) => {
+                        if frames.len() >= limit.as_frames() {
+                            return Err(DvrecError::FrameLimit);
+                        }
+                        if let Some(prev) = prev_seq {
+                            gaps = gaps
+                                .checked_add(crate::capture::seq_gap(prev, log.seq))
+                                .ok_or(DvrecError::FrameCount)?;
+                        }
+                        prev_seq = Some(log.seq);
+                        frames.push(frame);
+                    }
+                },
+                "vde" => saw_eot = true,
+                _ => skipped_lines += 1,
+            }
         }
-    }
 
-    let header = header.ok_or(DvrecError::MissingHeader)?;
-    if frames.is_empty() {
-        return Err(DvrecError::NoFrames);
+        let header = header.ok_or(DvrecError::MissingHeader)?;
+        if frames.is_empty() {
+            return Err(DvrecError::NoFrames);
+        }
+        let stream_id = stream_id.ok_or(DvrecError::BadStreamId)?;
+        let started_at = started_at.ok_or(DvrecError::NoFrames)?;
+        let ended_at = ended_at.ok_or(DvrecError::NoFrames)?;
+        Ok(Self {
+            header,
+            stream_id,
+            frames,
+            gaps,
+            started_at,
+            ended_at,
+            saw_eot,
+            skipped_lines,
+        })
     }
-    let stream_id = stream_id_raw
-        .and_then(StreamId::new)
-        .ok_or(DvrecError::BadStreamId)?;
-    let started_at = started_at.ok_or(DvrecError::NoFrames)?;
-    let ended_at = ended_at.ok_or(DvrecError::NoFrames)?;
-    Ok(ParsedDvrec {
-        header,
-        stream_id,
-        frames,
-        gaps,
-        started_at,
-        ended_at,
-        saw_eot,
-        skipped_lines,
-    })
 }
 
 /// Import outcome for one tree walk.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct ImportSummary {
     /// Recordings written.
     pub imported: usize,
@@ -249,6 +357,33 @@ pub struct ImportSummary {
 /// transmission when a stream id repeats within a day.
 const MATCH_TOLERANCE_SECS: i64 = 120;
 
+/// Explicit memory and retained-codec limits for each imported packet log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ImportLimits {
+    maximum_bytes: std::num::NonZeroUsize,
+    capture: CaptureDurationLimit,
+}
+impl ImportLimits {
+    /// Bound one log's bytes and retained voice frames before allocating/copying them.
+    #[must_use]
+    pub const fn new(maximum_bytes: std::num::NonZeroUsize, capture: CaptureDurationLimit) -> Self {
+        Self {
+            maximum_bytes,
+            capture,
+        }
+    }
+    /// Maximum input bytes for one log.
+    #[must_use]
+    pub const fn maximum_bytes(self) -> std::num::NonZeroUsize {
+        self.maximum_bytes
+    }
+    /// Maximum received codec frames for one log.
+    #[must_use]
+    pub const fn capture(self) -> CaptureDurationLimit {
+        self.capture
+    }
+}
+
 /// Import every published dvrec that has no locally captured twin.
 ///
 /// Walks `<recordings>/<SYS>-<M>/<date>/published/*.dvrec` and
@@ -260,17 +395,18 @@ const MATCH_TOLERANCE_SECS: i64 = 120;
 ///
 /// I/O errors walking the tree. Per-file parse/write failures are
 /// counted in [`ImportSummary::failed`], not fatal.
-pub fn import_tree(recordings: &Path, writer: &Writer) -> std::io::Result<ImportSummary> {
+pub fn import_tree(
+    recordings: &Path,
+    writer: &Writer,
+    limits: ImportLimits,
+) -> std::io::Result<ImportSummary> {
     let mut summary = ImportSummary::default();
     for target_entry in std::fs::read_dir(recordings)? {
         let target_dir = target_entry?.path();
         let Some(name) = target_dir.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        let Some((system, module_char)) = crate::harvest::split_target(name) else {
-            continue;
-        };
-        let Ok(module) = Module::try_from_char(module_char) else {
+        let Ok(target) = name.parse::<TargetKey>() else {
             continue;
         };
         if !target_dir.is_dir() {
@@ -282,7 +418,8 @@ pub fn import_tree(recordings: &Path, writer: &Writer) -> std::io::Result<Import
             if !published.is_dir() {
                 continue;
             }
-            let local = crate::harvest::load_local_recordings(&date_dir)?;
+            let local =
+                crate::harvest::LoadedLocal::from_directory(&date_dir, limits.maximum_bytes)?;
             for file_entry in std::fs::read_dir(&published)? {
                 let path = file_entry?.path();
                 if path.extension() != Some("dvrec".as_ref()) {
@@ -290,10 +427,10 @@ pub fn import_tree(recordings: &Path, writer: &Writer) -> std::io::Result<Import
                 }
                 import_one(
                     &path,
-                    &system,
-                    module,
+                    &target,
                     &local.recordings,
                     writer,
+                    limits,
                     &mut summary,
                 );
             }
@@ -304,23 +441,20 @@ pub fn import_tree(recordings: &Path, writer: &Writer) -> std::io::Result<Import
 
 fn import_one(
     path: &Path,
-    system: &str,
-    module: Module,
+    target: &TargetKey,
     local: &[crate::harvest::LocalRecording],
     writer: &Writer,
+    limits: ImportLimits,
     summary: &mut ImportSummary,
 ) {
-    let Ok(text) = std::fs::read_to_string(path) else {
+    let Ok(text) = read_bounded(path, limits.maximum_bytes) else {
         summary.failed += 1;
         return;
     };
-    let parsed = match parse_dvrec(&text) {
+    let parsed = match ParsedDvrec::from_text(&text, limits.capture) {
         Ok(p) => p,
         Err(DvrecError::NoFrames) => {
-            // Kerchunk: a header and end marker with no voice at all.
-            // Normal on-air behavior, not a failure, and it must not
-            // fail the import step (the nightly pipeline aborts on a
-            // failing exit before ever reaching alignment).
+            // Header/end-only logs contain no voice samples to reconstruct.
             tracing::debug!(path = %path.display(), "voiceless dvrec (kerchunk); skipped");
             summary.skipped_voiceless += 1;
             return;
@@ -331,27 +465,27 @@ fn import_one(
             return;
         }
     };
-    let sid_hex = format!("{:04X}", parsed.stream_id.get());
+    let file_sid = path
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .and_then(|stem| stem.rsplit_once("--"))
+        .and_then(|(_, id)| u16::from_str_radix(id, 16).ok())
+        .and_then(StreamId::new);
+    if file_sid != Some(parsed.stream_id) {
+        tracing::warn!(path = %path.display(), stream_id = %parsed.stream_id, "dvrec filename and line stream identities differ");
+        summary.failed += 1;
+        return;
+    }
     let twin = local.iter().any(|rec| {
-        rec.stream_id == sid_hex
-            && (rec.started_at - parsed.started_at).num_seconds().abs() <= MATCH_TOLERANCE_SECS
+        rec.stream_id() == parsed.stream_id
+            && (rec.started_at() - parsed.started_at).num_seconds().abs() <= MATCH_TOLERANCE_SECS
     });
     if twin {
         summary.skipped_existing += 1;
         return;
     }
     let recording = CompletedRecording {
-        origin: StreamOrigin {
-            reflector: system.to_string(),
-            module,
-            protocol: "dplus",
-            host: format!("{}.dstargateway.org", system.to_ascii_lowercase()),
-            port: 20001,
-            peer: std::net::SocketAddr::new(
-                std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
-                0,
-            ),
-        },
+        origin: StreamOrigin::imported(target.clone()),
         stream_id: parsed.stream_id,
         header: Some(parsed.header),
         header_diagnostics: vec![
@@ -382,20 +516,46 @@ fn import_one(
     }
 }
 
+fn read_bounded(path: &Path, maximum: std::num::NonZeroUsize) -> std::io::Result<String> {
+    use std::io::Read as _;
+    let mut file = std::fs::File::open(path)?;
+    let mut bytes = Vec::new();
+    let mut chunk = [0; 8192];
+    loop {
+        let count = file.read(&mut chunk)?;
+        if count == 0 {
+            break;
+        }
+        let length = bytes
+            .len()
+            .checked_add(count)
+            .filter(|length| *length <= maximum.get())
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "dvrec input byte limit exceeded",
+                )
+            })?;
+        bytes
+            .try_reserve(length - bytes.len())
+            .map_err(std::io::Error::other)?;
+        bytes.extend_from_slice(
+            chunk
+                .get(..count)
+                .ok_or_else(|| std::io::Error::other("invalid read count"))?,
+        );
+    }
+    String::from_utf8(bytes)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-    /// Real REF030 dvrec structure. The header line, first voice
-    /// line, and vde end-marker shape are verified against live
-    /// captures (a census over 97 published dvrecs parsed every line:
-    /// only hdr/vd/vde records exist). The vde payload is always the
-    /// AMBE silence constant with its seq carrying an 0x40 end flag,
-    /// correctly not a voice frame. Later vd lines here carry real
-    /// AMBE payloads with abridged slow-data, and one seq gap is
-    /// contrived at 02.
+    /// Header, voice and end-marker grammar with one missing sequence value.
     const FIXTURE: &str = "\
 #DVREC 20260711-175407.594 dplus
 20260711-175407.594>c2g:20:0002:01:58e6:80:hdr:000000:REF030 C:MM3TWA D:CQCQCQ  :MM3TWA  /AMBE:000b
@@ -407,20 +567,13 @@ mod tests {
 
     #[test]
     fn parses_real_shaped_dvrec() -> TestResult {
-        let parsed = parse_dvrec(FIXTURE)?;
-        assert_eq!(parsed.header.rpt2.as_str(), "REF030 C");
-        assert_eq!(parsed.header.rpt1.as_str(), "MM3TWA D");
-        assert_eq!(parsed.header.ur_call.as_str(), "CQCQCQ");
-        assert_eq!(parsed.header.my_call.as_str(), "MM3TWA");
-        assert_eq!(parsed.header.my_suffix.as_str(), "AMBE");
-        assert_eq!(
-            [
-                parsed.header.flag1,
-                parsed.header.flag2,
-                parsed.header.flag3
-            ],
-            [0, 0, 0]
-        );
+        let parsed = ParsedDvrec::from_text(FIXTURE, CaptureDurationLimit::try_from_seconds(60)?)?;
+        assert_eq!(parsed.header.rpt2.text()?, "REF030 C");
+        assert_eq!(parsed.header.rpt1.text()?, "MM3TWA D");
+        assert_eq!(parsed.header.ur_call.text()?, "CQCQCQ");
+        assert_eq!(parsed.header.my_call.text()?, "MM3TWA");
+        assert_eq!(parsed.header.my_suffix.text()?, "AMBE");
+        assert_eq!(*parsed.header.flags.as_bytes(), [0, 0, 0]);
         assert_eq!(
             parsed.stream_id.get(),
             0xE658,
@@ -469,7 +622,8 @@ mod tests {
 20260711-175407.960>c2g:20:0002:01:58e6:02:vd :7ac6883a2f11dba642:aaaaaa#dadada |...|
 20260711-175409.000>c2g:20:0002:01:58e6:44:vde:9e8d3288261a3f61e8:555555#251ac6 |%..|
 ";
-        let parsed = parse_dvrec(dup_fixture)?;
+        let parsed =
+            ParsedDvrec::from_text(dup_fixture, CaptureDurationLimit::try_from_seconds(60)?)?;
         assert_eq!(
             parsed.frames.iter().map(|f| f.seq).collect::<Vec<_>>(),
             [0, 1, 1, 0x2A, 2]
@@ -482,17 +636,22 @@ mod tests {
     }
 
     #[test]
-    fn rejects_headerless_and_frameless_logs() {
+    fn rejects_headerless_and_frameless_logs() -> TestResult {
+        let limit = CaptureDurationLimit::try_from_seconds(60)?;
         let no_hdr = "#DVREC x dplus\n\
             20260711-175407.890>c2g:20:0002:01:58e6:00:vd :ac6b06c1f0c029975c:552d16#0 |x|\n";
         assert!(matches!(
-            parse_dvrec(no_hdr),
+            ParsedDvrec::from_text(no_hdr, limit),
             Err(DvrecError::MissingHeader)
         ));
 
         let no_frames = "#DVREC x dplus\n\
             20260711-175407.594>c2g:20:0002:01:58e6:80:hdr:000000:REF030 C:MM3TWA D:CQCQCQ  :MM3TWA  /AMBE:000b\n";
-        assert!(matches!(parse_dvrec(no_frames), Err(DvrecError::NoFrames)));
+        assert!(matches!(
+            ParsedDvrec::from_text(no_frames, limit),
+            Err(DvrecError::NoFrames)
+        ));
+        Ok(())
     }
 
     #[test]
@@ -509,8 +668,12 @@ mod tests {
             FIXTURE,
         )?;
         let writer = Writer::new(recordings.clone(), true);
+        let limits = ImportLimits::new(
+            const { std::num::NonZeroUsize::new(1_048_576).unwrap() },
+            CaptureDurationLimit::try_from_seconds(60)?,
+        );
 
-        let summary = import_tree(&recordings, &writer)?;
+        let summary = import_tree(&recordings, &writer, limits)?;
         assert_eq!(summary.imported, 1, "{summary:?}");
         assert_eq!(summary.failed, 0);
         let date_dir = recordings.join("REF030-C").join("2026-07-11");
@@ -538,13 +701,11 @@ mod tests {
         );
 
         // Second walk: the freshly written recording is the twin.
-        let summary = import_tree(&recordings, &writer)?;
+        let summary = import_tree(&recordings, &writer, limits)?;
         assert_eq!(summary.imported, 0, "{summary:?}");
         assert_eq!(summary.skipped_existing, 1);
 
-        // A voiceless kerchunk log is a skip, never a failure: a
-        // failing import exit would abort the nightly pipeline
-        // before alignment.
+        // A header and end marker without voice is counted separately.
         std::fs::write(
             recordings
                 .join("REF030-C")
@@ -555,7 +716,7 @@ mod tests {
              20260711-190000.000>c2g:20:0002:01:aaaa:80:hdr:000000:REF030 C:W1AW C:CQCQCQ  :W1AW    /    :0000\n\
              20260711-190000.400>c2g:20:0002:01:aaaa:44:vde:9e8d3288261a3f61e8:555555#251ac6 |%..|\n",
         )?;
-        let summary = import_tree(&recordings, &writer)?;
+        let summary = import_tree(&recordings, &writer, limits)?;
         assert_eq!(summary.failed, 0, "{summary:?}");
         assert_eq!(summary.skipped_voiceless, 1, "{summary:?}");
         Ok(())
@@ -566,9 +727,71 @@ mod tests {
         let mut text = FIXTURE.to_string();
         text.push_str("not a record line\n");
         text.push_str("20260711-175410.000>c2g:20:0002:01:58e6:05:vd :SHORTHEX:552d16#0 |x|\n");
-        let parsed = parse_dvrec(&text)?;
+        let parsed = ParsedDvrec::from_text(&text, CaptureDurationLimit::try_from_seconds(60)?)?;
         assert_eq!(parsed.frames.len(), 3);
         assert_eq!(parsed.skipped_lines, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_mixed_streams_and_oversized_header_fields() -> TestResult {
+        let limit = CaptureDurationLimit::try_from_seconds(60)?;
+        let mixed = FIXTURE.replacen("58e6:01:vd", "59e6:01:vd", 1);
+        assert!(matches!(
+            ParsedDvrec::from_text(&mixed, limit),
+            Err(DvrecError::MixedStream { .. })
+        ));
+        let wide = FIXTURE.replace(":REF030 C:", ":REF030 CC:");
+        assert!(matches!(
+            ParsedDvrec::from_text(&wide, limit),
+            Err(DvrecError::FieldWidth {
+                field: HeaderField::Rpt2,
+                maximum: 8,
+                actual: 9
+            })
+        ));
+        let suffix = FIXTURE.replace("/AMBE:", "/ABCDE:");
+        assert!(matches!(
+            ParsedDvrec::from_text(&suffix, limit),
+            Err(DvrecError::FieldWidth {
+                field: HeaderField::Suffix,
+                ..
+            })
+        ));
+        let many = [
+            FIXTURE,
+            &"20260711-175410.000>c2g:20:0002:01:58e6:05:vd :ac6b06c1f0c029975c:552d16#0 |x|\n"
+                .repeat(50),
+        ]
+        .concat();
+        assert!(matches!(
+            ParsedDvrec::from_text(&many, CaptureDurationLimit::try_from_seconds(1)?),
+            Err(DvrecError::FrameLimit)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn import_rejects_filename_identity_mismatch_and_input_overflow() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let published = directory.path().join("REF030-C/2026-07-11/published");
+        std::fs::create_dir_all(&published)?;
+        let path = published.join("REF030-C--20260711-175407.594--MM3TWA--e659.dvrec");
+        std::fs::write(&path, FIXTURE)?;
+        let writer = Writer::new(directory.path().to_path_buf(), false);
+        let capture = CaptureDurationLimit::try_from_seconds(60)?;
+        let limits = ImportLimits::new(
+            const { std::num::NonZeroUsize::new(1_048_576).unwrap() },
+            capture,
+        );
+        let summary = import_tree(directory.path(), &writer, limits)?;
+        assert_eq!(summary.failed, 1);
+        assert_eq!(summary.imported, 0);
+        let limited =
+            ImportLimits::new(const { std::num::NonZeroUsize::new(10).unwrap() }, capture);
+        let summary = import_tree(directory.path(), &writer, limited)?;
+        assert_eq!(summary.failed, 1);
+        assert!(read_bounded(&path, limited.maximum_bytes()).is_err());
         Ok(())
     }
 }

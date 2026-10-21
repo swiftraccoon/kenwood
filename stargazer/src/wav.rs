@@ -6,34 +6,108 @@
 /// Sample rate of mbelib-rs decoder output.
 const SAMPLE_RATE: u32 = 8000;
 
-/// Serialize PCM samples into a complete WAV file byte vector.
-///
-/// Standard 44-byte RIFF/WAVE header (PCM format tag 1, mono,
-/// 8 kHz, 16-bit little-endian) followed by the raw samples. Sizes
-/// saturate at `u32::MAX`, which is unreachable in practice: stream
-/// length is bounded by the session inactivity timeout.
-#[must_use]
-pub fn wav_bytes(pcm: &[i16]) -> Vec<u8> {
-    let data_len = u32::try_from(pcm.len().saturating_mul(2)).unwrap_or(u32::MAX);
-    let riff_len = data_len.saturating_add(36);
-    let mut out = Vec::with_capacity(44 + pcm.len() * 2);
-    out.extend_from_slice(b"RIFF");
-    out.extend_from_slice(&riff_len.to_le_bytes());
-    out.extend_from_slice(b"WAVE");
-    out.extend_from_slice(b"fmt ");
-    out.extend_from_slice(&16u32.to_le_bytes()); // fmt chunk size
-    out.extend_from_slice(&1u16.to_le_bytes()); // PCM
-    out.extend_from_slice(&1u16.to_le_bytes()); // mono
-    out.extend_from_slice(&SAMPLE_RATE.to_le_bytes());
-    out.extend_from_slice(&(SAMPLE_RATE * 2).to_le_bytes()); // byte rate
-    out.extend_from_slice(&2u16.to_le_bytes()); // block align
-    out.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
-    out.extend_from_slice(b"data");
-    out.extend_from_slice(&data_len.to_le_bytes());
-    for s in pcm {
-        out.extend_from_slice(&s.to_le_bytes());
+/// Complete 8 kHz mono PCM16 WAV bytes with exact RIFF size fields.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WavFile(Vec<u8>);
+
+/// A PCM recording cannot be represented or allocated as a RIFF file.
+#[derive(Debug, thiserror::Error)]
+pub enum WavError {
+    /// The data and 36-byte RIFF payload header exceed the 32-bit RIFF size.
+    #[error("{samples} PCM samples exceed the RIFF/WAVE size fields")]
+    TooLong {
+        /// Supplied PCM sample count.
+        samples: usize,
+    },
+    /// The complete output buffer could not be reserved.
+    #[error("WAV allocation: {0}")]
+    Allocation(#[source] std::collections::TryReserveError),
+}
+
+impl WavFile {
+    /// Serialize signed samples without changing their values or order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WavError::TooLong`] before allocation if RIFF's 32-bit
+    /// size or this platform's address space cannot hold the output, and
+    /// [`WavError::Allocation`] if reserving that exact output fails.
+    pub fn from_pcm(pcm: &[i16]) -> Result<Self, WavError> {
+        let WavSizes {
+            data_len,
+            riff_len,
+            total,
+        } = sizes(pcm.len())?;
+        let mut out = Vec::new();
+        out.try_reserve_exact(total).map_err(WavError::Allocation)?;
+        out.extend_from_slice(b"RIFF");
+        out.extend_from_slice(&riff_len.to_le_bytes());
+        out.extend_from_slice(b"WAVE");
+        out.extend_from_slice(b"fmt ");
+        out.extend_from_slice(&16u32.to_le_bytes()); // fmt chunk size
+        out.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        out.extend_from_slice(&1u16.to_le_bytes()); // mono
+        out.extend_from_slice(&SAMPLE_RATE.to_le_bytes());
+        out.extend_from_slice(&(SAMPLE_RATE * 2).to_le_bytes()); // byte rate
+        out.extend_from_slice(&2u16.to_le_bytes()); // block align
+        out.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
+        out.extend_from_slice(b"data");
+        out.extend_from_slice(&data_len.to_le_bytes());
+        for s in pcm {
+            out.extend_from_slice(&s.to_le_bytes());
+        }
+        Ok(Self(out))
     }
-    out
+    /// Borrow the complete RIFF/WAVE file.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+    /// Take the encoded file without copying.
+    #[must_use]
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.0
+    }
+}
+
+struct WavSizes {
+    data_len: u32,
+    riff_len: u32,
+    total: usize,
+}
+
+fn sizes(samples: usize) -> Result<WavSizes, WavError> {
+    let too_long = || WavError::TooLong { samples };
+    let data_len = samples
+        .checked_mul(2)
+        .and_then(|bytes| u32::try_from(bytes).ok())
+        .ok_or_else(too_long)?;
+    let riff_len = data_len.checked_add(36).ok_or_else(too_long)?;
+    let total = usize::try_from(data_len)
+        .ok()
+        .and_then(|bytes| bytes.checked_add(44))
+        .ok_or_else(too_long)?;
+    Ok(WavSizes {
+        data_len,
+        riff_len,
+        total,
+    })
+}
+impl TryFrom<&[i16]> for WavFile {
+    type Error = WavError;
+    fn try_from(value: &[i16]) -> Result<Self, Self::Error> {
+        Self::from_pcm(value)
+    }
+}
+impl AsRef<[u8]> for WavFile {
+    fn as_ref(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+impl From<WavFile> for Vec<u8> {
+    fn from(value: WavFile) -> Self {
+        value.into_bytes()
+    }
 }
 
 #[cfg(test)]
@@ -56,7 +130,7 @@ mod tests {
 
     #[test]
     fn header_is_canonical_for_known_length() -> TestResult {
-        let bytes = wav_bytes(&[0i16; 160]);
+        let bytes = WavFile::from_pcm(&[0i16; 160])?.into_bytes();
         assert_eq!(bytes.len(), 44 + 320);
         assert_eq!(bytes.get(..4).ok_or("riff")?, b"RIFF");
         assert_eq!(bytes.get(8..12).ok_or("wave")?, b"WAVE");
@@ -77,8 +151,24 @@ mod tests {
 
     #[test]
     fn samples_are_little_endian_in_order() -> TestResult {
-        let bytes = wav_bytes(&[1i16, -2]);
+        let bytes = WavFile::from_pcm(&[1i16, -2])?.into_bytes();
         assert_eq!(bytes.get(44..).ok_or("samples")?, &[0x01, 0x00, 0xFE, 0xFF]);
+        Ok(())
+    }
+
+    #[test]
+    fn riff_size_boundaries_reject_instead_of_saturating() -> TestResult {
+        let maximum = usize::try_from((u32::MAX - 36) / 2)?;
+        let WavSizes {
+            data_len: data,
+            riff_len: riff,
+            total,
+        } = sizes(maximum)?;
+        assert_eq!(data, 4_294_967_258);
+        assert_eq!(riff, 4_294_967_294);
+        assert_eq!(total, maximum * 2 + 44);
+        assert!(matches!(sizes(maximum + 1), Err(WavError::TooLong { .. })));
+        assert!(sizes(usize::MAX).is_err());
         Ok(())
     }
 }

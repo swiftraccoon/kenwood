@@ -1,40 +1,39 @@
 [package]
 name = "stargazer"
 version = "0.2.0"
+authors = ["swiftraccoon"]
+categories = ["command-line-utilities", "multimedia::audio"]
 edition = "2024"
-rust-version = "1.94"
-description = "D-STAR reflector voice recorder: archives raw AMBE frames, decoded WAV, and metadata per transmission"
+keywords = ["ham-radio", "dstar", "recorder", "ambe"]
 license = "GPL-2.0-or-later"
 publish = false
+readme = "README.md"
+repository = "https://github.com/swiftraccoon/kenwood"
+rust-version = "1.94"
+description = "D-STAR recording, archive conversion and activity surveying"
 
 [dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
+clap = { version = "4", features = ["derive"] }
 dstar-gateway = { path = "../dstar-gateway" }
 dstar-gateway-core = { path = "../dstar-gateway-core" }
 mbelib-rs = { path = "../mbelib-rs" }
-tokio = { version = "1", features = [
-  "rt-multi-thread",
-  "macros",
-  "signal",
-  "sync",
-  "time",
-  "net",
-  "io-util",
-] }
-reqwest = { version = "0.12", default-features = false, features = [
-  "rustls-tls",
-] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "signal",
+    "sync",
+    "time",
+    "net",
+    "io-util",
+] }
 toml = "0.8"
-clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-chrono = { version = "0.4", default-features = false, features = [
-  "clock",
-  "serde",
-  "std",
-] }
-thiserror = "2"
 
 [dev-dependencies]
 tempfile = "3"

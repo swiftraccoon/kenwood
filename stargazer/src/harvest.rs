@@ -1,102 +1,181 @@
 // SPDX-FileCopyrightText: 2026 Swift Raccoon
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! Harvest reflector-published recordings that pair with ours.
+//! Bounded collection of published recordings with local matching metadata.
 //!
-//! Reflectors running the current DPLUS daemon publish, per
-//! transmission, a `.dvrec` packet log (every AMBE frame as hex), a
-//! server-side decoded `.mp3`, and a `.txt` sidecar under
-//! `https://<reflector>.dstargateway.org:8443/streams/<Y>/<M>/<D>/`
-//! with directory listing enabled. The MP3 is decoded by a different
-//! (higher-quality) vocoder implementation than mbelib-rs, which makes
-//! it a per-transmission reference signal for audio-quality work: the
-//! local `.ambe` capture of the same stream carries byte-identical
-//! frames, so `(local frames, published audio)` forms a matched pair.
+//! Listing names identify `.dvrec`, `.mp3` and `.txt` artifacts. Matching uses
+//! normalized station labels, hexadecimal stream identifiers and a 120-second
+//! start-time tolerance. A match selects candidate counterparts; byte identity,
+//! audio quality, retention and service coverage require separate verification.
 //!
-//! The harvester walks a recordings directory as written by the
-//! recorder, matches each published transmission to a local recording
-//! by `(callsign, stream id)` with a timestamp tolerance, and
-//! downloads the published files into `<date dir>/published/` under
-//! their original names. Matched transmissions fetch the `.mp3` and
-//! `.txt`; the bulkier `.dvrec` is fetched only where it adds frames
-//! the local capture lacks (gaps, or a transmission missed
-//! entirely). Every download and every run appends a provenance
-//! record to `<date dir>/published/harvest.jsonl`.
-//!
-//! Published retention is short (days), so harvesting is a same-day
-//! affair. This is a volunteer-run service, not a mirror target, and
-//! the client is engineered to be indistinguishable from a courteous
-//! human visitor: robots.txt is honored before anything else is
-//! fetched, downloads run strictly sequentially over one connection
-//! with a multi-second pause, the User-Agent names the tool and the
-//! responsible operator, re-runs never re-download, and a few
-//! consecutive failures stop the run entirely rather than hammer a
-//! struggling or purging server.
+//! Robots policy follows [RFC 9309](https://www.rfc-editor.org/rfc/rfc9309.html).
+//! Requests follow at most five redirects and reject oversized response bodies.
+//! Downloads run sequentially, separated by at least two seconds, with a required
+//! operator identity and a three-consecutive-failure stop. Unreachable robots
+//! policy prevents listing/download requests. Existing artifacts are preserved.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
+use std::num::NonZeroUsize;
 use std::path::Path;
+use std::str::FromStr;
 use std::time::Duration;
 
 use chrono::{DateTime, NaiveDate, Utc};
+use dstar_gateway_core::{Module, RoutingCallsign, StreamId};
 use serde::{Deserialize, Serialize};
 
-/// Identify ourselves honestly: tool, version, purpose, and (when
-/// known) the responsible operator, so a server owner can reach a
-/// human instead of reaching for a block.
-fn build_user_agent(operator: Option<&str>) -> String {
+use crate::config::{ReflectorName, TargetKey};
+use crate::http::HttpResponse;
+
+/// Identify the tool, version, purpose and responsible operator.
+fn build_user_agent(operator: RoutingCallsign) -> String {
     let mut ua = concat!(
         "stargazer-harvest/",
         env!("CARGO_PKG_VERSION"),
         " (amateur radio research; pairing our own reflector captures"
     )
     .to_string();
-    if let Some(op) = operator {
-        ua.push_str("; operator ");
-        ua.push_str(op);
-    }
+    ua.push_str("; operator ");
+    ua.push_str(&operator.to_string());
     ua.push(')');
     ua
 }
 
-/// Decide whether a robots.txt body forbids `path`, checked for both
-/// the wildcard agent and this tool's product token. It is honored
-/// even though the files are operator-published links, because the
-/// politest interpretation always wins.
+/// Evaluate the selected agent groups, longest matching rule and allow ties.
+///
+/// Rules follow RFC 9309 §§2.2.1-2.2.3. Wildcards match zero or more bytes;
+/// only a final dollar anchors the end. Unknown records preserve their group.
+#[cfg(test)]
 fn robots_disallows(robots: &str, path: &str) -> bool {
-    let mut applies = false; // current group names us (or everyone)
-    let mut in_agent_run = false; // inside consecutive User-agent lines
-    for raw in robots.lines() {
-        let line = raw.split('#').next().unwrap_or("").trim();
-        if line.is_empty() {
-            continue;
-        }
-        let Some((key, value)) = line.split_once(':') else {
-            continue;
+    RobotsRules::new(robots).disallows(path)
+}
+
+#[derive(Debug)]
+struct RobotsRule {
+    pattern: Vec<u8>,
+    exact: bool,
+    allow: bool,
+    priority: usize,
+}
+
+#[derive(Debug, Default)]
+struct RobotsRules(Vec<RobotsRule>);
+impl RobotsRules {
+    fn new(body: &str) -> Self {
+        let records = || {
+            body.lines()
+                .filter_map(|line| line.split('#').next()?.trim().split_once(':'))
+                .map(|(key, value)| (key.trim(), value.trim()))
         };
-        let key = key.trim().to_ascii_lowercase();
-        let value = value.trim();
-        match key.as_str() {
-            "user-agent" => {
-                if !in_agent_run {
-                    applies = false; // a new group begins
+        let specific = records().any(|(key, value)| {
+            key.eq_ignore_ascii_case("user-agent")
+                && value.eq_ignore_ascii_case("stargazer-harvest")
+        });
+        let mut applies = false;
+        let mut in_rules = false;
+        let mut rules = Vec::new();
+        for (key, value) in records() {
+            if key.eq_ignore_ascii_case("user-agent") {
+                if in_rules {
+                    applies = false;
+                    in_rules = false;
                 }
-                in_agent_run = true;
-                let agent = value.to_ascii_lowercase();
-                if agent == "*" || agent.starts_with("stargazer") {
+                if value.eq_ignore_ascii_case("stargazer-harvest") || (!specific && value == "*") {
                     applies = true;
                 }
-            }
-            "disallow" if applies => {
-                in_agent_run = false;
-                if !value.is_empty() && path.starts_with(value) {
-                    return true;
+            } else if key.eq_ignore_ascii_case("allow") || key.eq_ignore_ascii_case("disallow") {
+                in_rules = true;
+                if applies && !value.is_empty() {
+                    let exact = value.ends_with('$');
+                    let raw = value.strip_suffix('$').unwrap_or(value);
+                    let pattern = normalize_robots_path(raw, true);
+                    let priority = pattern.len() + usize::from(exact);
+                    rules.push(RobotsRule {
+                        pattern,
+                        exact,
+                        priority,
+                        allow: key.eq_ignore_ascii_case("allow"),
+                    });
                 }
             }
-            _ => in_agent_run = false,
+        }
+        Self(rules)
+    }
+
+    fn disallows(&self, path: &str) -> bool {
+        let path = normalize_robots_path(path, false);
+        let best = self
+            .0
+            .iter()
+            .filter(|rule| wildcard_matches(&rule.pattern, &path, rule.exact))
+            .max_by_key(|rule| (rule.priority, rule.allow));
+        best.is_some_and(|rule| !rule.allow)
+    }
+}
+
+fn normalize_robots_path(value: &str, pattern: bool) -> Vec<u8> {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut normalized = Vec::with_capacity(value.len());
+    let mut bytes = value.as_bytes().iter().copied().peekable();
+    while let Some(byte) = bytes.next() {
+        if byte == b'%' {
+            let mut following = bytes.clone();
+            if let (Some(high), Some(low)) = (following.next(), following.next())
+                && let (Some(high), Some(low)) =
+                    (char::from(high).to_digit(16), char::from(low).to_digit(16))
+                && let Ok(decoded) = u8::try_from(high * 16 + low)
+            {
+                bytes = following;
+                if decoded.is_ascii_alphanumeric() || b"-._~".contains(&decoded) {
+                    normalized.push(decoded);
+                } else {
+                    normalized.push(b'%');
+                    normalized.push(*HEX.get(usize::from(decoded >> 4)).unwrap_or(&b'0'));
+                    normalized.push(*HEX.get(usize::from(decoded & 15)).unwrap_or(&b'0'));
+                }
+                continue;
+            }
+        }
+        if !byte.is_ascii() || byte == b'$' || (!pattern && byte == b'*') {
+            normalized.push(b'%');
+            normalized.push(*HEX.get(usize::from(byte >> 4)).unwrap_or(&b'0'));
+            normalized.push(*HEX.get(usize::from(byte & 15)).unwrap_or(&b'0'));
+        } else {
+            normalized.push(byte);
         }
     }
-    false
+    normalized
+}
+
+fn wildcard_matches(pattern: &[u8], path: &[u8], exact: bool) -> bool {
+    let mut pattern_offset = 0;
+    let mut path_offset = 0;
+    let mut star = None;
+    let mut retry = 0;
+    while path_offset < path.len() {
+        if pattern_offset == pattern.len() && !exact {
+            return true;
+        }
+        if pattern.get(pattern_offset) == Some(&b'*') {
+            star = Some(pattern_offset);
+            pattern_offset += 1;
+            retry = path_offset;
+        } else if pattern.get(pattern_offset) == path.get(path_offset) {
+            pattern_offset += 1;
+            path_offset += 1;
+        } else if let Some(star) = star {
+            retry += 1;
+            path_offset = retry;
+            pattern_offset = star + 1;
+        } else {
+            return false;
+        }
+    }
+    while pattern.get(pattern_offset) == Some(&b'*') {
+        pattern_offset += 1;
+    }
+    pattern_offset == pattern.len()
 }
 
 /// Pause between successive file downloads. Two seconds keeps a full
@@ -119,38 +198,103 @@ const PUBLISHED_EXTENSIONS: [&str; 3] = ["dvrec", "mp3", "txt"];
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublishedTx {
     /// Filename stem exactly as published (no extension).
-    pub stem: String,
+    stem: String,
     /// Reflector system name (e.g. `"REF030"`).
-    pub system: String,
+    system: String,
     /// Module letter.
-    pub module: char,
+    module: char,
     /// Transmission start per the publisher's clock (UTC).
-    pub started_at: DateTime<Utc>,
+    started_at: DateTime<Utc>,
     /// MYCALL as published (trimmed, unsanitized).
-    pub mycall: String,
-    /// Stream id, normalized to uppercase hex.
-    pub stream_id: String,
+    mycall: String,
+    /// Checked nonzero transmission identifier.
+    stream_id: StreamId,
     /// Extensions available for this stem.
-    pub extensions: BTreeSet<String>,
+    extensions: BTreeSet<String>,
+}
+
+impl PublishedTx {
+    /// Borrow the published filename stem.
+    #[must_use]
+    pub fn stem(&self) -> &str {
+        &self.stem
+    }
+    /// Borrow the observed reflector name.
+    #[must_use]
+    pub fn system(&self) -> &str {
+        &self.system
+    }
+    /// Return the observed uppercase module letter.
+    #[must_use]
+    pub const fn module(&self) -> char {
+        self.module
+    }
+    /// Return the publisher's UTC start timestamp.
+    #[must_use]
+    pub const fn started_at(&self) -> DateTime<Utc> {
+        self.started_at
+    }
+    /// Borrow the publisher's station label.
+    #[must_use]
+    pub fn mycall(&self) -> &str {
+        &self.mycall
+    }
+    /// Return the checked nonzero transmission identifier.
+    #[must_use]
+    pub const fn stream_id(&self) -> StreamId {
+        self.stream_id
+    }
+    /// Iterate available extension strings in lexical order.
+    pub fn extensions(&self) -> std::collections::btree_set::Iter<'_, String> {
+        self.extensions.iter()
+    }
 }
 
 /// Pairing-relevant metadata of one local recording.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalRecording {
     /// Filename stem (no extension).
-    pub stem: String,
+    stem: String,
     /// Callsign in filename form (sanitized, uppercase).
-    pub callsign: String,
-    /// Stream id, uppercase hex.
-    pub stream_id: String,
+    callsign: String,
+    /// Checked nonzero transmission identifier.
+    stream_id: StreamId,
     /// Transmission start per the local clock (UTC).
-    pub started_at: DateTime<Utc>,
+    started_at: DateTime<Utc>,
     /// Sequence gaps observed during capture.
-    pub gaps: u64,
+    gaps: u64,
+}
+
+impl LocalRecording {
+    /// Borrow the local artifact stem.
+    #[must_use]
+    pub fn stem(&self) -> &str {
+        &self.stem
+    }
+    /// Borrow the normalized station label used for matching.
+    #[must_use]
+    pub fn callsign(&self) -> &str {
+        &self.callsign
+    }
+    /// Return the checked nonzero transmission identifier.
+    #[must_use]
+    pub const fn stream_id(&self) -> StreamId {
+        self.stream_id
+    }
+    /// Return the local UTC start timestamp.
+    #[must_use]
+    pub const fn started_at(&self) -> DateTime<Utc> {
+        self.started_at
+    }
+    /// Return the recorded sequence-gap count.
+    #[must_use]
+    pub const fn gaps(&self) -> u64 {
+        self.gaps
+    }
 }
 
 /// Local recordings loaded from a date directory.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct LoadedLocal {
     /// Successfully parsed recordings.
     pub recordings: Vec<LocalRecording>,
@@ -176,15 +320,33 @@ pub enum FetchReason {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FetchItem {
     /// Published filename (stem + extension).
-    pub file_name: String,
+    file_name: String,
     /// Why this file is wanted.
-    pub reason: FetchReason,
+    reason: FetchReason,
     /// Stem of the matched local recording, when paired.
-    pub local_stem: Option<String>,
+    local_stem: Option<String>,
+}
+
+impl FetchItem {
+    /// Borrow the validated single-component published filename.
+    #[must_use]
+    pub fn file_name(&self) -> &str {
+        &self.file_name
+    }
+    /// Return why this file is selected.
+    #[must_use]
+    pub const fn reason(&self) -> FetchReason {
+        self.reason
+    }
+    /// Borrow the local counterpart's stem, when paired.
+    #[must_use]
+    pub fn local_stem(&self) -> Option<&str> {
+        self.local_stem.as_deref()
+    }
 }
 
 /// Download plan plus pairing coverage for one date directory.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct HarvestPlan {
     /// Files to download, deterministic order.
     pub items: Vec<FetchItem>,
@@ -243,7 +405,11 @@ fn is_safe_basename(name: &str) -> bool {
     matches!(
         (components.next(), components.next()),
         (Some(Component::Normal(_)), None)
-    ) && !name.contains('\\')
+    ) && !name.ends_with([' ', '.'])
+        && name.len() <= 255
+        && name
+            .chars()
+            .all(|character| !character.is_control() && !"<>:\"/\\|?*".contains(character))
 }
 
 /// Parse one published filename into its transmission identity and
@@ -286,7 +452,7 @@ fn parse_published_name(file_name: &str) -> Option<(PublishedTx, String)> {
             module,
             started_at,
             mycall,
-            stream_id: stream_raw.to_ascii_uppercase(),
+            stream_id: StreamId::new(u16::from_str_radix(stream_raw, 16).ok()?)?,
             extensions: BTreeSet::new(),
         },
         ext.to_string(),
@@ -336,53 +502,90 @@ pub fn parse_listing(html: &str) -> Vec<PublishedTx> {
     txs
 }
 
-/// Load pairing metadata for every recording in a date directory (a
-/// recording exists iff its `.json` exists).
-///
-/// # Errors
-///
-/// I/O errors reading the directory. Individual unparseable sidecars
-/// are counted in [`LoadedLocal::skipped`], not fatal.
-pub fn load_local_recordings(date_dir: &Path) -> std::io::Result<LoadedLocal> {
-    let mut out = LoadedLocal::default();
-    if !date_dir.exists() {
-        // No local captures for this date, so everything published is
-        // a salvage candidate.
-        return Ok(out);
-    }
-    for entry in std::fs::read_dir(date_dir)? {
-        let path = entry?.path();
-        if path.extension() != Some("json".as_ref()) {
-            continue;
+impl LoadedLocal {
+    /// Load pairing metadata from JSON sidecars within `maximum` bytes each.
+    ///
+    /// # Errors
+    ///
+    /// Returns directory traversal errors. Individual unreadable, oversized or
+    /// malformed sidecars and invalid stream identifiers increment
+    /// [`LoadedLocal::skipped`]. No sidecar body grows beyond `maximum` bytes.
+    pub fn from_directory(date_dir: &Path, maximum: NonZeroUsize) -> std::io::Result<Self> {
+        let mut out = Self::default();
+        let entries = match std::fs::read_dir(date_dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+            Err(error) => return Err(error),
+        };
+        for entry in entries {
+            let path = entry?.path();
+            if path.extension() != Some("json".as_ref()) {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                out.skipped += 1;
+                continue;
+            };
+            let doc = read_sidecar(&path, maximum)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<SidecarDoc>(&bytes).ok());
+            let Some(doc) = doc else {
+                out.skipped += 1;
+                continue;
+            };
+            let Some(stream_id) = parse_stream_id(&doc.stream_id) else {
+                out.skipped += 1;
+                continue;
+            };
+            out.recordings.push(LocalRecording {
+                stem: stem.to_string(),
+                callsign: doc.header.map_or_else(
+                    || "UNKNOWN".to_string(),
+                    |h| crate::writer::sanitize_callsign(&h.my_callsign),
+                ),
+                stream_id,
+                started_at: doc.started_at,
+                gaps: doc.frames.map_or(0, |f| f.gaps),
+            });
         }
-        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
-            out.skipped += 1;
-            continue;
-        };
-        let doc: Option<SidecarDoc> = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|text| serde_json::from_str(&text).ok());
-        let Some(doc) = doc else {
-            out.skipped += 1;
-            continue;
-        };
-        out.recordings.push(LocalRecording {
-            stem: stem.to_string(),
-            callsign: doc.header.map_or_else(
-                || "UNKNOWN".to_string(),
-                |h| crate::writer::sanitize_callsign(&h.my_callsign),
-            ),
-            stream_id: doc.stream_id.to_ascii_uppercase(),
-            started_at: doc.started_at,
-            gaps: doc.frames.map_or(0, |f| f.gaps),
+        out.recordings.sort_by(|a, b| {
+            a.started_at
+                .cmp(&b.started_at)
+                .then_with(|| a.stem.cmp(&b.stem))
         });
+        Ok(out)
     }
-    out.recordings.sort_by(|a, b| {
-        a.started_at
-            .cmp(&b.started_at)
-            .then_with(|| a.stem.cmp(&b.stem))
-    });
-    Ok(out)
+}
+
+fn parse_stream_id(text: &str) -> Option<StreamId> {
+    if text.len() != 4 || !text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    StreamId::new(u16::from_str_radix(text, 16).ok()?)
+}
+
+fn read_sidecar(path: &Path, maximum: NonZeroUsize) -> std::io::Result<Vec<u8>> {
+    let mut file = std::fs::File::open(path)?;
+    let mut body = Vec::new();
+    let mut chunk = [0; 8192];
+    loop {
+        let count = file.read(&mut chunk)?;
+        if count == 0 {
+            return Ok(body);
+        }
+        if body
+            .len()
+            .checked_add(count)
+            .is_none_or(|size| size > maximum.get())
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "sidecar exceeds selected byte limit",
+            ));
+        }
+        body.try_reserve(count).map_err(std::io::Error::other)?;
+        body.extend_from_slice(chunk.get(..count).unwrap_or_default());
+    }
 }
 
 /// Pairing-relevant subset of the `stargazer-recording/1` sidecar.
@@ -414,28 +617,28 @@ struct SidecarHeader {
 pub fn plan(
     published: &[PublishedTx],
     local: &[LocalRecording],
-    module: char,
+    module: Module,
     existing: &BTreeSet<String>,
 ) -> HarvestPlan {
     let mut result = HarvestPlan::default();
 
-    let mut locals_by_key: BTreeMap<(&str, &str), Vec<usize>> = BTreeMap::new();
+    let mut locals_by_key: BTreeMap<(&str, u16), Vec<usize>> = BTreeMap::new();
     for (i, rec) in local.iter().enumerate() {
         locals_by_key
-            .entry((rec.callsign.as_str(), rec.stream_id.as_str()))
+            .entry((rec.callsign.as_str(), rec.stream_id.get()))
             .or_default()
             .push(i);
     }
 
     let mut claimed = vec![false; local.len()];
     let mut pairs: Vec<(&PublishedTx, Option<&LocalRecording>)> = Vec::new();
-    for tx in published.iter().filter(|t| t.module == module) {
+    for tx in published.iter().filter(|t| t.module == module.as_char()) {
         let key = (
             crate::writer::sanitize_callsign(&tx.mycall),
-            tx.stream_id.clone(),
+            tx.stream_id.get(),
         );
         let best = locals_by_key
-            .get(&(key.0.as_str(), key.1.as_str()))
+            .get(&(key.0.as_str(), key.1))
             .into_iter()
             .flatten()
             .filter(|&&i| claimed.get(i).is_some_and(|c| !*c))
@@ -496,75 +699,12 @@ pub fn plan(
     result
 }
 
-/// Derive the dashboard base URL for a reflector system name.
-/// Only `REFnnn` systems live on the shared hosting scheme; other
-/// systems need an explicit base URL.
-#[must_use]
-pub fn derived_base_url(system: &str) -> Option<reqwest::Url> {
-    let digits = system.strip_prefix("REF")?;
-    if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
-        return None;
-    }
-    reqwest::Url::parse(&format!(
-        "https://{}.dstargateway.org:8443/",
-        system.to_ascii_lowercase()
-    ))
-    .ok()
-}
-
-/// Extend a base URL with `streams/<Y>/<M>/<D>` plus a final segment
-/// (empty = trailing slash for the listing). A cannot-be-base URL is
-/// returned unchanged; http(s) bases always extend.
-fn streams_url(base: &reqwest::Url, date: NaiveDate, last: &str) -> reqwest::Url {
-    let mut url = base.clone();
-    if let Ok(mut segments) = url.path_segments_mut() {
-        let _unused = segments
-            .pop_if_empty()
-            .push("streams")
-            .push(&date.format("%Y").to_string())
-            .push(&date.format("%m").to_string())
-            .push(&date.format("%d").to_string())
-            .push(last);
-    }
-    url
-}
-
-/// Listing URL for one date under a base URL.
-#[must_use]
-pub fn listing_url(base: &reqwest::Url, date: NaiveDate) -> reqwest::Url {
-    streams_url(base, date, "")
-}
-
-/// Download URL for one published file under a base URL.
-#[must_use]
-pub fn file_url(base: &reqwest::Url, date: NaiveDate, file_name: &str) -> reqwest::Url {
-    streams_url(base, date, file_name)
-}
-
-/// Split a recordings directory name (`"REF030-C"`) into its system
-/// name and module letter. Returns `None` for names that are not
-/// `<SYSTEM>-<MODULE>` (e.g. a stray `survey/` directory).
-#[must_use]
-pub fn split_target(name: &str) -> Option<(String, char)> {
-    let (system, module_str) = name.rsplit_once('-')?;
-    let mut chars = module_str.chars();
-    match (chars.next(), chars.next()) {
-        (Some(c), None) if c.is_ascii_uppercase() && !system.is_empty() => {
-            Some((system.to_string(), c))
-        }
-        _ => None,
-    }
-}
-
 /// Harvest failures.
 #[derive(Debug, thiserror::Error)]
 pub enum HarvestError {
     /// No usable dashboard base URL.
-    #[error("base url: {0}")]
-    BaseUrl(String),
-    /// Recordings directory name is not `<SYSTEM>-<MODULE>`.
-    #[error("not a <SYSTEM>-<MODULE> directory name: {0:?}")]
-    DirName(String),
+    #[error("no dashboard base URL for {0}; supply a base URL override")]
+    BaseUrl(TargetKey),
     /// HTTP client construction failed.
     #[error("http client: {0}")]
     Client(#[source] reqwest::Error),
@@ -577,6 +717,9 @@ pub enum HarvestError {
     /// Atomic file write failed.
     #[error(transparent)]
     Write(#[from] crate::writer::WriteError),
+    /// A future pacing deadline cannot be represented on this platform.
+    #[error("download pacing deadline exceeds this platform's Instant range")]
+    PacingDeadline,
 }
 
 /// One run's coverage summary, printed to the operator and appended
@@ -613,13 +756,95 @@ pub struct RunRecord {
     pub failed: usize,
     /// Wanted files already present from an earlier run.
     pub skipped_existing: usize,
+    /// Wanted files excluded by a matching robots rule.
+    #[serde(default)]
+    pub blocked_by_robots: usize,
     /// True when `limit` cut the plan short.
     pub truncated: bool,
     /// True when this run only planned (nothing written).
     pub dry_run: bool,
     /// Why the run could not complete: a listing fetch/HTTP failure,
     /// a robots.txt disallow, or a consecutive-failure stop.
-    pub error: Option<String>,
+    error: Option<String>,
+    #[serde(skip)]
+    live_failure: Option<std::sync::Arc<HarvestFailure>>,
+}
+
+impl RunRecord {
+    fn new(target: &TargetKey, date: NaiveDate, listing: &reqwest::Url, dry_run: bool) -> Self {
+        Self {
+            run_at: Utc::now(),
+            target: target.to_string(),
+            date,
+            listing_url: listing.to_string(),
+            http_status: None,
+            published_tx: 0,
+            local_recordings: 0,
+            local_skipped: 0,
+            matched: 0,
+            published_only: 0,
+            local_only: 0,
+            planned: 0,
+            downloaded: 0,
+            failed: 0,
+            skipped_existing: 0,
+            blocked_by_robots: 0,
+            truncated: false,
+            dry_run,
+            error: None,
+            live_failure: None,
+        }
+    }
+
+    /// Recorded stopping reason, including historical provenance read from JSON.
+    #[must_use]
+    pub fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+    /// Typed most recent failure from this live run, absent from deserialized provenance.
+    #[must_use]
+    pub fn failure(&self) -> Option<&HarvestFailure> {
+        self.live_failure.as_deref()
+    }
+}
+
+/// HTTP request phase retained by a live harvest failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FetchStage {
+    /// Robots policy lookup before any listing or recording request.
+    Robots,
+    /// Daily listing request.
+    Listing,
+    /// One selected recording artifact.
+    Download,
+}
+
+/// Typed stopping or most recent file failure from a live run.
+#[derive(Debug, thiserror::Error)]
+pub enum HarvestFailure {
+    /// HTTP, redirect, deadline, response-size or allocation failure.
+    #[error("{stage:?}: {source}")]
+    Fetch {
+        /// Request phase that failed.
+        stage: FetchStage,
+        /// Original HTTP/body error.
+        #[source]
+        source: crate::FetchError,
+    },
+    /// A response status prevents proceeding in this phase.
+    #[error("{stage:?}: HTTP {status}")]
+    HttpStatus {
+        /// Request phase that failed.
+        stage: FetchStage,
+        /// Received status.
+        status: reqwest::StatusCode,
+    },
+    /// The applicable robots rules exclude the daily listing.
+    #[error("robots.txt disallows the streams listing")]
+    RobotsDisallowed,
+    /// The run stopped after three consecutive download failures.
+    #[error("stopped after three consecutive download failures: {0}")]
+    DownloadBreaker(#[source] std::sync::Arc<Self>),
 }
 
 /// One attempted download, appended to the manifest.
@@ -653,32 +878,263 @@ pub enum ManifestRecord {
     File(FileRecord),
 }
 
-/// Options for building a [`Harvester`].
-#[derive(Debug, Clone)]
-pub struct HarvestOptions {
-    /// Dashboard base URL override; default derives one per system
-    /// via [`derived_base_url`].
-    pub base_url: Option<String>,
-    /// Cap on downloads per run.
-    pub limit: Option<usize>,
-    /// Plan and report only: write nothing, download nothing.
-    pub dry_run: bool,
-    /// Pause between downloads (default [`POLITE_GAP`]).
-    pub fetch_gap: Duration,
-    /// Operator callsign advertised in the User-Agent so the server
-    /// owner can identify and contact who is fetching.
-    pub operator: Option<String>,
+/// An HTTP(S) dashboard base without credentials, query or fragment.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct DashboardUrl(reqwest::Url);
+
+/// Invalid dashboard URL syntax or unsupported URL components.
+#[derive(Debug, thiserror::Error)]
+pub enum DashboardUrlError {
+    /// URI parsing failed.
+    #[error("dashboard URL: {0}")]
+    Parse(#[source] <reqwest::Url as FromStr>::Err),
+    /// The scheme is neither HTTP nor HTTPS, or the authority is absent.
+    #[error("dashboard URL requires an HTTP(S) authority")]
+    Authority,
+    /// User information, query or fragment is present.
+    #[error("dashboard base cannot include credentials, a query or a fragment")]
+    Components,
+}
+impl DashboardUrl {
+    /// Derive this application's default `REF`-plus-digits dashboard address.
+    ///
+    /// Returns `None` for other naming schemes. A derived address is a routing
+    /// convention; availability and published content require an HTTP response.
+    #[must_use]
+    pub fn for_reflector(reflector: &ReflectorName) -> Option<Self> {
+        let system = reflector.as_str();
+        let digits = system.strip_prefix("REF")?;
+        if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        let url = reqwest::Url::parse(&format!(
+            "https://{}.dstargateway.org:8443/",
+            system.to_ascii_lowercase()
+        ))
+        .ok()?;
+        Self::new(url).ok()
+    }
+
+    /// Check an owned parsed URL without copying its storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DashboardUrlError`] for unsupported schemes or base components.
+    pub fn new(value: reqwest::Url) -> Result<Self, DashboardUrlError> {
+        if !matches!(value.scheme(), "http" | "https")
+            || !value.has_host()
+            || value.cannot_be_a_base()
+        {
+            return Err(DashboardUrlError::Authority);
+        }
+        if !value.username().is_empty()
+            || value.password().is_some()
+            || value.query().is_some()
+            || value.fragment().is_some()
+        {
+            return Err(DashboardUrlError::Components);
+        }
+        Ok(Self(value))
+    }
+    /// Borrow the checked base URL.
+    #[must_use]
+    pub const fn as_url(&self) -> &reqwest::Url {
+        &self.0
+    }
+    /// Take the parsed base URL without copying.
+    #[must_use]
+    pub fn into_url(self) -> reqwest::Url {
+        self.0
+    }
+
+    /// Construct the date-partitioned listing URL below this checked base.
+    #[must_use]
+    pub fn listing_url(&self, date: NaiveDate) -> reqwest::Url {
+        self.streams_url(date, "")
+    }
+
+    /// Construct the URL for one parsed and planned published artifact.
+    #[must_use]
+    pub fn file_url(&self, date: NaiveDate, item: &FetchItem) -> reqwest::Url {
+        self.streams_url(date, &item.file_name)
+    }
+
+    fn streams_url(&self, date: NaiveDate, last: &str) -> reqwest::Url {
+        let mut url = self.0.clone();
+        match url.path_segments_mut() {
+            Ok(mut segments) => {
+                let _segments = segments
+                    .pop_if_empty()
+                    .push("streams")
+                    .push(&date.format("%Y").to_string())
+                    .push(&date.format("%m").to_string())
+                    .push(&date.format("%d").to_string())
+                    .push(last);
+            }
+            Err(()) => {
+                unreachable!("DashboardUrl construction requires a hierarchical HTTP(S) URL")
+            }
+        }
+        url
+    }
+}
+impl FromStr for DashboardUrl {
+    type Err = DashboardUrlError;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::new(value.parse().map_err(DashboardUrlError::Parse)?)
+    }
+}
+impl TryFrom<reqwest::Url> for DashboardUrl {
+    type Error = DashboardUrlError;
+    fn try_from(value: reqwest::Url) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+impl From<DashboardUrl> for reqwest::Url {
+    fn from(value: DashboardUrl) -> Self {
+        value.into_url()
+    }
+}
+impl AsRef<reqwest::Url> for DashboardUrl {
+    fn as_ref(&self) -> &reqwest::Url {
+        self.as_url()
+    }
+}
+impl std::fmt::Display for DashboardUrl {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, formatter)
+    }
 }
 
-impl Default for HarvestOptions {
+/// At least two seconds between successive completed downloads and requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FetchGap(Duration);
+/// Invalid or unrepresentable download pacing interval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum FetchGapError {
+    /// The requested interval is below the mandatory two-second policy.
+    #[error("download gap {0:?} is below two seconds")]
+    TooShort(Duration),
+    /// Adding the interval to the current monotonic clock overflows.
+    #[error("download gap exceeds the platform's Instant range")]
+    TooLarge,
+}
+impl FetchGap {
+    /// Enforce the application's two-second floor and monotonic representation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FetchGapError`] before a harvester is constructed.
+    pub fn new(value: Duration) -> Result<Self, FetchGapError> {
+        if value < POLITE_GAP {
+            return Err(FetchGapError::TooShort(value));
+        }
+        if std::time::Instant::now().checked_add(value).is_none() {
+            return Err(FetchGapError::TooLarge);
+        }
+        Ok(Self(value))
+    }
+    /// Minimum interval between downloads.
+    #[must_use]
+    pub const fn duration(self) -> Duration {
+        self.0
+    }
+}
+impl Default for FetchGap {
     fn default() -> Self {
+        Self(POLITE_GAP)
+    }
+}
+impl TryFrom<Duration> for FetchGap {
+    type Error = FetchGapError;
+    fn try_from(value: Duration) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+impl From<FetchGap> for Duration {
+    fn from(value: FetchGap) -> Self {
+        value.duration()
+    }
+}
+
+/// Validated options for one sequential [`Harvester`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HarvestOptions {
+    /// Dashboard base URL override; default derives one per system
+    /// via [`DashboardUrl::for_reflector`].
+    base_url: Option<DashboardUrl>,
+    /// Cap on downloads per run.
+    limit: Option<NonZeroUsize>,
+    /// Plan and report only: write nothing, download nothing.
+    dry_run: bool,
+    /// Pause between downloads (default [`POLITE_GAP`]).
+    fetch_gap: FetchGap,
+    /// Operator callsign advertised in the User-Agent so the server
+    /// owner can identify and contact who is fetching.
+    operator: RoutingCallsign,
+    response_limit: NonZeroUsize,
+    sidecar_limit: NonZeroUsize,
+}
+
+impl HarvestOptions {
+    /// Select the operator identity; defaults are a two-second gap and 64 MiB per response.
+    #[must_use]
+    pub fn new(operator: RoutingCallsign) -> Self {
         Self {
             base_url: None,
             limit: None,
             dry_run: false,
-            fetch_gap: POLITE_GAP,
-            operator: None,
+            fetch_gap: FetchGap::default(),
+            operator,
+            response_limit: const { NonZeroUsize::new(67_108_864).unwrap() },
+            sidecar_limit: const { NonZeroUsize::new(1_048_576).unwrap() },
         }
+    }
+    /// Override the derived dashboard address.
+    #[must_use]
+    pub fn with_base_url(mut self, value: DashboardUrl) -> Self {
+        self.base_url = Some(value);
+        self
+    }
+    /// Limit successful and failed download attempts per run.
+    #[must_use]
+    pub const fn with_limit(mut self, value: NonZeroUsize) -> Self {
+        self.limit = Some(value);
+        self
+    }
+    /// Plan without writing or downloading recording files.
+    #[must_use]
+    pub const fn with_dry_run(mut self, value: bool) -> Self {
+        self.dry_run = value;
+        self
+    }
+    /// Use a checked interval at least as long as the mandatory floor.
+    #[must_use]
+    pub const fn with_fetch_gap(mut self, value: FetchGap) -> Self {
+        self.fetch_gap = value;
+        self
+    }
+    /// Bound bytes retained for each listing or recording response.
+    #[must_use]
+    pub const fn with_response_limit(mut self, value: NonZeroUsize) -> Self {
+        self.response_limit = value;
+        self
+    }
+    /// Bound each local JSON sidecar before parsing; the default is 1 MiB.
+    #[must_use]
+    pub const fn with_sidecar_limit(mut self, value: NonZeroUsize) -> Self {
+        self.sidecar_limit = value;
+        self
+    }
+    /// Selected minimum delay between downloads.
+    #[must_use]
+    pub const fn fetch_gap(&self) -> FetchGap {
+        self.fetch_gap
+    }
+    /// Borrow an explicit dashboard base, if selected.
+    #[must_use]
+    pub const fn base_url(&self) -> Option<&DashboardUrl> {
+        self.base_url.as_ref()
     }
 }
 
@@ -687,19 +1143,34 @@ impl Default for HarvestOptions {
 #[derive(Debug)]
 pub struct Harvester {
     client: reqwest::Client,
-    base_url: Option<reqwest::Url>,
+    base_url: Option<DashboardUrl>,
     limit: Option<usize>,
     dry_run: bool,
-    fetch_gap: Duration,
+    fetch_gap: FetchGap,
+    response_limit: NonZeroUsize,
+    sidecar_limit: NonZeroUsize,
+    next_download: Option<tokio::time::Instant>,
+    pacing_overflow: bool,
+}
+
+struct DownloadPacing<'a> {
+    next: &'a mut Option<tokio::time::Instant>,
+    overflow: &'a mut bool,
+    gap: Duration,
+}
+impl Drop for DownloadPacing<'_> {
+    fn drop(&mut self) {
+        *self.next = tokio::time::Instant::now().checked_add(self.gap);
+        *self.overflow = self.next.is_none();
+    }
 }
 
 impl Harvester {
-    /// Build a harvester (validates the base URL override, if any).
+    /// Build a harvester with a 30-second total deadline per HTTP request.
     ///
     /// # Errors
     ///
-    /// [`HarvestError::BaseUrl`] for an unparseable override;
-    /// [`HarvestError::Client`] if the HTTP client cannot be built.
+    /// Returns [`HarvestError::Client`] if the bounded HTTP client cannot be built.
     pub fn new(options: HarvestOptions) -> Result<Self, HarvestError> {
         let HarvestOptions {
             base_url,
@@ -707,23 +1178,21 @@ impl Harvester {
             dry_run,
             fetch_gap,
             operator,
+            response_limit,
+            sidecar_limit,
         } = options;
-        let base_url = base_url
-            .map(|raw| {
-                reqwest::Url::parse(&raw).map_err(|e| HarvestError::BaseUrl(format!("{raw}: {e}")))
-            })
-            .transpose()?;
-        let client = reqwest::Client::builder()
-            .user_agent(build_user_agent(operator.as_deref()))
-            .timeout(Duration::from_secs(30))
-            .build()
+        let client = crate::http::client(&build_user_agent(operator), Duration::from_secs(30))
             .map_err(HarvestError::Client)?;
         Ok(Self {
             client,
             base_url,
-            limit,
+            limit: limit.map(NonZeroUsize::get),
             dry_run,
             fetch_gap,
+            response_limit,
+            sidecar_limit,
+            next_download: None,
+            pacing_overflow: false,
         })
     }
 
@@ -733,103 +1202,104 @@ impl Harvester {
     /// per-file fetch failures are recorded in the returned record,
     /// not raised; local I/O failures are fatal.
     ///
+    /// Cancellation preserves download pacing and already-published files;
+    /// completion counts and manifests can describe a partial run. Repeated runs
+    /// share the checked minimum interval. Local filesystem calls are synchronous.
+    ///
     /// # Errors
     ///
     /// [`HarvestError`] on invalid target names, missing base URL,
     /// or local filesystem failures.
     pub async fn harvest_dir(
-        &self,
+        &mut self,
         recordings: &Path,
-        target: &str,
+        target: &TargetKey,
         date: NaiveDate,
     ) -> Result<RunRecord, HarvestError> {
-        let (system, module) =
-            split_target(target).ok_or_else(|| HarvestError::DirName(target.to_string()))?;
+        if self.pacing_overflow {
+            return Err(HarvestError::PacingDeadline);
+        }
+        let system = target.reflector().as_str();
+        let module = target.module();
         let base = match &self.base_url {
             Some(url) => url.clone(),
-            None => derived_base_url(&system).ok_or_else(|| {
-                HarvestError::BaseUrl(format!(
-                    "no derivable dashboard URL for {system}; pass --base-url"
-                ))
-            })?,
+            None => DashboardUrl::for_reflector(target.reflector())
+                .ok_or_else(|| HarvestError::BaseUrl(target.clone()))?,
         };
         let date_dir = recordings
-            .join(target)
+            .join(target.to_string())
             .join(date.format("%Y-%m-%d").to_string());
         let published_dir = date_dir.join("published");
-        let listing = listing_url(&base, date);
+        let listing = base.listing_url(date);
 
-        let mut record = RunRecord {
-            run_at: Utc::now(),
-            target: target.to_string(),
-            date,
-            listing_url: listing.to_string(),
-            http_status: None,
-            published_tx: 0,
-            local_recordings: 0,
-            local_skipped: 0,
-            matched: 0,
-            published_only: 0,
-            local_only: 0,
-            planned: 0,
-            downloaded: 0,
-            failed: 0,
-            skipped_existing: 0,
-            truncated: false,
-            dry_run: self.dry_run,
-            error: None,
-        };
+        let mut record = RunRecord::new(target, date, &listing, self.dry_run);
 
-        let local = load_local_recordings(&date_dir)?;
+        let local = LoadedLocal::from_directory(&date_dir, self.sidecar_limit)?;
         record.local_recordings = local.recordings.len();
         record.local_skipped = local.skipped;
 
-        // The politest interpretation wins: ask robots.txt first, and
-        // if the streams tree is off-limits for us, walk away without
-        // touching the listing.
-        let mut robots_url = base.clone();
-        robots_url.set_path("/robots.txt");
-        let robots_blocked = match self.fetch(robots_url).await {
-            Ok((200, body)) => robots_disallows(&String::from_utf8_lossy(&body), listing.path()),
-            // Absent or unreadable robots: the operator-published
-            // links themselves govern.
-            _ => false,
+        let robots = match self.robots_rules(&base).await {
+            Ok(rules) => rules,
+            Err(error) => {
+                record.error = Some(format!("robots.txt unreachable: {error}; nothing fetched"));
+                record.live_failure = Some(std::sync::Arc::new(error));
+                return Ok(record);
+            }
         };
-        if robots_blocked {
+        if robots.disallows(listing.path()) {
             record.error =
                 Some("robots.txt disallows the streams tree for us; nothing fetched".to_string());
+            record.live_failure = Some(std::sync::Arc::new(HarvestFailure::RobotsDisallowed));
             return Ok(record);
         }
 
         match self.fetch(listing).await {
-            Err(e) => record.error = Some(e.to_string()),
-            Ok((status, body)) => {
-                record.http_status = Some(status);
+            Err(error) => {
+                record.error = Some(error.to_string());
+                record.live_failure = Some(std::sync::Arc::new(HarvestFailure::Fetch {
+                    stage: FetchStage::Listing,
+                    source: error,
+                }));
+            }
+            Ok(HttpResponse { status, body }) => {
+                record.http_status = Some(status.as_u16());
                 match status {
                     // Nothing published for this date, which is normal.
-                    404 => {}
-                    200 => {
-                        let published = parse_listing(&String::from_utf8_lossy(&body));
+                    reqwest::StatusCode::NOT_FOUND => {}
+                    reqwest::StatusCode::OK => {
+                        let mut published = parse_listing(&String::from_utf8_lossy(&body));
+                        published.retain(|transmission| {
+                            transmission.system.eq_ignore_ascii_case(system)
+                        });
                         let existing = existing_files(&published_dir)?;
-                        let plan = plan(&published, &local.recordings, module, &existing);
+                        let mut plan = plan(&published, &local.recordings, module, &existing);
                         record.published_tx = plan.matched + plan.published_only;
                         record.matched = plan.matched;
                         record.published_only = plan.published_only;
                         record.local_only = plan.local_only;
                         record.skipped_existing = plan.skipped_existing;
+                        let wanted = plan.items.len();
+                        plan.items
+                            .retain(|item| !robots.disallows(base.file_url(date, item).path()));
+                        record.blocked_by_robots = wanted - plan.items.len();
                         record.planned = plan.items.len();
                         if !self.dry_run {
                             self.execute(&mut record, &plan, &base, date, &published_dir)
                                 .await?;
                         }
                     }
-                    other => record.error = Some(format!("http status {other}")),
+                    other => {
+                        record.error = Some(format!("http status {other}"));
+                        record.live_failure =
+                            Some(std::sync::Arc::new(HarvestFailure::HttpStatus {
+                                stage: FetchStage::Listing,
+                                status: other,
+                            }));
+                    }
                 }
             }
         }
 
-        // Append the run summary, but never create directory litter
-        // for a date with nothing to do and nothing done before.
         if !self.dry_run
             && (record.planned > 0 || record.skipped_existing > 0 || published_dir.exists())
         {
@@ -838,14 +1308,39 @@ impl Harvester {
         Ok(record)
     }
 
+    async fn robots_rules(&self, base: &DashboardUrl) -> Result<RobotsRules, HarvestFailure> {
+        let mut robots_url = base.as_url().clone();
+        robots_url.set_path("/robots.txt");
+        match crate::http::fetch(
+            &self.client,
+            robots_url,
+            const { NonZeroUsize::new(512_000).unwrap() },
+        )
+        .await
+        {
+            Ok(response) if response.status.is_success() => {
+                Ok(RobotsRules::new(&String::from_utf8_lossy(&response.body)))
+            }
+            Ok(response) if response.status.is_client_error() => Ok(RobotsRules::default()),
+            Ok(response) => Err(HarvestFailure::HttpStatus {
+                stage: FetchStage::Robots,
+                status: response.status,
+            }),
+            Err(error) => Err(HarvestFailure::Fetch {
+                stage: FetchStage::Robots,
+                source: error,
+            }),
+        }
+    }
+
     /// Download the planned files sequentially with the polite gap,
     /// appending a manifest record per attempt. Fetch/HTTP failures
     /// are recorded and counted; local I/O failures are fatal.
     async fn execute(
-        &self,
+        &mut self,
         record: &mut RunRecord,
         plan: &HarvestPlan,
-        base: &reqwest::Url,
+        base: &DashboardUrl,
         date: NaiveDate,
         published_dir: &Path,
     ) -> Result<(), HarvestError> {
@@ -853,10 +1348,9 @@ impl Harvester {
         record.truncated = plan.items.len() > take;
         let mut consecutive_failures = 0usize;
         for item in plan.items.iter().take(take) {
-            if !self.fetch_gap.is_zero() {
-                tokio::time::sleep(self.fetch_gap).await;
-            }
-            let url = file_url(base, date, &item.file_name);
+            let earliest = self.next_download.unwrap_or_else(tokio::time::Instant::now);
+            tokio::time::sleep_until(earliest).await;
+            let url = base.file_url(date, item);
             let mut file_record = FileRecord {
                 fetched_at: Utc::now(),
                 file_name: item.file_name.clone(),
@@ -867,23 +1361,34 @@ impl Harvester {
                 local_stem: item.local_stem.clone(),
                 error: None,
             };
-            match self.fetch(url).await {
-                Err(e) => {
-                    file_record.error = Some(e.to_string());
+            let pacing = DownloadPacing {
+                next: &mut self.next_download,
+                overflow: &mut self.pacing_overflow,
+                gap: self.fetch_gap.duration(),
+            };
+            let fetched = crate::http::fetch(&self.client, url, self.response_limit).await;
+            drop(pacing);
+            match fetched {
+                Err(error) => {
+                    file_record.error = Some(error.to_string());
+                    record.live_failure = Some(std::sync::Arc::new(HarvestFailure::Fetch {
+                        stage: FetchStage::Download,
+                        source: error,
+                    }));
                     record.failed += 1;
                     consecutive_failures += 1;
                 }
-                Ok((status, body)) => {
-                    file_record.http_status = Some(status);
-                    if status == 200 {
+                Ok(HttpResponse { status, body }) => {
+                    file_record.http_status = Some(status.as_u16());
+                    if status == reqwest::StatusCode::OK {
                         // Listing names are single path components by
                         // construction (parse_listing drops any href
                         // containing '/').
                         std::fs::create_dir_all(published_dir)?;
-                        crate::writer::write_atomic(
+                        crate::writer::publish_bytes(
                             &published_dir.join(&item.file_name),
                             &body,
-                            false,
+                            &mut |_, _| Ok(()),
                         )?;
                         file_record.bytes = body.len();
                         record.downloaded += 1;
@@ -895,10 +1400,18 @@ impl Harvester {
                         );
                     } else {
                         file_record.error = Some(format!("http status {status}"));
+                        record.live_failure =
+                            Some(std::sync::Arc::new(HarvestFailure::HttpStatus {
+                                stage: FetchStage::Download,
+                                status,
+                            }));
                         record.failed += 1;
                         consecutive_failures += 1;
                     }
                 }
+            }
+            if self.pacing_overflow {
+                return Err(HarvestError::PacingDeadline);
             }
             append_manifest(published_dir, &ManifestRecord::File(file_record))?;
             if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
@@ -909,31 +1422,34 @@ impl Harvester {
                     "stopped after {MAX_CONSECUTIVE_FAILURES} consecutive download failures. \
                      Leaving the server alone; remaining files retry next run"
                 ));
+                if let Some(failure) = record.live_failure.take() {
+                    record.live_failure = Some(std::sync::Arc::new(
+                        HarvestFailure::DownloadBreaker(failure),
+                    ));
+                }
                 break;
             }
         }
         Ok(())
     }
 
-    async fn fetch(&self, url: reqwest::Url) -> Result<(u16, Vec<u8>), reqwest::Error> {
-        let resp = self.client.get(url).send().await?;
-        let status = resp.status().as_u16();
-        let body = resp.bytes().await?;
-        Ok((status, body.to_vec()))
+    async fn fetch(&self, url: reqwest::Url) -> Result<HttpResponse, crate::FetchError> {
+        crate::http::fetch(&self.client, url, self.response_limit).await
     }
 }
 
 /// Names of nonzero-size files already in the destination directory.
 fn existing_files(dir: &Path) -> std::io::Result<BTreeSet<String>> {
     let mut out = BTreeSet::new();
-    if !dir.exists() {
-        return Ok(out);
-    }
-    for entry in std::fs::read_dir(dir)? {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
         let entry = entry?;
         let meta = entry.metadata()?;
         if meta.is_file()
-            && meta.len() > 0
             && let Some(name) = entry.file_name().to_str()
         {
             let _unused = out.insert(name.to_string());
@@ -1016,7 +1532,7 @@ mod tests {
             module,
             started_at: ts(started_at)?,
             mycall: mycall.to_string(),
-            stream_id: stream_id.to_string(),
+            stream_id: parse_stream_id(stream_id).ok_or("stream identifier")?,
             extensions: extensions.iter().map(ToString::to_string).collect(),
         })
     }
@@ -1031,7 +1547,7 @@ mod tests {
         Ok(LocalRecording {
             stem: stem.to_string(),
             callsign: callsign.to_string(),
-            stream_id: stream_id.to_string(),
+            stream_id: parse_stream_id(stream_id).ok_or("stream identifier")?,
             started_at: ts(started_at)?,
             gaps,
         })
@@ -1044,7 +1560,7 @@ mod tests {
 
         let e658 = txs
             .iter()
-            .find(|t| t.stream_id == "E658")
+            .find(|t| t.stream_id.get() == 0xe658)
             .ok_or("E658 missing")?;
         assert_eq!(e658.stem, "REF030-C--20260711-175407.594--MM3TWA--e658");
         assert_eq!(e658.system, "REF030");
@@ -1059,7 +1575,7 @@ mod tests {
 
         let partial = txs
             .iter()
-            .find(|t| t.stream_id == "E11D")
+            .find(|t| t.stream_id.get() == 0xe11d)
             .ok_or("E11D missing")?;
         assert_eq!(
             partial
@@ -1078,7 +1594,7 @@ mod tests {
         let txs = parse_listing(LISTING_FIXTURE);
         let spaced = txs
             .iter()
-            .find(|t| t.stream_id == "96DA")
+            .find(|t| t.stream_id.get() == 0x96da)
             .ok_or("96DA missing")?;
         assert_eq!(spaced.mycall, "KJ5CJS B", "%20 decoded");
         assert_eq!(
@@ -1138,6 +1654,23 @@ mod tests {
         assert!(!is_safe_basename("a\\b.txt"));
         assert!(!is_safe_basename(".."));
         assert!(!is_safe_basename(""));
+        assert!(is_safe_basename(
+            "REF030-C--20260711-175407.594--É--e658.mp3"
+        ));
+        assert!(!is_safe_basename("name\n.mp3"));
+    }
+
+    #[test]
+    fn existing_empty_artifacts_are_preserved_and_directory_errors_propagate() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("empty.txt");
+        std::fs::write(&path, [])?;
+        assert!(existing_files(directory.path())?.contains("empty.txt"));
+        assert!(existing_files(&path).is_err());
+        assert!(
+            LoadedLocal::from_directory(&path, const { NonZeroUsize::new(1024).unwrap() }).is_err()
+        );
+        Ok(())
     }
 
     #[test]
@@ -1182,7 +1715,7 @@ mod tests {
             "2026-07-11T17:54:07.608Z",
             0,
         )?];
-        let plan = plan(&p, &l, 'C', &BTreeSet::new());
+        let plan = plan(&p, &l, Module::C, &BTreeSet::new());
         assert_eq!(plan.matched, 1);
         assert_eq!(plan.published_only, 0);
         assert_eq!(plan.local_only, 0);
@@ -1232,7 +1765,7 @@ mod tests {
             "2026-07-11T17:54:07.608Z",
             3,
         )?];
-        let plan = plan(&p, &l, 'C', &BTreeSet::new());
+        let plan = plan(&p, &l, Module::C, &BTreeSet::new());
         assert!(
             plan.items.iter().any(|i| {
                 i.reason == FetchReason::GapFillDvrec
@@ -1254,7 +1787,7 @@ mod tests {
             "9485",
             &["dvrec", "mp3", "txt"],
         )?];
-        let plan = plan(&p, &[], 'C', &BTreeSet::new());
+        let plan = plan(&p, &[], Module::C, &BTreeSet::new());
         assert_eq!(plan.matched, 0);
         assert_eq!(plan.published_only, 1);
         assert_eq!(plan.items.len(), 3, "{:?}", plan.items);
@@ -1287,7 +1820,7 @@ mod tests {
             "2026-07-11T13:00:00.300Z",
             0,
         )?];
-        let plan = plan(&p, &l, 'C', &BTreeSet::new());
+        let plan = plan(&p, &l, Module::C, &BTreeSet::new());
         assert_eq!(plan.matched, 1, "{plan:?}");
         Ok(())
     }
@@ -1302,7 +1835,7 @@ mod tests {
             "0ABC",
             &["mp3", "txt"],
         )?];
-        let plan = plan(&p, &[], 'C', &BTreeSet::new());
+        let plan = plan(&p, &[], Module::C, &BTreeSet::new());
         assert_eq!(plan.published_only, 0, "other module is out of scope");
         assert!(plan.items.is_empty());
         Ok(())
@@ -1317,7 +1850,7 @@ mod tests {
             "2026-07-11T13:00:00.000Z",
             0,
         )?];
-        let plan = plan(&[], &l, 'C', &BTreeSet::new());
+        let plan = plan(&[], &l, Module::C, &BTreeSet::new());
         assert_eq!(plan.local_only, 1);
         assert!(plan.items.is_empty());
         Ok(())
@@ -1361,7 +1894,7 @@ mod tests {
                 0,
             )?,
         ];
-        let plan = plan(&p, &l, 'C', &BTreeSet::new());
+        let plan = plan(&p, &l, Module::C, &BTreeSet::new());
         assert_eq!(plan.matched, 2);
         let morning = plan
             .items
@@ -1393,7 +1926,7 @@ mod tests {
             "2026-07-11T11:00:00.000Z",
             0,
         )?];
-        let plan = plan(&p, &l, 'C', &BTreeSet::new());
+        let plan = plan(&p, &l, Module::C, &BTreeSet::new());
         assert_eq!(plan.matched, 0, "an hour apart is not the same tx");
         assert_eq!(plan.published_only, 1);
         assert_eq!(plan.local_only, 1);
@@ -1419,7 +1952,7 @@ mod tests {
         )?];
         let existing =
             BTreeSet::from(["REF030-C--20260711-175407.594--MM3TWA--e658.mp3".to_string()]);
-        let plan = plan(&p, &l, 'C', &existing);
+        let plan = plan(&p, &l, Module::C, &existing);
         assert_eq!(plan.skipped_existing, 1);
         assert_eq!(plan.items.len(), 1, "{:?}", plan.items);
         assert!(
@@ -1458,13 +1991,14 @@ mod tests {
         std::fs::write(dir.path().join("garbage.json"), "not json")?;
         std::fs::write(dir.path().join("note.txt"), "ignored")?;
 
-        let loaded = load_local_recordings(dir.path())?;
+        let loaded =
+            LoadedLocal::from_directory(dir.path(), const { NonZeroUsize::new(4096).unwrap() })?;
         assert_eq!(loaded.skipped, 1, "garbage.json");
         assert_eq!(loaded.recordings.len(), 2);
         let rec = loaded
             .recordings
             .iter()
-            .find(|r| r.stream_id == "E658")
+            .find(|r| r.stream_id.get() == 0xe658)
             .ok_or("E658")?;
         assert_eq!(rec.stem, "20260711T175407Z_MM3TWA_E658");
         assert_eq!(rec.callsign, "MM3TWA");
@@ -1473,36 +2007,69 @@ mod tests {
         let unknown = loaded
             .recordings
             .iter()
-            .find(|r| r.stream_id == "1234")
+            .find(|r| r.stream_id.get() == 0x1234)
             .ok_or("1234")?;
         assert_eq!(unknown.callsign, "UNKNOWN", "headerless recording");
         Ok(())
     }
 
     #[test]
+    fn pairing_metadata_rejects_invalid_stream_ids_and_bounds_sidecar_bytes() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("capture.json");
+        for stream in ["0000", "10000", "xyz!"] {
+            let bytes = serde_json::to_vec(
+                &serde_json::json!({ "stream_id": stream, "started_at": "2026-07-11T18:00:00Z" }),
+            )?;
+            std::fs::write(&path, bytes)?;
+            let loaded = LoadedLocal::from_directory(
+                directory.path(),
+                const { NonZeroUsize::new(4096).unwrap() },
+            )?;
+            assert_eq!(loaded.skipped, 1, "{stream}");
+            assert!(loaded.recordings.is_empty());
+        }
+        std::fs::write(&path, [b'x'; 33])?;
+        let maximum = NonZeroUsize::new(32).ok_or("limit")?;
+        assert!(read_sidecar(&path, maximum).is_err());
+        let loaded = LoadedLocal::from_directory(directory.path(), maximum)?;
+        assert_eq!(loaded.skipped, 1);
+        assert!(loaded.recordings.is_empty());
+        assert!(parse_published_name("REF030-C--20260711-180000.000--W1AW--0000.mp3").is_none());
+        Ok(())
+    }
+
+    #[test]
     fn urls_derive_encode_and_partition_by_date() -> TestResult {
-        let base = derived_base_url("REF030").ok_or("REF systems derive")?;
+        let base = DashboardUrl::for_reflector(&ReflectorName::new("REF030")?)
+            .ok_or("REF systems derive")?;
         assert_eq!(
-            base.as_str(),
+            base.as_url().as_str(),
             "https://ref030.dstargateway.org:8443/",
             "lowercased shared-hosting scheme"
         );
         assert!(
-            derived_base_url("XRF757").is_none(),
+            DashboardUrl::for_reflector(&ReflectorName::new("XRF757")?).is_none(),
             "non-REF needs --base-url"
         );
-        assert!(derived_base_url("REF999X").is_none(), "not a REFnnn name");
+        assert!(
+            DashboardUrl::for_reflector(&ReflectorName::new("REF999X")?).is_none(),
+            "not a REFnnn name"
+        );
 
         let date = NaiveDate::from_ymd_opt(2026, 7, 11).ok_or("date")?;
         assert_eq!(
-            listing_url(&base, date).as_str(),
+            base.listing_url(date).as_str(),
             "https://ref030.dstargateway.org:8443/streams/2026/07/11/"
         );
         assert_eq!(
-            file_url(
-                &base,
+            base.file_url(
                 date,
-                "REF030-C--20260711-130000.250--KJ5CJS B--96da.mp3"
+                &FetchItem {
+                    file_name: "REF030-C--20260711-130000.250--KJ5CJS B--96da.mp3".to_owned(),
+                    reason: FetchReason::Salvage,
+                    local_stem: None
+                }
             )
             .as_str(),
             "https://ref030.dstargateway.org:8443/streams/2026/07/11/REF030-C--20260711-130000.250--KJ5CJS%20B--96da.mp3",
@@ -1512,23 +2079,43 @@ mod tests {
     }
 
     #[test]
-    fn default_pacing_is_gentle() {
+    fn default_pacing_and_direct_construction_enforce_the_floor() -> TestResult {
         assert_eq!(
-            HarvestOptions::default().fetch_gap,
+            HarvestOptions::new(RoutingCallsign::new("W1AW")?)
+                .fetch_gap()
+                .duration(),
             Duration::from_secs(2),
-            "default pace stays well under any rate-limit radar"
+            "the minimum interval is application policy"
         );
+        assert!(matches!(
+            FetchGap::new(Duration::ZERO),
+            Err(FetchGapError::TooShort(_))
+        ));
+        assert!(FetchGap::new(Duration::from_millis(1999)).is_err());
+        assert!(FetchGap::new(Duration::MAX).is_err());
+        assert_eq!(
+            FetchGap::new(Duration::from_secs(2))?.duration(),
+            POLITE_GAP
+        );
+        for invalid in [
+            "file:///tmp/recordings",
+            "mailto:operator@example.org",
+            "https://user@example.org/",
+            "https://example.org/?query",
+            "https://example.org/#fragment",
+        ] {
+            assert!(invalid.parse::<DashboardUrl>().is_err(), "{invalid}");
+        }
+        Ok(())
     }
 
     #[test]
-    fn user_agent_identifies_tool_and_operator() {
-        let anon = build_user_agent(None);
-        assert!(anon.starts_with("stargazer-harvest/"), "{anon}");
-        assert!(anon.contains("amateur radio research"), "{anon}");
-        assert!(!anon.contains("operator"), "{anon}");
-
-        let signed = build_user_agent(Some("KQ4NIT"));
+    fn user_agent_identifies_tool_and_operator() -> TestResult {
+        let signed = build_user_agent(RoutingCallsign::new("KQ4NIT")?);
+        assert!(signed.starts_with("stargazer-harvest/"), "{signed}");
+        assert!(signed.contains("amateur radio research"), "{signed}");
         assert!(signed.contains("operator KQ4NIT"), "{signed}");
+        Ok(())
     }
 
     #[test]
@@ -1588,5 +2175,43 @@ mod tests {
             "100%zz",
             "non-hex escape survives"
         );
+    }
+
+    #[test]
+    fn robots_longest_allow_wildcard_anchor_encoding_and_agent_groups() {
+        let rules = "User-agent: *\nDisallow: /streams/\nAllow: /streams/public/\nDisallow: /*.mp3$\nAllow: /streams/public/open.mp3$\n";
+        assert!(robots_disallows(rules, "/streams/private/a.txt"));
+        assert!(!robots_disallows(rules, "/streams/public/a.txt"));
+        assert!(robots_disallows(rules, "/other/a.mp3"));
+        assert!(!robots_disallows(rules, "/other/a.mp3.txt"));
+        assert!(!robots_disallows(rules, "/streams/public/open.mp3"));
+        assert!(!robots_disallows(
+            "User-agent: *\nDisallow: /\nUser-agent: STARGAZER-HARVEST\nAllow: /",
+            "/streams/"
+        ));
+        assert!(robots_disallows(
+            "User-agent: stargazer-harvest\nDisallow: /streams/\nSitemap: /map\nAllow: /else/\nUser-agent: stargazer-harvest\nDisallow: /other/",
+            "/other/"
+        ));
+        assert!(!robots_disallows(
+            "User-agent: *\nDisallow: /x\nAllow: /x",
+            "/x"
+        ));
+        assert!(robots_disallows(
+            "User-agent: *\nDisallow: /caf%C3%A9/",
+            "/café/a"
+        ));
+        assert!(robots_disallows(
+            "User-agent: *\nDisallow: /foo/%62az",
+            "/foo/baz"
+        ));
+        assert!(!robots_disallows(
+            "User-agent: *\nDisallow: /foo%2Fbar",
+            "/foo/bar"
+        ));
+        assert!(robots_disallows(
+            "User-agent: *\nDisallow: /literal%2A$",
+            "/literal*"
+        ));
     }
 }

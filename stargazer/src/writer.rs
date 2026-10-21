@@ -4,17 +4,18 @@
 //! Recording writer: metadata document construction and atomic
 //! three-file persistence.
 
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
 use crate::capture::{CompletedRecording, DprsSeen, FrameRecord};
+use crate::config::protocol_name;
 
 /// What happened to the WAV for a recording.
 #[derive(Debug, Clone)]
-pub struct AudioOutcome {
+struct AudioOutcome {
     /// Whether a WAV file was written.
     pub wav: bool,
     /// Frames synthesized by gap concealment during decode.
@@ -26,14 +27,14 @@ pub struct AudioOutcome {
 
 /// Top-level metadata JSON document (schema `stargazer-recording/1`).
 #[derive(Debug, Serialize)]
-pub struct RecordingDoc {
+struct RecordingDoc {
     schema: &'static str,
     writer: String,
     reflector: String,
     module: String,
-    protocol: &'static str,
-    host: String,
-    peer: String,
+    protocol: Option<&'static str>,
+    host: Option<String>,
+    peer: Option<String>,
     stream_id: String,
     started_at: String,
     ended_at: String,
@@ -136,7 +137,7 @@ fn hex_lower(bytes: &[u8]) -> String {
 /// [`mbelib_rs::frame_fec`] as a convenience index; the authoritative
 /// numbers are always re-derivable from the `.ambe` container.
 #[must_use]
-pub fn build_doc(rec: &CompletedRecording, audio: &AudioOutcome) -> RecordingDoc {
+fn build_doc(rec: &CompletedRecording, audio: &AudioOutcome) -> RecordingDoc {
     let mut fec = FecDoc {
         corrected_bits: 0,
         frames_with_errors: 0,
@@ -157,12 +158,12 @@ pub fn build_doc(rec: &CompletedRecording, audio: &AudioOutcome) -> RecordingDoc
     }
 
     let header = rec.header.as_ref().map(|h| HeaderDoc {
-        my_callsign: trimmed(&h.my_call.as_str()),
-        my_suffix: trimmed_opt(&h.my_suffix.as_str()),
-        ur_callsign: trimmed_opt(&h.ur_call.as_str()),
-        rpt1: trimmed(&h.rpt1.as_str()),
-        rpt2: trimmed(&h.rpt2.as_str()),
-        flags: [h.flag1, h.flag2, h.flag3],
+        my_callsign: trimmed(&h.my_call.to_string()),
+        my_suffix: trimmed_opt(&h.my_suffix.to_string()),
+        ur_callsign: trimmed_opt(&h.ur_call.to_string()),
+        rpt1: trimmed(&h.rpt1.to_string()),
+        rpt2: trimmed(&h.rpt2.to_string()),
+        flags: *h.flags.as_bytes(),
         raw_hex: hex_lower(&h.encode()),
         diagnostics: rec.header_diagnostics.clone(),
     });
@@ -170,11 +171,17 @@ pub fn build_doc(rec: &CompletedRecording, audio: &AudioOutcome) -> RecordingDoc
     RecordingDoc {
         schema: "stargazer-recording/1",
         writer: format!("stargazer/{}", env!("CARGO_PKG_VERSION")),
-        reflector: rec.origin.reflector.clone(),
-        module: rec.origin.module.as_char().to_string(),
-        protocol: rec.origin.protocol,
-        host: format!("{}:{}", rec.origin.host, rec.origin.port),
-        peer: rec.origin.peer.to_string(),
+        reflector: rec.origin.target().reflector().to_string(),
+        module: rec.origin.target().module().as_char().to_string(),
+        protocol: rec
+            .origin
+            .endpoint()
+            .map(|target| protocol_name(target.protocol())),
+        host: rec
+            .origin
+            .endpoint()
+            .map(|target| format!("{}:{}", target.host(), target.port())),
+        peer: rec.origin.peer().map(|peer| peer.to_string()),
         stream_id: format!("{:04X}", rec.stream_id.get()),
         started_at: rfc3339_millis(rec.started_at),
         ended_at: rfc3339_millis(rec.ended_at),
@@ -205,11 +212,12 @@ pub fn build_doc(rec: &CompletedRecording, audio: &AudioOutcome) -> RecordingDoc
 
 fn dprs_doc(seen: &DprsSeen) -> DprsDoc {
     DprsDoc {
-        callsign: trimmed(&seen.report.callsign.as_str()),
-        lat: seen.report.latitude.degrees(),
-        lon: seen.report.longitude.degrees(),
-        symbol: seen.report.symbol,
-        comment: seen.report.comment.clone(),
+        callsign: seen.report.source().as_str().to_owned(),
+        lat: seen.report.latitude().degrees(),
+        lon: seen.report.longitude().degrees(),
+        symbol: seen.report.symbol().code().as_char(),
+        comment: (!seen.report.comment().as_str().is_empty())
+            .then(|| seen.report.comment().as_str().to_owned()),
         at_frame: seen.at_frame,
     }
 }
@@ -225,10 +233,10 @@ const AMBE_RECORD_LEN: u16 = 13;
 #[derive(Debug, thiserror::Error)]
 pub enum WriteError {
     /// Filesystem error with the path it occurred on.
-    #[error("{context} {path}: {source}")]
+    #[error("{operation:?} {path}: {source}")]
     Io {
         /// What was being attempted.
-        context: &'static str,
+        operation: WriteOperation,
         /// Path involved.
         path: PathBuf,
         /// Underlying error.
@@ -239,14 +247,56 @@ pub enum WriteError {
     #[error("serialize metadata: {0}")]
     Serialize(#[from] serde_json::Error),
     /// No free filename variant was found (extremely unexpected).
-    #[error("no free filename for stem {0} after 99 attempts")]
+    #[error("no free filename for stem {0} after 1000 candidates")]
     NameExhausted(String),
+    /// The container's byte count cannot be represented on this platform.
+    #[error("AMBE container exceeds addressable capacity")]
+    ContainerTooLarge,
+    /// Reserving the container's complete output buffer failed.
+    #[error("AMBE allocation: {0}")]
+    Allocation(#[source] std::collections::TryReserveError),
+    /// Metadata is visible, but its final directory sync or reservation release failed.
+    #[error("metadata visible at {path}; completion failed: {source}")]
+    MetadataVisible {
+        /// Visible metadata path; callers must inspect it before retrying.
+        path: PathBuf,
+        /// Failure after publishing the complete metadata bytes.
+        #[source]
+        source: Box<Self>,
+    },
 }
 
-fn io_err(context: &'static str, path: &Path) -> impl FnOnce(std::io::Error) -> WriteError {
+/// Filesystem phase that failed while storing an archive artifact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum WriteOperation {
+    /// Create one missing archive directory.
+    CreateDirectory,
+    /// Sync archive directories and their ancestors on Unix.
+    SyncHierarchy,
+    /// Exclusively reserve a recording stem.
+    ReserveName,
+    /// Exclusively create a temporary artifact.
+    CreateTemporary,
+    /// Write the complete artifact body.
+    WriteTemporary,
+    /// Flush artifact data and metadata to the filesystem.
+    SyncFile,
+    /// Publish a hard link without replacing an existing artifact.
+    Publish,
+    /// Remove a temporary artifact after publication.
+    RemoveTemporary,
+    /// Sync the directory containing a published artifact on Unix.
+    SyncDirectory,
+    /// Remove the recording's exclusive stem reservation.
+    ReleaseReservation,
+    /// Replace an intentionally mutable state file.
+    ReplaceState,
+}
+
+fn io_err(operation: WriteOperation, path: &Path) -> impl FnOnce(std::io::Error) -> WriteError {
     let path = path.to_path_buf();
     move |source| WriteError::Io {
-        context,
+        operation,
         path,
         source,
     }
@@ -266,58 +316,90 @@ impl Writer {
         Self { base, write_wav }
     }
 
-    /// Write one recording: `.ambe` (ground truth, failure aborts),
-    /// then `.wav` (failure is recorded in the JSON, not fatal),
-    /// then `.json` (the commit marker, fsynced). Returns the JSON path.
+    /// Publish raw AMBE, optional decoded WAV, then complete JSON metadata.
+    ///
+    /// Every artifact is written to an exclusive temporary file, synced and
+    /// installed without replacing an existing file. One exclusive stem
+    /// reservation separates concurrent writes. WAV failures are retained in
+    /// `audio.error`; raw or JSON failures abort the operation. On Unix each
+    /// ancestor and artifact directory is synced. Other platforms sync files
+    /// and guarantee nonreplacement visibility, without a directory-durability promise.
     ///
     /// # Errors
     ///
-    /// [`WriteError`] if the directory, `.ambe`, or `.json` cannot be
-    /// written.
+    /// Returns the phase/path/source of a filesystem failure, a container
+    /// capacity error, or a JSON encoding error. Complete raw/WAV artifacts
+    /// may remain after failure. [`WriteError::MetadataVisible`] means the
+    /// JSON is already visible; inspect its path before retrying.
     pub fn write(&self, rec: &CompletedRecording) -> Result<PathBuf, WriteError> {
+        self.write_with(rec, &mut |_, _| Ok(()))
+    }
+
+    fn write_with(
+        &self,
+        rec: &CompletedRecording,
+        observe: &mut impl FnMut(WriteOperation, &Path) -> std::io::Result<()>,
+    ) -> Result<PathBuf, WriteError> {
         let dir = self
             .base
-            .join(format!(
-                "{}-{}",
-                rec.origin.reflector,
-                rec.origin.module.as_char()
-            ))
+            .join(rec.origin.target().to_string())
             .join(rec.started_at.format("%Y-%m-%d").to_string());
-        fs::create_dir_all(&dir).map_err(io_err("create dir", &dir))?;
+        create_directories(&dir, observe)?;
+        let reservation = reserve_stem(&dir, rec, observe)?;
+        let stem = &reservation.stem;
+        let json_path = dir.join(format!("{stem}.json"));
+        let result = (|| {
+            let ambe_path = dir.join(format!("{stem}.ambe"));
+            publish_bytes(&ambe_path, &container_bytes(&rec.frames)?, observe)?;
 
-        let stem = unique_stem(&dir, rec)?;
-
-        let ambe_path = dir.join(format!("{stem}.ambe"));
-        write_atomic(&ambe_path, &container_bytes(&rec.frames), false)?;
-
-        let mut outcome = AudioOutcome {
-            wav: false,
-            concealed_frames: 0,
-            error: None,
-        };
-        if self.write_wav {
-            let decoded = crate::audio::decode_stream(&rec.frames);
-            outcome.concealed_frames = decoded.concealed_frames;
-            let wav_path = dir.join(format!("{stem}.wav"));
-            match write_atomic(&wav_path, &crate::wav::wav_bytes(&decoded.pcm), false) {
-                Ok(()) => outcome.wav = true,
-                Err(e) => {
-                    tracing::error!(path = %wav_path.display(), error = %e, "WAV write failed");
-                    outcome.error = Some(e.to_string());
+            let mut outcome = AudioOutcome {
+                wav: false,
+                concealed_frames: 0,
+                error: None,
+            };
+            if self.write_wav {
+                let wav_path = dir.join(format!("{stem}.wav"));
+                let wav_result = (|| -> Result<(), Box<dyn std::error::Error>> {
+                    let decoded = crate::audio::DecodedAudio::from_frames(&rec.frames)?;
+                    outcome.concealed_frames = decoded.concealed_frames();
+                    let wav = crate::wav::WavFile::from_pcm(decoded.pcm())?;
+                    publish_bytes(&wav_path, wav.as_bytes(), observe)?;
+                    Ok(())
+                })();
+                match wav_result {
+                    Ok(()) => outcome.wav = true,
+                    Err(e) => {
+                        tracing::error!(path = %wav_path.display(), error = %e, "WAV write failed");
+                        outcome.error = Some(e.to_string());
+                    }
                 }
             }
-        }
 
-        let doc = build_doc(rec, &outcome);
-        let json_path = dir.join(format!("{stem}.json"));
-        write_atomic(&json_path, &serde_json::to_vec_pretty(&doc)?, true)?;
-        Ok(json_path)
+            let doc = build_doc(rec, &outcome);
+            publish_bytes(&json_path, &serde_json::to_vec_pretty(&doc)?, observe)
+        })();
+        let released = reservation.release(observe);
+        match result.and(released) {
+            Ok(()) => Ok(json_path),
+            Err(source) if json_path.exists() => Err(WriteError::MetadataVisible {
+                path: json_path,
+                source: Box::new(source),
+            }),
+            Err(source) => Err(source),
+        }
     }
 }
 
 /// Serialize frames into the self-describing container format.
-fn container_bytes(frames: &[FrameRecord]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(16 + frames.len() * usize::from(AMBE_RECORD_LEN));
+pub(crate) fn container_bytes(frames: &[FrameRecord]) -> Result<Vec<u8>, WriteError> {
+    let length = frames
+        .len()
+        .checked_mul(usize::from(AMBE_RECORD_LEN))
+        .and_then(|bytes| bytes.checked_add(16))
+        .ok_or(WriteError::ContainerTooLarge)?;
+    let mut out = Vec::new();
+    out.try_reserve_exact(length)
+        .map_err(WriteError::Allocation)?;
     out.extend_from_slice(AMBE_MAGIC);
     out.extend_from_slice(&AMBE_VERSION.to_le_bytes());
     out.extend_from_slice(&AMBE_RECORD_LEN.to_le_bytes());
@@ -327,7 +409,7 @@ fn container_bytes(frames: &[FrameRecord]) -> Vec<u8> {
         out.extend_from_slice(&f.ambe);
         out.extend_from_slice(&f.slow_data);
     }
-    out
+    Ok(out)
 }
 
 /// Map a wire callsign to a filename-safe `[A-Z0-9-]+` token.
@@ -348,12 +430,32 @@ pub(crate) fn sanitize_callsign(raw: &str) -> String {
     }
 }
 
-/// Compute the filename stem, appending `-1`, `-2`, … if the `.json`
-/// already exists (same second + callsign + stream id).
-fn unique_stem(dir: &Path, rec: &CompletedRecording) -> Result<String, WriteError> {
+struct Reservation {
+    stem: String,
+    path: PathBuf,
+    handle: fs::File,
+}
+
+impl Reservation {
+    fn release(
+        self,
+        observe: &mut impl FnMut(WriteOperation, &Path) -> std::io::Result<()>,
+    ) -> Result<(), WriteError> {
+        drop(self.handle);
+        observe(WriteOperation::ReleaseReservation, &self.path)
+            .map_err(io_err(WriteOperation::ReleaseReservation, &self.path))?;
+        fs::remove_file(&self.path).map_err(io_err(WriteOperation::ReleaseReservation, &self.path))
+    }
+}
+
+fn reserve_stem(
+    dir: &Path,
+    rec: &CompletedRecording,
+    observe: &mut impl FnMut(WriteOperation, &Path) -> std::io::Result<()>,
+) -> Result<Reservation, WriteError> {
     let callsign = rec.header.as_ref().map_or_else(
         || "UNKNOWN".to_string(),
-        |h| sanitize_callsign(&h.my_call.as_str()),
+        |h| sanitize_callsign(&h.my_call.to_string()),
     );
     let base = format!(
         "{}_{}_{:04X}",
@@ -361,32 +463,159 @@ fn unique_stem(dir: &Path, rec: &CompletedRecording) -> Result<String, WriteErro
         callsign,
         rec.stream_id.get()
     );
-    if !dir.join(format!("{base}.json")).exists() {
-        return Ok(base);
-    }
-    for i in 1..=99u32 {
-        let candidate = format!("{base}-{i}");
-        if !dir.join(format!("{candidate}.json")).exists() {
-            return Ok(candidate);
+    for suffix in 0..=999_u16 {
+        let stem = if suffix == 0 {
+            base.clone()
+        } else {
+            format!("{base}-{suffix}")
+        };
+        let path = dir.join(format!("{stem}.reserve"));
+        observe(WriteOperation::ReserveName, &path)
+            .map_err(io_err(WriteOperation::ReserveName, &path))?;
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(handle) => {
+                let reservation = Reservation { stem, path, handle };
+                if ["ambe", "wav", "json", "ambe.tmp", "wav.tmp", "json.tmp"]
+                    .iter()
+                    .all(|extension| {
+                        !dir.join(format!("{}.{extension}", reservation.stem))
+                            .exists()
+                    })
+                {
+                    return Ok(reservation);
+                }
+                reservation.release(observe)?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(source) => return Err(io_err(WriteOperation::ReserveName, &path)(source)),
         }
     }
     Err(WriteError::NameExhausted(base))
 }
 
-/// Write bytes to `<path>.tmp`, optionally fsync, then rename over
-/// `path`. A crash leaves at most `.tmp` litter, never a torn file.
-pub(crate) fn write_atomic(path: &Path, bytes: &[u8], fsync: bool) -> Result<(), WriteError> {
+/// Publish complete bytes without replacing an existing destination.
+pub(crate) fn publish_bytes(
+    path: &Path,
+    bytes: &[u8],
+    observe: &mut impl FnMut(WriteOperation, &Path) -> std::io::Result<()>,
+) -> Result<(), WriteError> {
     let mut tmp_os = path.as_os_str().to_owned();
     tmp_os.push(".tmp");
     let tmp = PathBuf::from(tmp_os);
+    observe(WriteOperation::CreateTemporary, &tmp)
+        .map_err(io_err(WriteOperation::CreateTemporary, &tmp))?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .map_err(io_err(WriteOperation::CreateTemporary, &tmp))?;
+    let result = (|| {
+        observe(WriteOperation::WriteTemporary, &tmp)
+            .map_err(io_err(WriteOperation::WriteTemporary, &tmp))?;
+        file.write_all(bytes)
+            .map_err(io_err(WriteOperation::WriteTemporary, &tmp))?;
+        observe(WriteOperation::SyncFile, &tmp).map_err(io_err(WriteOperation::SyncFile, &tmp))?;
+        file.sync_all()
+            .map_err(io_err(WriteOperation::SyncFile, &tmp))
+    })();
+    drop(file);
+    if let Err(error) = result {
+        let _cleanup = fs::remove_file(&tmp);
+        return Err(error);
+    }
+    if let Err(source) =
+        observe(WriteOperation::Publish, path).and_then(|()| fs::hard_link(&tmp, path))
     {
-        let mut f = fs::File::create(&tmp).map_err(io_err("create", &tmp))?;
-        f.write_all(bytes).map_err(io_err("write", &tmp))?;
-        if fsync {
-            f.sync_all().map_err(io_err("fsync", &tmp))?;
+        let _cleanup = fs::remove_file(&tmp);
+        return Err(io_err(WriteOperation::Publish, path)(source));
+    }
+    observe(WriteOperation::RemoveTemporary, &tmp)
+        .map_err(io_err(WriteOperation::RemoveTemporary, &tmp))?;
+    fs::remove_file(&tmp).map_err(io_err(WriteOperation::RemoveTemporary, &tmp))?;
+    #[cfg(unix)]
+    sync_directory(
+        path.parent().unwrap_or_else(|| Path::new(".")),
+        WriteOperation::SyncDirectory,
+        observe,
+    )?;
+    Ok(())
+}
+
+pub(crate) fn replace_state(path: &Path, bytes: &[u8]) -> Result<(), WriteError> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT_TEMPORARY: AtomicU64 = AtomicU64::new(0);
+    let mut name = path.as_os_str().to_owned();
+    name.push(format!(
+        ".{}.{}.tmp",
+        std::process::id(),
+        NEXT_TEMPORARY.fetch_add(1, Ordering::Relaxed)
+    ));
+    let temporary = PathBuf::from(name);
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .map_err(io_err(WriteOperation::CreateTemporary, &temporary))?;
+    let written = file.write_all(bytes).and_then(|()| file.sync_all());
+    drop(file);
+    if let Err(source) = written {
+        let _cleanup = fs::remove_file(&temporary);
+        return Err(io_err(WriteOperation::WriteTemporary, &temporary)(source));
+    }
+    if let Err(source) = fs::rename(&temporary, path) {
+        let _cleanup = fs::remove_file(&temporary);
+        return Err(io_err(WriteOperation::ReplaceState, path)(source));
+    }
+    #[cfg(unix)]
+    sync_directory(
+        path.parent().unwrap_or_else(|| Path::new(".")),
+        WriteOperation::SyncDirectory,
+        &mut |_, _| Ok(()),
+    )?;
+    Ok(())
+}
+
+#[cfg(unix)]
+pub(crate) fn sync_directory(
+    directory: &Path,
+    operation: WriteOperation,
+    observe: &mut impl FnMut(WriteOperation, &Path) -> std::io::Result<()>,
+) -> Result<(), WriteError> {
+    let directory = if directory.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        directory
+    };
+    observe(operation, directory).map_err(io_err(operation, directory))?;
+    fs::File::open(directory)
+        .and_then(|file| file.sync_all())
+        .map_err(io_err(operation, directory))
+}
+
+pub(crate) fn create_directories(
+    directory: &Path,
+    observe: &mut impl FnMut(WriteOperation, &Path) -> std::io::Result<()>,
+) -> Result<(), WriteError> {
+    let mut missing = Vec::new();
+    let mut ancestor = directory;
+    while !ancestor.as_os_str().is_empty() && !ancestor.is_dir() {
+        missing.push(ancestor.to_path_buf());
+        ancestor = ancestor.parent().unwrap_or_else(|| Path::new(""));
+    }
+    for path in missing.into_iter().rev() {
+        observe(WriteOperation::CreateDirectory, &path)
+            .map_err(io_err(WriteOperation::CreateDirectory, &path))?;
+        match fs::create_dir(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && path.is_dir() => {}
+            Err(source) => return Err(io_err(WriteOperation::CreateDirectory, &path)(source)),
         }
     }
-    fs::rename(&tmp, path).map_err(io_err("rename", path))
+    #[cfg(unix)]
+    for ancestor in directory.ancestors() {
+        sync_directory(ancestor, WriteOperation::SyncHierarchy, observe)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -394,26 +623,30 @@ mod tests {
     use super::*;
     use crate::capture::{CompletedRecording, EndReason, FrameRecord, StreamOrigin};
     use chrono::{DateTime, Utc};
-    use dstar_gateway_core::{Callsign, DstarHeader, Module, StreamId, Suffix};
+    use dstar_gateway_core::hosts::HostAddress;
+    use dstar_gateway_core::{
+        Callsign, DstarHeader, HeaderFlags, Module, ProtocolKind, StreamId, Suffix,
+    };
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
     fn fixture() -> Option<CompletedRecording> {
         Some(CompletedRecording {
-            origin: StreamOrigin {
-                reflector: "REF030".to_string(),
-                module: Module::C,
-                protocol: "dplus",
-                host: "ref030.example.org".to_string(),
-                port: 20001,
-                peer: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 20001),
-            },
+            origin: StreamOrigin::new(
+                crate::config::Target::new(
+                    crate::config::ReflectorName::new("REF030").ok()?,
+                    ProtocolKind::DPlus,
+                    HostAddress::new("ref030.example.org").ok()?,
+                    const { std::num::NonZeroU16::new(20001).unwrap() },
+                    Module::C,
+                )
+                .ok()?,
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 20001),
+            ),
             stream_id: StreamId::new(0x04D2)?,
             header: Some(DstarHeader {
-                flag1: 12,
-                flag2: 0,
-                flag3: 0,
+                flags: HeaderFlags::from_bytes([12, 0, 0]),
                 rpt2: Callsign::from_wire_bytes(*b"REF030 G"),
                 rpt1: Callsign::from_wire_bytes(*b"REF030 C"),
                 ur_call: Callsign::from_wire_bytes(*b"CQCQCQ  "),
@@ -581,10 +814,10 @@ mod tests {
         assert!(expected_dir.join(format!("{stem}.wav")).exists());
         assert!(expected_dir.join(format!("{stem}.json")).exists());
         // No temp litter after success.
-        let names: Vec<String> = fs::read_dir(&expected_dir)?
-            .filter_map(Result::ok)
-            .map(|e| e.file_name().to_string_lossy().to_string())
-            .collect();
+        let mut names = Vec::new();
+        for entry in fs::read_dir(&expected_dir)? {
+            names.push(entry?.file_name().to_string_lossy().into_owned());
+        }
         assert!(
             names
                 .iter()
@@ -677,5 +910,156 @@ mod tests {
         assert_eq!(sanitize_callsign("W1AW"), "W1AW");
         assert_eq!(sanitize_callsign("w1aw/p"), "W1AW-P");
         assert_eq!(sanitize_callsign("   "), "UNKNOWN");
+    }
+
+    #[test]
+    fn concurrent_publication_reserves_complete_distinct_recordings() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let writer = std::sync::Arc::new(Writer::new(dir.path().to_path_buf(), true));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+        let mut tasks = Vec::new();
+        for byte in 1..=4_u8 {
+            let writer = writer.clone();
+            let barrier = barrier.clone();
+            let mut recording = fixture().ok_or("fixture")?;
+            recording.frames = vec![FrameRecord {
+                seq: byte,
+                ambe: [byte; 9],
+                slow_data: [byte; 3],
+            }];
+            recording.gaps = 0;
+            tasks.push(std::thread::spawn(move || {
+                let _waited = barrier.wait();
+                writer.write(&recording).map(|path| (byte, path))
+            }));
+        }
+        let mut paths = std::collections::BTreeSet::new();
+        for task in tasks {
+            let (byte, path) = task.join().map_err(|_| "publication task panicked")??;
+            assert!(
+                paths.insert(path.clone()),
+                "recording paths must be distinct"
+            );
+            let ambe = fs::read(path.with_extension("ambe"))?;
+            assert_eq!(ambe.get(17..26), Some([byte; 9].as_slice()));
+            assert!(path.with_extension("wav").exists());
+            let document: serde_json::Value = serde_json::from_slice(&fs::read(path)?)?;
+            assert_eq!(
+                document.pointer("/frames/received"),
+                Some(&serde_json::json!(1))
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn publication_preserves_existing_artifacts_and_reports_visible_metadata() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let destination = dir.path().join("raw.ambe");
+        fs::write(&destination, b"retained")?;
+        assert!(publish_bytes(&destination, b"replacement", &mut |_, _| Ok(())).is_err());
+        assert_eq!(fs::read(destination)?, b"retained");
+        let writer = Writer::new(dir.path().to_path_buf(), false);
+        let rec = fixture().ok_or("fixture")?;
+        let failure = writer.write_with(&rec, &mut |operation, path| {
+            if operation == WriteOperation::ReleaseReservation
+                && path.extension() == Some("reserve".as_ref())
+            {
+                return Err(std::io::Error::other(
+                    "injected reservation release failure",
+                ));
+            }
+            Ok(())
+        });
+        assert!(
+            matches!(failure, Err(WriteError::MetadataVisible { ref path, .. }) if path.exists()),
+            "{failure:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn raw_failure_blocks_metadata_and_wav_failure_is_explicit() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let writer = Writer::new(dir.path().to_path_buf(), true);
+        let rec = fixture().ok_or("fixture")?;
+        let failed = writer.write_with(&rec, &mut |operation, path| {
+            if operation == WriteOperation::Publish && path.extension() == Some("ambe".as_ref()) {
+                return Err(std::io::Error::other("injected raw publication failure"));
+            }
+            Ok(())
+        });
+        assert!(failed.is_err());
+        let target_dir = dir.path().join("REF030-C/1970-01-01");
+        assert!(fs::read_dir(&target_dir)?.all(|entry| {
+            entry.is_ok_and(|entry| entry.path().extension() != Some("json".as_ref()))
+        }));
+        let path = writer.write_with(&rec, &mut |operation, path| {
+            if operation == WriteOperation::Publish && path.extension() == Some("wav".as_ref()) {
+                return Err(std::io::Error::other("injected WAV publication failure"));
+            }
+            Ok(())
+        })?;
+        let document: serde_json::Value = serde_json::from_slice(&fs::read(path)?)?;
+        assert_eq!(
+            document.pointer("/audio/wav"),
+            Some(&serde_json::json!(false))
+        );
+        assert!(
+            document
+                .pointer("/audio/error")
+                .and_then(serde_json::Value::as_str)
+                .is_some()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn every_artifact_is_synced_before_publication_and_metadata_is_last() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let writer = Writer::new(dir.path().to_path_buf(), true);
+        let rec = fixture().ok_or("fixture")?;
+        let mut operations = Vec::new();
+        let _path = writer.write_with(&rec, &mut |operation, path| {
+            operations.push((operation, path.to_path_buf()));
+            Ok(())
+        })?;
+        let published: Vec<_> = operations
+            .iter()
+            .filter(|(operation, _)| *operation == WriteOperation::Publish)
+            .map(|(_, path)| path.extension())
+            .collect();
+        assert_eq!(
+            published,
+            [
+                Some("ambe".as_ref()),
+                Some("wav".as_ref()),
+                Some("json".as_ref())
+            ]
+        );
+        for (index, (operation, path)) in operations.iter().enumerate() {
+            if *operation == WriteOperation::Publish {
+                let mut temporary = path.as_os_str().to_owned();
+                temporary.push(".tmp");
+                assert!(
+                    operations
+                        .get(..index)
+                        .ok_or("earlier operations")?
+                        .iter()
+                        .any(|(operation, path)| *operation == WriteOperation::SyncFile
+                            && path == Path::new(&temporary))
+                );
+            }
+        }
+        #[cfg(unix)]
+        assert!(operations.iter().any(|(operation, path)| *operation
+            == WriteOperation::SyncHierarchy
+            && path == dir.path()));
+        #[cfg(not(unix))]
+        assert!(!operations.iter().any(|(operation, _)| matches!(
+            operation,
+            WriteOperation::SyncHierarchy | WriteOperation::SyncDirectory
+        )));
+        Ok(())
     }
 }

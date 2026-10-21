@@ -3,11 +3,16 @@
 
 //! Stargazer CLI entry point.
 
-// The bin target is its own compilation unit and sees every crate
-// dependency; acknowledge the ones consumed only by the library so
-// `unused_crate_dependencies` stays silent here.
+use std::num::{NonZeroU64, NonZeroUsize};
+use std::path::PathBuf;
+use std::process::ExitCode;
+#[cfg(unix)]
+use std::sync::Arc;
+use std::time::Duration;
+
+use clap::{Parser, Subcommand};
 use dstar_gateway as _;
-use dstar_gateway_core as _;
+use dstar_gateway_core::RoutingCallsign;
 use mbelib_rs as _;
 use reqwest as _;
 use serde as _;
@@ -17,12 +22,9 @@ use tempfile as _;
 use thiserror as _;
 use toml as _;
 
-use std::path::PathBuf;
-use std::process::ExitCode;
-use std::sync::Arc;
-use std::time::Duration;
-
-use clap::{Parser, Subcommand};
+use stargazer::config::{Config, TargetKey};
+use stargazer::harvest::{DashboardUrl, HarvestOptions};
+use stargazer::survey::{ActivityRanking, SurveyLimits};
 
 /// D-STAR reflector voice recorder and activity survey.
 #[derive(Debug, Parser)]
@@ -53,6 +55,18 @@ enum Cmd {
         /// Poll exactly once and exit.
         #[arg(long)]
         once: bool,
+        /// Operator callsign in the User-Agent; otherwise read from --config.
+        #[arg(long)]
+        operator: Option<RoutingCallsign>,
+        /// Maximum retained distinct event identities; raise to resume a full archive.
+        #[arg(long, default_value = "1000000")]
+        max_seen: NonZeroUsize,
+        /// Maximum response body bytes.
+        #[arg(long, default_value = "1048576")]
+        max_response_bytes: NonZeroUsize,
+        /// Maximum JSON bytes per archived line.
+        #[arg(long, default_value = "1048576")]
+        max_line_bytes: NonZeroUsize,
     },
     /// Rank reflector modules by archived voice activity.
     Report {
@@ -62,28 +76,30 @@ enum Cmd {
         /// Ranking window in hours.
         #[arg(long, default_value_t = 24)]
         window_hours: u64,
+        /// Maximum JSON bytes per archived line.
+        #[arg(long, default_value = "1048576")]
+        max_line_bytes: NonZeroUsize,
     },
-    /// Fetch reflector-published recordings (reference-decoded MP3s,
+    /// Fetch reflector-published recordings (MP3s,
     /// sidecars, gap-fill packet logs) that pair with local
     /// recordings, into per-date `published/` subdirectories.
     Harvest {
         /// Recordings directory (as written by the recorder).
         #[arg(long, default_value = "recordings")]
         recordings: PathBuf,
-        /// Date to harvest, YYYY-MM-DD (UTC). Defaults to today;
-        /// published retention is short, so harvest same-day.
+        /// Date to harvest, YYYY-MM-DD (UTC). Defaults to today.
         #[arg(long, value_parser = parse_date)]
         date: Option<chrono::NaiveDate>,
         /// Restrict to one reflector-module directory (repeatable,
         /// e.g. `--target REF030-C`). Default: every directory.
         #[arg(long)]
-        target: Vec<String>,
+        target: Vec<TargetKey>,
         /// Dashboard base URL override (testing / non-REF systems).
         #[arg(long)]
-        base_url: Option<String>,
+        base_url: Option<DashboardUrl>,
         /// Maximum downloads this run.
         #[arg(long)]
-        limit: Option<usize>,
+        limit: Option<NonZeroUsize>,
         /// Match and report only; download and write nothing.
         #[arg(long)]
         dry_run: bool,
@@ -91,7 +107,7 @@ enum Cmd {
         /// owners can identify and contact who is fetching (default:
         /// the callsign from --config when that file exists).
         #[arg(long)]
-        operator: Option<String>,
+        operator: Option<RoutingCallsign>,
     },
     /// Reconstruct recordings from published dvrec packet logs for
     /// transmissions with no locally captured twin (salvage from
@@ -100,10 +116,14 @@ enum Cmd {
         /// Recordings directory (as written by the recorder).
         #[arg(long, default_value = "recordings")]
         recordings: PathBuf,
+        /// Maximum retained prefix per imported transmission, in seconds.
+        #[arg(long, default_value = "3600")]
+        max_capture_seconds: NonZeroU64,
+        /// Maximum input bytes for one packet log.
+        #[arg(long, default_value = "67108864")]
+        max_input_bytes: NonZeroUsize,
     },
-    /// Control the running recorder: free or reclaim individual
-    /// reflector slots and apply config target changes, all without
-    /// restarting (and without touching the other links).
+    /// Control local recorder sessions through a Unix socket.
     Ctl {
         #[command(subcommand)]
         action: CtlAction,
@@ -124,16 +144,15 @@ enum Cmd {
 enum CtlAction {
     /// Show every configured target's state.
     Status,
-    /// Unlink one target and keep its slot free (persists across
-    /// recorder restarts until `enable`).
+    /// Stop one local target and persist its disabled state.
     Disable {
         /// Target key, e.g. `REF030-C`.
-        target: String,
+        target: TargetKey,
     },
     /// Relink a disabled target.
     Enable {
         /// Target key, e.g. `REF030-C`.
-        target: String,
+        target: TargetKey,
     },
     /// Re-read the config file and start/stop supervisors to match
     /// its target list.
@@ -156,8 +175,28 @@ async fn main() -> ExitCode {
             out,
             interval,
             once,
-        }) => survey(&out, interval, once).await,
-        Some(Cmd::Report { out, window_hours }) => report(&out, window_hours),
+            operator,
+            max_seen,
+            max_response_bytes,
+            max_line_bytes,
+        }) => {
+            let operator = match resolve_operator(operator, &args.config) {
+                Ok(operator) => operator,
+                Err(error) => {
+                    tracing::error!(%error, "set --operator or provide a valid --config");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let limits = SurveyLimits::new(max_seen)
+                .with_response_bytes(max_response_bytes)
+                .with_line_bytes(max_line_bytes);
+            survey(&out, interval, once, limits, operator).await
+        }
+        Some(Cmd::Report {
+            out,
+            window_hours,
+            max_line_bytes,
+        }) => report(&out, window_hours, max_line_bytes),
         Some(Cmd::Features { input, out }) => {
             match stargazer::features::export_file(&input, &out) {
                 Ok(frames) => {
@@ -179,25 +218,53 @@ async fn main() -> ExitCode {
             dry_run,
             operator,
         }) => {
-            // Identify the responsible operator in the User-Agent:
-            // explicit flag first, recorder config as the fallback.
-            let operator = operator.or_else(|| {
-                stargazer::config::load(&args.config)
-                    .ok()
-                    .map(|c| c.callsign.as_str().trim_end().to_string())
-            });
-            let options = stargazer::harvest::HarvestOptions {
-                base_url,
-                limit,
-                dry_run,
-                operator,
-                ..stargazer::harvest::HarvestOptions::default()
+            let operator = match resolve_operator(operator, &args.config) {
+                Ok(operator) => operator,
+                Err(error) => {
+                    tracing::error!(%error, "set --operator or provide a valid --config");
+                    return ExitCode::FAILURE;
+                }
             };
+            let mut options = HarvestOptions::new(operator).with_dry_run(dry_run);
+            if let Some(base) = base_url {
+                options = options.with_base_url(base);
+            }
+            if let Some(maximum) = limit {
+                options = options.with_limit(maximum);
+            }
             harvest(&recordings, date, &target, options).await
         }
-        Some(Cmd::ImportDvrec { recordings }) => import_dvrec(&recordings),
+        Some(Cmd::ImportDvrec {
+            recordings,
+            max_capture_seconds,
+            max_input_bytes,
+        }) => {
+            let capture = match stargazer::capture::CaptureDurationLimit::try_from_seconds(
+                max_capture_seconds.get(),
+            ) {
+                Ok(limit) => limit,
+                Err(error) => {
+                    tracing::error!(%error, "import capture limit is not representable");
+                    return ExitCode::FAILURE;
+                }
+            };
+            import_dvrec(
+                &recordings,
+                stargazer::dvrec::ImportLimits::new(max_input_bytes, capture),
+            )
+        }
         Some(Cmd::Ctl { action }) => ctl(&args.config, action).await,
     }
+}
+
+fn resolve_operator(
+    explicit: Option<RoutingCallsign>,
+    config_path: &std::path::Path,
+) -> Result<RoutingCallsign, stargazer::config::ConfigError> {
+    explicit.map_or_else(
+        || Config::load(config_path).map(|config| config.callsign()),
+        Ok,
+    )
 }
 
 /// Import salvaged dvrec packet logs as recordings.
@@ -208,9 +275,9 @@ async fn main() -> ExitCode {
 /// permanently wedge any pipeline that runs the importer ahead of
 /// later stages. The exit code reports only whether the recordings
 /// tree itself could be walked.
-fn import_dvrec(recordings: &std::path::Path) -> ExitCode {
+fn import_dvrec(recordings: &std::path::Path, limits: stargazer::dvrec::ImportLimits) -> ExitCode {
     let writer = stargazer::writer::Writer::new(recordings.to_path_buf(), true);
-    match stargazer::dvrec::import_tree(recordings, &writer) {
+    match stargazer::dvrec::import_tree(recordings, &writer, limits) {
         Err(e) => {
             tracing::error!(error = %e, "dvrec import failed");
             ExitCode::FAILURE
@@ -230,74 +297,99 @@ fn import_dvrec(recordings: &std::path::Path) -> ExitCode {
 
 /// Send one control command to the running recorder and print the
 /// response.
+#[cfg(unix)]
 async fn ctl(config_path: &std::path::Path, action: CtlAction) -> ExitCode {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-    let config = match stargazer::config::load(config_path) {
+    let config = match Config::load(config_path) {
         Ok(c) => c,
         Err(e) => {
             tracing::error!(path = %config_path.display(), error = %e, "config load failed");
             return ExitCode::FAILURE;
         }
     };
-    let socket = config.recordings_dir.join(stargazer::control::SOCKET_FILE);
+    let socket = config
+        .recordings_dir()
+        .join(stargazer::control::SOCKET_FILE);
     let line = match action {
         CtlAction::Status => "status".to_string(),
         CtlAction::Disable { target } => format!("disable {target}"),
         CtlAction::Enable { target } => format!("enable {target}"),
         CtlAction::Reload => "reload".to_string(),
     };
-    let mut stream = match tokio::net::UnixStream::connect(&socket).await {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!(
-                socket = %socket.display(),
-                error = %e,
-                "cannot reach the recorder; is it running (with control support)?"
-            );
-            return ExitCode::FAILURE;
+    let exchange = async {
+        let mut stream = tokio::net::UnixStream::connect(&socket).await?;
+        stream.write_all(format!("{line}\n").as_bytes()).await?;
+        let mut response = Vec::new();
+        let _count = stream.take(1_048_577).read_to_end(&mut response).await?;
+        if response.len() > 1_048_576 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "control response exceeds 1 MiB",
+            ));
         }
+        String::from_utf8(response)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
     };
-    if let Err(e) = stream.write_all(format!("{line}\n").as_bytes()).await {
-        tracing::error!(error = %e, "control request failed");
-        return ExitCode::FAILURE;
+    match tokio::time::timeout(Duration::from_secs(10), exchange).await {
+        Ok(Ok(response)) => {
+            print!("{response}");
+            ExitCode::SUCCESS
+        }
+        Ok(Err(error)) => {
+            tracing::error!(%error, socket = %socket.display(), "control request failed; check recorder status");
+            ExitCode::FAILURE
+        }
+        Err(_) => {
+            tracing::error!(
+                "control request exceeded 10 seconds; inspect recorder status before retrying"
+            );
+            ExitCode::FAILURE
+        }
     }
-    let mut response = String::new();
-    if let Err(e) = stream.read_to_string(&mut response).await {
-        tracing::error!(error = %e, "control response failed");
-        return ExitCode::FAILURE;
-    }
-    print!("{response}");
-    ExitCode::SUCCESS
+}
+
+#[cfg(not(unix))]
+fn ctl(_config_path: &std::path::Path, _action: CtlAction) -> std::future::Ready<ExitCode> {
+    tracing::error!("recorder control requires Unix sockets; use a Unix platform");
+    std::future::ready(ExitCode::FAILURE)
 }
 
 /// Default mode: record configured reflector targets.
+#[cfg(unix)]
 async fn record(config_path: &std::path::Path) -> ExitCode {
-    let config = match stargazer::config::load(config_path) {
+    let config = match Config::load(config_path) {
         Ok(c) => c,
         Err(e) => {
             tracing::error!(path = %config_path.display(), error = %e, "config load failed");
             return ExitCode::FAILURE;
         }
     };
-    if let Err(e) = std::fs::create_dir_all(&config.recordings_dir) {
+    if let Err(e) = std::fs::create_dir_all(config.recordings_dir()) {
         tracing::error!(
-            dir = %config.recordings_dir.display(),
+            dir = %config.recordings_dir().display(),
             error = %e,
             "cannot create recordings dir"
         );
         return ExitCode::FAILURE;
     }
+    let _instance_lock = match claim_instance(config.recordings_dir()) {
+        Ok(file) => file,
+        Err(error) => {
+            tracing::error!(%error, "cannot lock recorder directory; stop the other recorder or inspect permissions");
+            return ExitCode::FAILURE;
+        }
+    };
     tracing::info!(
-        targets = config.targets.len(),
-        recordings_dir = %config.recordings_dir.display(),
-        max_capture_seconds = config.capture_limit.as_seconds(),
-        max_concurrent_captures = config.concurrent_capture_limit.get(),
+        targets = config.targets().len(),
+        recordings_dir = %config.recordings_dir().display(),
+        max_capture_seconds = config.capture_limit().as_seconds(),
+        max_concurrent_captures = config.concurrent_capture_limit().get(),
         "stargazer recording"
     );
 
     let writer = Arc::new(stargazer::writer::Writer::new(
-        config.recordings_dir.clone(),
-        config.write_wav,
+        config.recordings_dir().to_owned(),
+        config.write_wav(),
     ));
     let mut coordinator =
         match stargazer::control::Coordinator::new(config, config_path.to_path_buf(), writer) {
@@ -307,22 +399,11 @@ async fn record(config_path: &std::path::Path) -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
-    // Single-instance guard BEFORE any reflector is touched: two
-    // recorders share one callsign and would displace each other on
-    // every slot, so a second instance must die without connecting.
     let socket_path = coordinator.socket_path();
-    if stargazer::control::recorder_already_running(&socket_path).await {
-        tracing::error!(
-            socket = %socket_path.display(),
-            "another recorder is already running; refusing to start a second"
-        );
-        return ExitCode::FAILURE;
-    }
-    let _unused = std::fs::remove_file(&socket_path); // stale socket after a crash
-    let listener = match tokio::net::UnixListener::bind(&socket_path) {
+    let listener = match bind_control_socket(&socket_path).await {
         Ok(l) => l,
         Err(e) => {
-            tracing::error!(socket = %socket_path.display(), error = %e, "control socket bind failed");
+            tracing::error!(socket = %socket_path.display(), error = %e, "control socket initialization failed");
             return ExitCode::FAILURE;
         }
     };
@@ -331,6 +412,7 @@ async fn record(config_path: &std::path::Path) -> ExitCode {
     let server = tokio::spawn(stargazer::control::serve_socket(listener, request_tx));
     tracing::info!(socket = %socket_path.display(), "control socket ready (`stargazer ctl status`)");
 
+    let mut reconcile = tokio::time::interval(Duration::from_millis(250));
     loop {
         tokio::select! {
             sig = tokio::signal::ctrl_c() => {
@@ -345,28 +427,119 @@ async fn record(config_path: &std::path::Path) -> ExitCode {
                 break;
             }
             request = request_rx.recv() => {
-                let Some((command, reply)) = request else { break };
+                let Some(stargazer::control::CommandRequest { command, reply }) = request else { break };
                 let response = coordinator.handle(command).await;
-                let _unused = reply.send(response);
+                log_completions(response.completions());
+                let _delivered = reply.send(response.message().to_owned());
             }
+            _tick = reconcile.tick() => log_completions(&coordinator.reconcile().await),
         }
     }
 
-    server.abort();
-    if tokio::time::timeout(Duration::from_secs(8), coordinator.shutdown_all())
-        .await
-        .is_err()
-    {
-        tracing::warn!("supervisors did not drain within 8s, exiting anyway");
+    drop(request_rx);
+    let server_ok = match server.await {
+        Ok(Ok(())) => true,
+        Ok(Err(error)) => {
+            tracing::error!(%error, "control server failed");
+            false
+        }
+        Err(error) => {
+            tracing::error!(%error, "control server task failed");
+            false
+        }
+    };
+    log_completions(&coordinator.shutdown_all().await);
+    if let Err(error) = std::fs::remove_file(&socket_path) {
+        tracing::error!(%error, "cannot remove recorder socket");
+        return ExitCode::FAILURE;
     }
-    let _unused = std::fs::remove_file(&socket_path);
-    ExitCode::SUCCESS
+    if server_ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
+#[cfg(unix)]
+fn claim_instance(directory: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(directory.join(".recorder.lock"))?;
+    file.try_lock()?;
+    Ok(file)
+}
+
+#[cfg(unix)]
+#[derive(Debug, thiserror::Error)]
+enum ControlStartupError {
+    #[error("cannot determine socket state: {0}; inspect it before starting")]
+    Probe(#[from] stargazer::control::ProbeError),
+    #[error("recorder socket is occupied; use the existing recorder")]
+    Occupied,
+    #[error("socket creation: {0}; inspect the path and permissions")]
+    Io(#[from] std::io::Error),
+}
+
+#[cfg(unix)]
+async fn bind_control_socket(
+    path: &std::path::Path,
+) -> Result<tokio::net::UnixListener, ControlStartupError> {
+    if stargazer::control::recorder_already_running(path).await? {
+        return Err(ControlStartupError::Occupied);
+    }
+    if let Err(error) = std::fs::remove_file(path)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(error.into());
+    }
+    Ok(tokio::net::UnixListener::bind(path)?)
+}
+
+#[cfg(not(unix))]
+fn record(_config_path: &std::path::Path) -> std::future::Ready<ExitCode> {
+    tracing::error!("recording requires Unix socket coordination; use a Unix platform");
+    std::future::ready(ExitCode::FAILURE)
+}
+
+#[cfg(unix)]
+fn log_completions(completions: &[stargazer::control::TargetCompletion]) {
+    for completion in completions {
+        match &completion.result {
+            Ok(summary) => {
+                if let Some(error) = summary.last_failure() {
+                    tracing::warn!(target = %completion.target, %error, written = summary.recordings_written(), failed_writes = summary.failed_writes(), "supervisor stopped with failures");
+                }
+            }
+            Err(error) => {
+                tracing::error!(target = %completion.target, %error, "supervisor task failed");
+            }
+        }
+    }
 }
 
 /// Survey mode: poll the DPLUSMON feed gently and archive everything.
-async fn survey(out: &std::path::Path, interval: u64, once: bool) -> ExitCode {
-    let interval = interval.max(stargazer::survey::MIN_INTERVAL_SECS);
-    let mut surveyor = match stargazer::survey::Surveyor::new(out) {
+async fn survey(
+    out: &std::path::Path,
+    interval: u64,
+    once: bool,
+    limits: SurveyLimits,
+    operator: RoutingCallsign,
+) -> ExitCode {
+    if interval < stargazer::survey::MIN_INTERVAL_SECS
+        || Duration::from_secs(interval)
+            .checked_mul(16)
+            .and_then(|duration| tokio::time::Instant::now().checked_add(duration))
+            .is_none()
+    {
+        tracing::error!(
+            "poll interval must be at least 30 seconds and fit its 16-times backoff deadline"
+        );
+        return ExitCode::FAILURE;
+    }
+    let mut surveyor = match stargazer::survey::Surveyor::new(out, limits, operator) {
         Ok(s) => s,
         Err(e) => {
             tracing::error!(error = %e, "survey init failed");
@@ -389,7 +562,7 @@ async fn survey(out: &std::path::Path, interval: u64, once: bool) -> ExitCode {
                 return ExitCode::FAILURE;
             }
             Ok(rec) => {
-                if let Some(err) = &rec.error {
+                if let Some(err) = rec.error() {
                     consecutive_errors = consecutive_errors.saturating_add(1);
                     tracing::warn!(error = %err, consecutive = consecutive_errors, "poll failed");
                 } else {
@@ -413,10 +586,16 @@ async fn survey(out: &std::path::Path, interval: u64, once: bool) -> ExitCode {
             return ExitCode::SUCCESS;
         }
         // Back off politely on repeated errors: up to 16× interval.
-        let factor = 1u64 << consecutive_errors.min(4);
-        let sleep = Duration::from_secs(interval.saturating_mul(factor));
+        let factor = 1u32 << consecutive_errors.min(4);
+        let Some(sleep) = Duration::from_secs(interval)
+            .checked_mul(factor)
+            .and_then(|duration| tokio::time::Instant::now().checked_add(duration))
+        else {
+            tracing::error!("next poll deadline cannot be represented");
+            return ExitCode::FAILURE;
+        };
         tokio::select! {
-            () = tokio::time::sleep(sleep) => {}
+            () = tokio::time::sleep_until(sleep) => {}
             result = tokio::signal::ctrl_c() => {
                 if let Err(e) = result {
                     tracing::error!(error = %e, "ctrl-c handler failed, exiting");
@@ -432,14 +611,14 @@ async fn survey(out: &std::path::Path, interval: u64, once: bool) -> ExitCode {
 async fn harvest(
     recordings: &std::path::Path,
     date: Option<chrono::NaiveDate>,
-    targets: &[String],
-    options: stargazer::harvest::HarvestOptions,
+    targets: &[TargetKey],
+    options: HarvestOptions,
 ) -> ExitCode {
-    use stargazer::harvest::{Harvester, split_target};
+    use stargazer::harvest::Harvester;
 
     let date = date.unwrap_or_else(|| chrono::Utc::now().date_naive());
-    let has_base_override = options.base_url.is_some();
-    let harvester = match Harvester::new(options) {
+    let has_base_override = options.base_url().is_some();
+    let mut harvester = match Harvester::new(options) {
         Ok(h) => h,
         Err(e) => {
             tracing::error!(error = %e, "harvester init failed");
@@ -447,39 +626,14 @@ async fn harvest(
         }
     };
 
-    let mut names: Vec<String> = if targets.is_empty() {
-        // Auto-walk: harvest every <SYSTEM>-<MODULE> directory that
-        // has a reachable dashboard scheme; skip the rest quietly.
-        let entries = match std::fs::read_dir(recordings) {
-            Ok(rd) => rd,
-            Err(e) => {
-                tracing::error!(
-                    dir = %recordings.display(),
-                    error = %e,
-                    "cannot read recordings dir"
-                );
+    let mut names = if targets.is_empty() {
+        match discover_targets(recordings, has_base_override) {
+            Ok(targets) => targets,
+            Err(error) => {
+                tracing::error!(%error, dir = %recordings.display(), "cannot read recordings directory");
                 return ExitCode::FAILURE;
             }
-        };
-        entries
-            .filter_map(Result::ok)
-            .filter(|e| e.path().is_dir())
-            .filter_map(|e| e.file_name().to_str().map(str::to_string))
-            .filter(|name| match split_target(name) {
-                None => false,
-                Some((system, _)) => {
-                    let derivable = has_base_override
-                        || stargazer::harvest::derived_base_url(&system).is_some();
-                    if !derivable {
-                        tracing::info!(
-                            target = %name,
-                            "skipped: no derivable dashboard URL (pass --target + --base-url)"
-                        );
-                    }
-                    derivable
-                }
-            })
-            .collect()
+        }
     } else {
         targets.to_vec()
     };
@@ -510,9 +664,35 @@ async fn harvest(
     }
 }
 
+fn discover_targets(
+    recordings: &std::path::Path,
+    has_base_override: bool,
+) -> std::io::Result<Vec<TargetKey>> {
+    let mut targets = Vec::new();
+    for entry in std::fs::read_dir(recordings)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Ok(target) = name.parse::<TargetKey>() else {
+            continue;
+        };
+        if has_base_override || DashboardUrl::for_reflector(target.reflector()).is_some() {
+            targets.push(target);
+        } else {
+            tracing::info!(%target, "no default dashboard address; set --target and --base-url to fetch it");
+        }
+    }
+    Ok(targets)
+}
+
 /// One human-readable coverage line per harvested target.
 fn print_harvest_run(rec: &stargazer::harvest::RunRecord) {
-    if let Some(err) = &rec.error {
+    if let Some(err) = rec.error() {
         println!("{} {}: listing unavailable: {err}", rec.target, rec.date);
         return;
     }
@@ -521,7 +701,7 @@ fn print_harvest_run(rec: &stargazer::harvest::RunRecord) {
         return;
     }
     let pct = if rec.published_tx > 0 {
-        100 * rec.matched / rec.published_tx
+        rec.matched.saturating_mul(100) / rec.published_tx
     } else {
         0
     };
@@ -553,23 +733,40 @@ fn print_harvest_run(rec: &stargazer::harvest::RunRecord) {
 }
 
 /// Report mode: rank reflector modules from the archived events.
-fn report(out: &std::path::Path, window_hours: u64) -> ExitCode {
+fn report(out: &std::path::Path, window_hours: u64, maximum_line: NonZeroUsize) -> ExitCode {
     let archive = stargazer::survey::Archive::new(out);
-    let events = match archive.load_events() {
+    let events = match archive.events(maximum_line) {
         Ok(e) => e,
         Err(e) => {
             tracing::error!(error = %e, archive = %out.display(), "cannot read archive");
             return ExitCode::FAILURE;
         }
     };
-    let hours = i64::try_from(window_hours).unwrap_or(i64::MAX);
-    let since = chrono::Utc::now() - chrono::TimeDelta::hours(hours);
-    let ranked = stargazer::survey::rank_activity(&events, since);
+    let since = i64::try_from(window_hours)
+        .ok()
+        .and_then(chrono::TimeDelta::try_hours)
+        .and_then(|window| chrono::Utc::now().checked_sub_signed(window));
+    let Some(since) = since else {
+        tracing::error!("ranking window exceeds the representable UTC range; choose fewer hours");
+        return ExitCode::FAILURE;
+    };
+    let mut ranking = ActivityRanking::new(since);
+    let mut count = 0usize;
+    for event in events {
+        match event {
+            Ok(event) => {
+                ranking.observe(&event);
+                count = count.saturating_add(1);
+            }
+            Err(error) => {
+                tracing::error!(%error, "invalid activity archive; inspect the reported line");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+    let ranked = ranking.into_rows();
 
-    println!(
-        "DPLUS voice activity: last {window_hours}h ({} events archived)",
-        events.len()
-    );
+    println!("DPLUS voice activity: last {window_hours}h ({count} events archived)");
     // Manually aligned to the row format below.
     println!("REFLECTOR  MODULE TRANSMISSIONS  STATIONS  LAST HEARD (UTC)");
     for row in &ranked {
@@ -590,21 +787,17 @@ fn report(out: &std::path::Path, window_hours: u64) -> ExitCode {
 
 /// Resolves when SIGTERM arrives (how launchd stops a service);
 /// pends forever where SIGTERM does not exist or cannot be hooked.
+#[cfg(unix)]
 async fn terminate_signal() {
-    #[cfg(unix)]
-    {
-        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-            Ok(mut sig) => {
-                let _unused = sig.recv().await;
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "SIGTERM handler failed; only ctrl-c will stop us");
-                std::future::pending::<()>().await;
-            }
+    match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+        Ok(mut sig) => {
+            let _unused = sig.recv().await;
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "SIGTERM handler failed; only ctrl-c will stop us");
+            std::future::pending::<()>().await;
         }
     }
-    #[cfg(not(unix))]
-    std::future::pending::<()>().await;
 }
 
 fn init_tracing(verbose: bool) {
@@ -615,4 +808,60 @@ fn init_tracing(verbose: bool) {
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
         .init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    #[test]
+    fn command_line_rejects_unsafe_targets_and_invalid_http_options() {
+        for arguments in [
+            vec!["stargazer", "harvest", "--target", "../..-C"],
+            vec!["stargazer", "harvest", "--base-url", "file:///tmp/captures"],
+            vec!["stargazer", "harvest", "--limit", "0"],
+            vec!["stargazer", "survey", "--max-seen", "0"],
+            vec!["stargazer", "survey", "--operator", "TOOLONGCALL"],
+        ] {
+            assert!(Args::try_parse_from(&arguments).is_err(), "{arguments:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recorder_directory_lock_prevents_a_second_instance() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let first = claim_instance(directory.path())?;
+        assert!(claim_instance(directory.path()).is_err());
+        drop(first);
+        let _replacement = claim_instance(directory.path())?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unrepresentable_poll_and_report_windows_fail_before_network_io() -> TestResult {
+        let directory = tempfile::tempdir()?;
+        let limits = SurveyLimits::new(NonZeroUsize::new(100).ok_or("limit")?);
+        for interval in [0, 29, u64::MAX] {
+            assert_eq!(
+                survey(
+                    directory.path(),
+                    interval,
+                    true,
+                    limits,
+                    RoutingCallsign::new("N0CALL")?
+                )
+                .await,
+                ExitCode::FAILURE
+            );
+        }
+        assert_eq!(
+            report(directory.path(), u64::MAX, limits.line_bytes()),
+            ExitCode::FAILURE
+        );
+        assert_eq!(std::fs::read_dir(directory.path())?.count(), 0);
+        Ok(())
+    }
 }

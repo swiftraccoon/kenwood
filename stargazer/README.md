@@ -1,246 +1,252 @@
 # stargazer
 
-D-STAR reflector voice recorder. A TOML config lists the reflectors you
-want to record; stargazer connects to each as a listen-only client and
-writes every received transmission to disk as three files: the raw AMBE
-frames (ground truth), a decoded 8 kHz WAV (for listening and review),
-and a metadata JSON (callsigns, timing, signal quality, GPS).
+D-STAR recording, archive conversion, published-file collection and activity
+surveying. The capture engine receives injected timestamps and performs no I/O.
+The session shell owns UDP and the clock; explicit shutdown joins sessions and
+pending filesystem work. Recording and recorder control require Unix sockets.
+The format, harvest, survey, report and import APIs also compile on Windows.
 
-## Quick start
+## Configuration and capture
 
-Create `stargazer.toml`:
+Configuration validates routing names, protocol identities, host addresses,
+nonzero ports and required capture bounds. Reflector names are at most seven
+ASCII bytes and safe as one filesystem component, including Windows reserved
+names. This application's local module policy is A-E; target modules are A-Z.
+Capture bounds are caller-selected storage policy, not protocol limits.
 
-```toml
-callsign = "N0CALL"            # your callsign: reflector login + DPlus auth
-recordings_dir = "recordings"  # created if missing
-write_wav = true               # decoded WAV alongside the raw AMBE
-local_module = "D"             # module letter presented in rpt1 (A-E)
-max_capture_seconds = 3600      # required retained prefix per transmission
-max_concurrent_captures = 4     # required simultaneous stream-state bound
+```rust
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
+use chrono::{DateTime, Utc};
+use dstar_gateway_core::{StreamId, VoiceFrame};
+use stargazer::audio::DecodedAudio;
+use stargazer::capture::{CaptureManager, EndReason, StreamOrigin};
+use stargazer::config::Config;
+use stargazer::wav::WavFile;
+
+let config = Config::from_toml(r#"
+callsign = "N0CALL"
+recordings_dir = "recordings"
+max_capture_seconds = 3600
+max_concurrent_captures = 4
 [[record]]
-reflector = "REF030"
-protocol = "dplus"             # dplus | dextra | dcs
-host = "ref030.dstargateway.org"
-modules = ["C"]                # one session per listed module
-
-[[record]]
-reflector = "XLX039"
+reflector = "XRF001"
 protocol = "dextra"
-host = "xlx039.example.org"
-port = 30001                   # optional; defaults: dplus 20001, dextra 30001, dcs 30051
-modules = ["A", "B"]
+host = "127.0.0.1"
+modules = ["B"]
+"#)?;
+let target = config.targets().first().ok_or("target")?.clone();
+let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), target.port().get());
+let mut captures = CaptureManager::new(
+    StreamOrigin::new(target, peer),
+    config.capture_limit(),
+    config.concurrent_capture_limit(),
+);
+let stream = StreamId::new(0x1234).ok_or("stream")?;
+let now = DateTime::<Utc>::UNIX_EPOCH;
+assert!(captures.on_voice_frame(stream, 0, &VoiceFrame::silence(), now)?.is_none());
+let recording = captures.on_voice_end(stream, EndReason::Eot, now).ok_or("recording")?;
+assert_eq!(recording.expected_frames(), 1);
+let audio = DecodedAudio::from_frames(recording.frames())?;
+assert_eq!(audio.pcm().len(), 160);
+let wav = WavFile::from_pcm(audio.pcm())?;
+assert_eq!(wav.as_bytes().len(), 44 + 160 * 2);
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-Then:
+Save equivalent TOML as `stargazer.toml`, then run:
 
 ```bash
 cargo run -p stargazer -- --config stargazer.toml
+cargo run -p stargazer -- ctl status
+cargo run -p stargazer -- ctl disable XRF001-B
+cargo run -p stargazer -- ctl enable XRF001-B
+cargo run -p stargazer -- ctl reload
 ```
 
-Stargazer connects to every `(reflector, module)` pair, records until
-you press Ctrl-C, and heals dropped links automatically with jittered
-exponential backoff. `--verbose` enables per-frame debug logging.
+Protocol values are `dplus`, `dextra` and `dcs`; default ports are 20001, 30001
+and 30051 respectively. `DPlus` authentication failure is recorded before the
+configured unauthenticated connection attempt. A complete connect attempt has a
+30-second deadline. Disabled targets persist in `.disabled-targets` under the
+recording root. A file lock prevents concurrent recorder instances in that root.
+Reload compares effective target identity, including protocol and endpoint.
+Global configuration changes require a restart.
 
-## Configuration reference
+Reaching the per-stream duration writes the retained prefix with
+`end_reason = "capture_limit"` and suppresses its remainder until the end event.
+Exceeding the concurrent-state bound finalizes existing prefixes and reconnects.
+Disable waits up to six seconds before reporting a still-retiring local session.
+Replacements wait for the prior task to join; no response asserts remote slot
+availability. Normal shutdown has no filesystem timeout and observes all tasks.
+Process termination can interrupt that explicit shutdown.
 
-| Field | Default | Meaning |
-|---|---|---|
-| `callsign` | *required* | Operator callsign used for reflector login and `DPlus` auth |
-| `recordings_dir` | `"recordings"` | Base directory for recordings (created if missing) |
-| `write_wav` | `true` | Decode and write a WAV next to each raw AMBE archive |
-| `local_module` | `"D"` | Local module letter in rpt1 (A–E; other letters are silently dropped by xlxd-derived reflectors) |
-| `max_capture_seconds` | *required* | Maximum retained prefix for one transmission; must be greater than zero |
-| `max_concurrent_captures` | *required* | Maximum simultaneous retained or limit-suppressed stream states per reflector session; must be greater than zero |
-| `[[record]].reflector` | *required* | Reflector callsign, e.g. `"REF030"` (also the wire callsign for DCS) |
-| `[[record]].protocol` | *required* | `dplus`, `dextra`, or `dcs` |
-| `[[record]].host` | *required* | Host name or IP; always explicit, there is no discovery |
-| `[[record]].port` | per protocol | `dplus` 20001, `dextra` 30001, `dcs` 30051 |
-| `[[record]].modules` | *required* | Module letters (A–Z); each gets its own session |
+```rust,no_run
+use std::path::Path;
+use std::sync::Arc;
+use stargazer::config::Config;
+use stargazer::control::Coordinator;
+use stargazer::writer::Writer;
 
-`DPlus` targets attempt authentication against the D-STAR gateway auth
-service first; if that fails, stargazer logs a warning and connects
-unauthenticated.
-
-The two capture limits are operator policy, not protocol limits. On the first
-frame beyond `max_capture_seconds`, Stargazer writes the retained prefix with
-`end_reason = "capture_limit"`, logs the loss, and rejects the rest of that
-stream until EOT or inactivity frees its stream ID. If a new interleaved stream
-would exceed `max_concurrent_captures`, Stargazer logs the rejected stream,
-finalizes admitted partial captures, and reconnects rather than retaining
-unbounded state or silently beginning a mid-stream recording.
-
-## Recording layout
-
-```
-recordings/
-  REF030-C/                       # <reflector>-<module>
-    2026-07-09/                   # UTC date of stream start
-      20260709T183042Z_W1AW_04D2.ambe
-      20260709T183042Z_W1AW_04D2.wav
-      20260709T183042Z_W1AW_04D2.json
-```
-
-Filenames are `<UTC start time>_<callsign>_<stream id hex>`. Callsigns
-are sanitized to `[A-Z0-9-]`; a transmission whose header was never
-received records as `UNKNOWN`. Name collisions get a `-1`, `-2`, …
-suffix.
-
-**A recording exists iff its `.json` exists.** Files are written to a
-temp name and renamed into place (`.ambe`, then `.wav`, then the
-fsynced `.json` last), so a crash can leave stray `*.tmp` files but
-never a torn recording.
-
-## File formats
-
-### `.ambe`: raw frame container
-
-Every retained frame exactly as it arrived. A normal recording contains the
-whole stream; a recording whose metadata says `capture_limit` contains exactly
-the configured prefix. All integers little-endian.
-
-```
-Header (16 bytes):
-  magic       [u8; 8] = "STGZAMBE"
-  version     u16     = 1
-  record_len  u16     = 13
-  reserved    u32     = 0
-Records (13 bytes each, arrival order):
-  seq         u8       D-STAR frame sequence (0..=20)
-  ambe        [u8; 9]  AMBE 3600x2400 voice bytes
-  slow_data   [u8; 3]  raw slow-data bytes
-```
-
-This file is the canonical archive: the decoded WAV, per-frame FEC
-error counts, codec parameters for vocoder-domain ASR, and any future
-(better) decode are all deterministic re-derivations from it. It costs
-about 650 bytes per second of speech, roughly 2.3 MB per hour of
-continuous talk.
-
-### `.wav`
-
-8000 Hz, mono, 16-bit PCM. Frames lost on the RF uplink (sequence
-gaps) are filled with the decoder's concealment output so the audio
-timeline matches the transmission's codec time.
-
-### `.json`: metadata (schema `stargazer-recording/1`)
-
-```json
-{
-  "schema": "stargazer-recording/1",
-  "writer": "stargazer/0.2.0",
-  "reflector": "REF030",
-  "module": "C",
-  "protocol": "dplus",
-  "host": "ref030.dstargateway.org:20001",
-  "peer": "203.0.113.7:20001",
-  "stream_id": "04D2",
-  "started_at": "2026-07-09T18:30:42.113Z",
-  "ended_at": "2026-07-09T18:31:07.554Z",
-  "duration_s": 25.44,
-  "end_reason": "eot",
-  "header": {
-    "my_callsign": "W1AW",
-    "my_suffix": "D75",
-    "ur_callsign": "CQCQCQ",
-    "rpt1": "REF030 C",
-    "rpt2": "REF030 G",
-    "flags": [0, 0, 0],
-    "raw_hex": "…the parsed header re-encoded to its 41-byte wire form…",
-    "diagnostics": []
-  },
-  "frames": { "received": 1272, "expected": 1272, "gaps": 0 },
-  "fec": {
-    "corrected_bits": 3,
-    "frames_with_errors": 2,
-    "erasure_frames": 0,
-    "tone_frames": 0
-  },
-  "slow_data": {
-    "text": "Asheville NC",
-    "dprs": [
-      { "callsign": "W1AW", "lat": 35.5951, "lon": -82.5515,
-        "symbol": "[", "comment": "walking", "at_frame": 512 }
-    ]
-  },
-  "audio": { "wav": true, "concealed_frames": 0 }
+# async fn example() -> Result<(), Box<dyn std::error::Error>> {
+let path = Path::new("stargazer.toml");
+let config = Config::load(path)?;
+let writer = Arc::new(Writer::new(config.recordings_dir().to_owned(), config.write_wav()));
+let mut recorder = Coordinator::new(config, path.to_owned(), writer)?;
+recorder.spawn_initial();
+let response = recorder.handle("status".parse()?).await;
+println!("{}", response.message());
+for completed in recorder.shutdown_all().await {
+    let summary = completed.result?;
+    println!("{}: {} recordings", completed.target, summary.recordings_written());
 }
+# Ok(())
+# }
 ```
 
-Field notes:
+## Storage and formats
 
-- `duration_s` is codec time (`expected` frames × 20 ms); the
-  wall-clock delta additionally includes network jitter.
-- `end_reason` is `eot` (real end-of-transmission), `inactivity`
-  (stream timed out), `disconnect` (link dropped mid-stream), or
-  `shutdown` (stargazer exited mid-stream), or `capture_limit` (the retained
-  prefix reached the operator's configured bound). Partial captures are
-  first-class recordings with honest metadata, not discarded.
-- `header` is `null` when no voice header was ever received.
-- `frames.gaps` counts frames missing from the sequence; `fec` sums
-  Golay/ECC corrections across the stream; both are quality indexes
-  whose ground truth remains the `.ambe` file.
-- `slow_data.text` is the radio's 20-character TX message; when the
-  message is not clean printable ASCII (Japanese radios commonly send
-  JIS X 0201 half-width katakana), `slow_data.text_hex` additionally
-  carries the raw 20 bytes losslessly. `dprs` lists every parsed DPRS
-  position with the frame index where it completed.
+Artifacts live under `<root>/<REFLECTOR>-<MODULE>/<UTC date>/`. Stems contain the
+UTC start time, sanitized station label and hexadecimal stream ID. Writers
+exclusively reserve the whole stem and try up to 1000 suffix variants. Existing
+artifacts are preserved. Each file is written to an exclusive temporary file,
+synced and published by a non-replacing hard link. Raw AMBE is published first,
+optional WAV second and JSON metadata last. A WAV failure is retained in
+`audio.error`; raw-file failure prevents metadata publication.
 
-## Activity survey
+On Unix the writer also syncs containing directories and newly created ancestor
+entries. Other platforms omit directory syncing. Filesystem support and its sync
+semantics determine persistence across power loss; no power-loss test is claimed.
+Failures may leave partial sets or temporary files. `WriteError::MetadataVisible`
+means complete JSON bytes are visible but a later completion step failed; inspect
+that path before retrying. Imported recordings have `null` live endpoint/peer
+metadata instead of fabricated network identities.
 
-To decide *which* reflectors are worth recording, stargazer can survey
-network-wide DPLUS voice activity:
+The version-1 `.ambe` header is 16 bytes: `STGZAMBE`, little-endian version 1,
+little-endian record length 13 and four reserved bytes. Each record is one raw
+sequence byte, nine AMBE bytes and three slow-data bytes in arrival order. All
+256 sequence-byte values and reserved header bytes remain inspectable. Only
+0 through 20 participate in inferred sequence gaps; duplicates infer no gap.
+
+```rust
+use stargazer::features::FrameArchive;
+
+let mut bytes = Vec::from(*b"STGZAMBE\x01\x00\x0d\x00\x00\x00\x00\x00");
+bytes.extend_from_slice(&[255; 13]);
+let archive = FrameArchive::from_bytes(&bytes)?;
+assert_eq!(archive.iter().len(), 1);
+assert_eq!(archive.iter().next().ok_or("frame")?.seq, 255);
+assert_eq!(archive.as_bytes(), bytes);
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+Decoded WAV is 8 kHz mono signed PCM16. One fresh decoder handles each stream;
+inferred gaps call its concealment operation. RIFF counts and output allocations
+are checked. `features::export_file` streams input records into 170 little-endian
+f32 values per received or concealed frame and publishes only a complete output.
+It preserves existing output files and rejects a truncated container.
+
+```rust,no_run
+use std::path::Path;
+use stargazer::features::export_file;
+
+let frames = export_file(Path::new("capture.ambe"), Path::new("capture.f32"))?;
+println!("exported {frames} frames");
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+`ParsedDvrec::from_text` checks stream identity, header field widths and the
+selected frame bound. `import_tree` also bounds input bytes and checks the
+filename identity against recognized log lines. Per-file failures are counted
+and logged; tree-walk errors fail the operation. Existing local counterparts are
+preserved, including gapped captures.
+
+```rust,no_run
+use std::num::NonZeroUsize;
+use std::path::Path;
+use stargazer::capture::CaptureDurationLimit;
+use stargazer::dvrec::{ImportLimits, import_tree};
+use stargazer::writer::Writer;
+
+let root = Path::new("recordings");
+let limits = ImportLimits::new(
+    NonZeroUsize::new(64 * 1024 * 1024).ok_or("byte bound")?,
+    CaptureDurationLimit::try_from_seconds(3600)?,
+);
+let summary = import_tree(root, &Writer::new(root.to_owned(), true), limits)?;
+println!("imported {}, failed {}", summary.imported, summary.failed);
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+## Harvesting and surveying
+
+Both HTTP clients identify the operator, enforce response-size bounds and follow
+at most five redirects. Harvest policy follows
+[RFC 9309](https://www.rfc-editor.org/rfc/rfc9309.html): matching agent groups,
+longest wildcard/end-anchored match and allow ties; unreachable robots policy
+prevents further collection. Downloads run sequentially, at least two seconds
+apart, including after cancellation. Three consecutive failures stop the run.
+Filename/path validation and non-replacing publication preserve existing files.
+Matching station, stream ID and time selects candidates; it does not establish
+byte identity or relative audio quality.
+
+```rust,no_run
+use chrono::NaiveDate;
+use dstar_gateway_core::RoutingCallsign;
+use stargazer::harvest::{HarvestOptions, Harvester};
+
+# async fn example() -> Result<(), Box<dyn std::error::Error>> {
+let options = HarvestOptions::new(RoutingCallsign::new("N0CALL")?).with_dry_run(true);
+let mut harvester = Harvester::new(options)?;
+let target = "REF030-C".parse()?;
+let date = NaiveDate::from_ymd_opt(2026, 7, 11).ok_or("date")?;
+let report = harvester.harvest_dir(std::path::Path::new("recordings"), &target, date).await?;
+println!("planned {}, failure {:?}", report.planned, report.failure());
+# Ok(())
+# }
+```
+
+Surveying collects rows returned by the configured NJ6N DPLUSMON endpoint.
+Each poll start reserves a 30-second minimum interval before network I/O, retained
+after cancellation. Complete response bytes are archived before parsing under
+`<survey root>/dplusmon/raw/<date>/`; timestamp collisions receive unique suffixes.
+Events append to `activity.jsonl`, and completed poll summaries to `polls.jsonl`.
+An event enters in-memory deduplication only after its complete JSON line syncs.
+Each failed append attempts truncate-and-sync rollback; a rollback failure retains
+both errors. File locks serialize append transactions. Separate pollers have
+separate deduplication sets, so use one surveyor for an archive.
+
+```rust,no_run
+use std::num::NonZeroUsize;
+use std::path::Path;
+use dstar_gateway_core::RoutingCallsign;
+use stargazer::survey::{SurveyLimits, Surveyor};
+
+# async fn example() -> Result<(), Box<dyn std::error::Error>> {
+let limits = SurveyLimits::new(NonZeroUsize::new(1_000_000).ok_or("identity bound")?);
+let mut survey = Surveyor::new(Path::new("survey"), limits, RoutingCallsign::new("N0CALL")?)?;
+let poll = survey.poll_once().await?;
+println!("new {}, failure {:?}", poll.new_events, poll.failure());
+# Ok(())
+# }
+```
+
+Archive iteration streams a fixed-length snapshot, bounds each line and reports
+malformed, oversized or unterminated JSON with path and line number. Survey
+identity storage has a caller-selected bound; reaching it fails without silently
+discarding history. Ranking incrementally reads events. The observed feed window
+can omit transmissions; `gap_risk` records a window entirely newer than the
+previous newest row. Archive operations are synchronous and may block.
 
 ```bash
-cargo run -p stargazer -- survey             # poll + archive every 60 s (Ctrl-C to stop)
-cargo run -p stargazer -- survey --once      # single poll
-cargo run -p stargazer -- report             # rank reflector modules, last 24 h
-cargo run -p stargazer -- report --window-hours 6
+cargo run -p stargazer -- survey --operator N0CALL --max-seen 1000000
+cargo run -p stargazer -- report --window-hours 24
+cargo run -p stargazer -- harvest --operator N0CALL --target REF030-C --dry-run
+cargo run -p stargazer -- import-dvrec --max-capture-seconds 3600
 ```
 
-The survey polls the [NJ6N DPLUSMON](https://nj6n.com/dplusmon/) feed
-(a volunteer-run monitor that republishes every transmission on the
-DPLUS network) rather than probing reflectors directly: no client
-slots are consumed and no reflector sees a single extra packet. Please
-be a good guest of that service too: the default 60-second interval is
-gentler than one open browser tab of its own web UI (which polls every
-15 s), a 30-second floor is enforced, errors back off exponentially,
-and the tool identifies itself in its User-Agent.
-
-The feed is a rolling ~30-row window, so history evaporates unless
-kept. The survey archives everything it observes under `survey/dplusmon/`:
-
-- `raw/<date>/<timestamp>.html`: every response, verbatim, before parsing
-- `activity.jsonl`: append-only deduplicated transmission events
-- `polls.jsonl`: per-poll provenance (row counts, window span, and a
-  `gap_risk` flag when the window may have rolled over between polls)
-
-`report` reads the accumulated archive and ranks reflector modules by
-transmissions and distinct stations in the window. The longer the
-survey runs, the more meaningful the ranking.
-
-## Why archive raw AMBE?
-
-Decoded audio discards the codec parameters. The raw 9-byte frames
-preserve everything the RF channel delivered: they can be re-decoded
-with later decoders, and they are the input that vocoder-parameter
-speech recognition consumes (models that read AMBE/IMBE codec
-parameters directly instead of reconstructed audio). The WAV is for
-listening; the `.ambe` is the archive.
-
-## Legal & community notes
-
-- **License:** GPL-2.0-or-later.
-- **Law and policy:** US federal law contains amateur-radio
-  interception exceptions in
-  [18 USC 2511(g)](https://uscode.house.gov/view.xhtml?req=%28title%3A18+section%3A2511%29)
-  and
-  [47 USC 605](https://uscode.house.gov/view.xhtml?edition=prelim&num=0&req=granuleid%3AUSC-prelim-title47-section605).
-  Those provisions are not a blanket conclusion about recording,
-  republication, transcription, privacy, or laws outside the US.
-  Operators are responsible for applicable law and reflector/service
-  policies.
-- **Be a good guest:** stargazer occupies one client slot per
-  configured module, exactly like any other linked station. Consider
-  the reflector operator's policy and capacity before pointing a
-  recorder at their system.
+The CLI defaults to 60-second polling, 1 MiB survey response/line and harvest
+sidecar bounds, 64 MiB harvest response and import-input bounds, and a one-hour
+imported capture bound. Import uses its input-byte bound for local sidecars too.
+Survey/harvest use `--operator` or a valid recorder configuration. Published
+content, retention and service policies depend on the endpoint. The license is
+GPL-2.0-or-later; operators choose permitted sources and uses.

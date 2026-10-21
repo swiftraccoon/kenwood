@@ -9,13 +9,16 @@
 //! method, and the writer consumes the completed values.
 
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::net::SocketAddr;
 use std::num::{NonZeroU64, NonZeroUsize};
 
 use chrono::{DateTime, Utc};
-use dstar_gateway_core::dprs::{DprsReport, parse_dprs};
+use dstar_gateway_core::dprs::DprsReport;
 use dstar_gateway_core::slowdata::{SlowDataAssembler, SlowDataBlock, SlowDataTextCollector};
-use dstar_gateway_core::{DstarHeader, Module, StreamId, VoiceFrame};
+use dstar_gateway_core::{DstarHeader, StreamId, VoiceFrame};
+
+use crate::config::{Target, TargetKey};
 
 /// D-STAR voice seq values cycle 0..=20 (one 21-frame superframe).
 pub(crate) const SEQ_MODULUS: u16 = 21;
@@ -28,7 +31,7 @@ const FRAMES_PER_SECOND: usize = 50;
 /// This is a storage policy, not a claim about a protocol maximum. The
 /// configured number of seconds is converted to the exact number of 20 ms
 /// D-STAR voice frames that may be retained in memory and written to disk.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CaptureDurationLimit {
     seconds: NonZeroU64,
     frames: NonZeroUsize,
@@ -40,8 +43,8 @@ impl CaptureDurationLimit {
     /// # Errors
     ///
     /// Returns [`CaptureLimitError::Zero`] for zero or
-    /// [`CaptureLimitError::TooLarge`] when the corresponding frame count
-    /// cannot be represented on this platform.
+    /// [`CaptureLimitError::TooLarge`] when retained frames exceed this
+    /// platform's address space or worst-case inferred codec time exceeds u64.
     pub fn try_from_seconds(seconds: u64) -> Result<Self, CaptureLimitError> {
         let seconds = NonZeroU64::new(seconds).ok_or(CaptureLimitError::Zero)?;
         let seconds_as_usize =
@@ -50,6 +53,16 @@ impl CaptureDurationLimit {
             .checked_mul(FRAMES_PER_SECOND)
             .and_then(NonZeroUsize::new)
             .ok_or(CaptureLimitError::TooLarge { seconds })?;
+        if seconds
+            .get()
+            .checked_mul(50)
+            .and_then(|count| count.checked_sub(1))
+            .and_then(|count| count.checked_mul(20))
+            .and_then(|count| count.checked_add(1))
+            .is_none()
+        {
+            return Err(CaptureLimitError::TooLarge { seconds });
+        }
         Ok(Self { seconds, frames })
     }
 
@@ -72,10 +85,8 @@ pub enum CaptureLimitError {
     /// A zero-second limit cannot retain a recording.
     #[error("capture duration must be greater than zero seconds")]
     Zero,
-    /// The duration cannot be represented as a frame count on this platform.
-    #[error(
-        "capture duration {seconds} seconds exceeds this platform's addressable frame capacity"
-    )]
+    /// Retained frames or inferred codec time cannot be represented.
+    #[error("capture duration {seconds} seconds exceeds retained-frame or codec-time capacity")]
     TooLarge {
         /// Rejected operator-supplied duration.
         seconds: NonZeroU64,
@@ -84,7 +95,7 @@ pub enum CaptureLimitError {
 
 /// Validated maximum number of simultaneous stream states retained for one
 /// reflector session.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ConcurrentCaptureLimit(NonZeroUsize);
 
 impl ConcurrentCaptureLimit {
@@ -109,6 +120,39 @@ impl ConcurrentCaptureLimit {
         self.0.get()
     }
 }
+
+impl TryFrom<u64> for CaptureDurationLimit {
+    type Error = CaptureLimitError;
+    fn try_from(value: u64) -> Result<Self, Self::Error> {
+        Self::try_from_seconds(value)
+    }
+}
+impl From<CaptureDurationLimit> for u64 {
+    fn from(value: CaptureDurationLimit) -> Self {
+        value.as_seconds()
+    }
+}
+impl TryFrom<u64> for ConcurrentCaptureLimit {
+    type Error = ConcurrentCaptureLimitError;
+    fn try_from(value: u64) -> Result<Self, Self::Error> {
+        Self::try_from_count(value)
+    }
+}
+impl From<ConcurrentCaptureLimit> for usize {
+    fn from(value: ConcurrentCaptureLimit) -> Self {
+        value.get()
+    }
+}
+
+macro_rules! numeric_format {
+    ($value:ty, $getter:ident; $($format:ident),+ $(,)?) => {
+        $(impl fmt::$format for $value {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result { fmt::$format::fmt(&self.$getter(), formatter) }
+        })+
+    };
+}
+numeric_format!(CaptureDurationLimit, as_seconds; Display, Binary, Octal, LowerHex, UpperHex, LowerExp, UpperExp);
+numeric_format!(ConcurrentCaptureLimit, get; Display, Binary, Octal, LowerHex, UpperHex, LowerExp, UpperExp);
 
 /// Invalid simultaneous-capture policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -156,9 +200,9 @@ pub(crate) fn seq_gap(prev: u8, seq: u8) -> u64 {
 }
 
 /// One received voice frame, archived exactly as it arrived.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FrameRecord {
-    /// D-STAR frame sequence number (0..=20).
+    /// Raw sequence byte, including values outside the 0..=20 sequence alphabet.
     pub seq: u8,
     /// 9-byte AMBE voice payload.
     pub ambe: [u8; 9],
@@ -167,7 +211,7 @@ pub struct FrameRecord {
 }
 
 /// Why a recording ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EndReason {
     /// Real end-of-transmission packet.
     Eot,
@@ -196,22 +240,48 @@ impl EndReason {
     }
 }
 
-/// Where a stream was received: the configured target plus the
-/// resolved peer address, stamped onto every recording.
-#[derive(Debug, Clone)]
+/// Recording target and optional live connection metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamOrigin {
-    /// Reflector callsign (e.g. `"REF030"`).
-    pub reflector: String,
-    /// Reflector module linked to.
-    pub module: Module,
-    /// Protocol name (`"dplus"` / `"dextra"` / `"dcs"`).
-    pub protocol: &'static str,
-    /// Configured host string.
-    pub host: String,
-    /// Configured port.
-    pub port: u16,
-    /// Resolved peer socket address for this connection.
-    pub peer: SocketAddr,
+    target: TargetKey,
+    endpoint: Option<Target>,
+    peer: Option<SocketAddr>,
+}
+
+impl StreamOrigin {
+    /// Stamp a live connection's checked target and resolved peer.
+    #[must_use]
+    pub fn new(target: Target, peer: SocketAddr) -> Self {
+        Self {
+            target: target.key(),
+            endpoint: Some(target),
+            peer: Some(peer),
+        }
+    }
+    /// Identify an imported archive without claiming a live host or peer.
+    #[must_use]
+    pub const fn imported(target: TargetKey) -> Self {
+        Self {
+            target,
+            endpoint: None,
+            peer: None,
+        }
+    }
+    /// Checked reflector/module path component.
+    #[must_use]
+    pub const fn target(&self) -> &TargetKey {
+        &self.target
+    }
+    /// Live configured endpoint, absent for imported packet logs.
+    #[must_use]
+    pub const fn endpoint(&self) -> Option<&Target> {
+        self.endpoint.as_ref()
+    }
+    /// Resolved peer, absent for imported packet logs.
+    #[must_use]
+    pub const fn peer(&self) -> Option<SocketAddr> {
+        self.peer
+    }
 }
 
 /// A DPRS position report seen inside a stream's slow data.
@@ -228,45 +298,110 @@ pub struct DprsSeen {
 #[derive(Debug, Clone)]
 pub struct CompletedRecording {
     /// Connection the stream arrived on.
-    pub origin: StreamOrigin,
+    pub(crate) origin: StreamOrigin,
     /// D-STAR stream id.
-    pub stream_id: StreamId,
+    pub(crate) stream_id: StreamId,
     /// Decoded voice header, if one was received.
-    pub header: Option<DstarHeader>,
+    pub(crate) header: Option<DstarHeader>,
     /// Stringified lenient-parse diagnostics from the header.
-    pub header_diagnostics: Vec<String>,
+    pub(crate) header_diagnostics: Vec<String>,
     /// Wall clock when the stream opened.
-    pub started_at: DateTime<Utc>,
+    pub(crate) started_at: DateTime<Utc>,
     /// Wall clock when the stream was finalized.
-    pub ended_at: DateTime<Utc>,
+    pub(crate) ended_at: DateTime<Utc>,
     /// Why the stream ended.
-    pub end_reason: EndReason,
+    pub(crate) end_reason: EndReason,
     /// Frames in arrival order.
-    pub frames: Vec<FrameRecord>,
+    pub(crate) frames: Vec<FrameRecord>,
     /// Missing frames inferred from seq discontinuities.
-    pub gaps: u64,
+    pub(crate) gaps: u64,
     /// Validated printable-ASCII D-STAR TX message, without trailing
     /// wire-space padding. Invalid textual bytes remain available through
     /// [`Self::text_bytes`] and never receive replacement characters.
-    pub text: Option<String>,
+    pub(crate) text: Option<String>,
     /// The TX message's raw 20 wire bytes, kept losslessly.
-    pub text_bytes: Option<[u8; 20]>,
+    pub(crate) text_bytes: Option<[u8; 20]>,
     /// DPRS position reports in arrival order.
-    pub dprs: Vec<DprsSeen>,
+    pub(crate) dprs: Vec<DprsSeen>,
 }
 
 impl CompletedRecording {
     /// Frames the transmission should have had: received + gaps.
     #[must_use]
     pub fn expected_frames(&self) -> u64 {
-        u64::try_from(self.frames.len()).unwrap_or(u64::MAX) + self.gaps
+        u64::try_from(self.frames.len()).unwrap_or_else(|_| unreachable!("validated capture count"))
+            + self.gaps
     }
 
     /// Codec-time duration: expected frames × 20 ms.
     #[must_use]
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "codec duration is the nearest representable f64 projection of a checked u64 frame count"
+    )]
     pub fn duration_s(&self) -> f64 {
-        let frames = u32::try_from(self.expected_frames()).unwrap_or(u32::MAX);
-        f64::from(frames) * 0.02
+        self.expected_frames() as f64 * 0.02
+    }
+
+    /// Recording target and live metadata, if available.
+    #[must_use]
+    pub const fn origin(&self) -> &StreamOrigin {
+        &self.origin
+    }
+    /// Nonzero stream identifier.
+    #[must_use]
+    pub const fn stream_id(&self) -> StreamId {
+        self.stream_id
+    }
+    /// Received header, if present.
+    #[must_use]
+    pub const fn header(&self) -> Option<&DstarHeader> {
+        self.header.as_ref()
+    }
+    /// Header parser diagnostics in arrival order.
+    #[must_use]
+    pub fn header_diagnostics(&self) -> &[String] {
+        &self.header_diagnostics
+    }
+    /// Caller-supplied stream opening time.
+    #[must_use]
+    pub const fn started_at(&self) -> DateTime<Utc> {
+        self.started_at
+    }
+    /// Caller-supplied finalization time.
+    #[must_use]
+    pub const fn ended_at(&self) -> DateTime<Utc> {
+        self.ended_at
+    }
+    /// Finalization trigger.
+    #[must_use]
+    pub const fn end_reason(&self) -> EndReason {
+        self.end_reason
+    }
+    /// Losslessly retained received frames.
+    #[must_use]
+    pub fn frames(&self) -> &[FrameRecord] {
+        &self.frames
+    }
+    /// Missing codec frames inferred from the sequence alphabet.
+    #[must_use]
+    pub const fn gaps(&self) -> u64 {
+        self.gaps
+    }
+    /// Printable received TX text without trailing padding.
+    #[must_use]
+    pub fn text(&self) -> Option<&str> {
+        self.text.as_deref()
+    }
+    /// Lossless received TX message bytes.
+    #[must_use]
+    pub const fn text_bytes(&self) -> Option<&[u8; 20]> {
+        self.text_bytes.as_ref()
+    }
+    /// Parsed position reports and their frame indexes.
+    #[must_use]
+    pub fn dprs(&self) -> &[DprsSeen] {
+        &self.dprs
     }
 }
 
@@ -338,7 +473,7 @@ impl StreamCapture {
     /// Parse a completed GPS slow-data sentence; keep DPRS reports,
     /// silently skip plain NMEA (common from GPS-equipped radios).
     fn consume_gps_sentence(&mut self, sentence: &str) {
-        if let Ok(report) = parse_dprs(sentence) {
+        if let Ok(report) = sentence.parse::<DprsReport>() {
             self.dprs.push(DprsSeen {
                 report,
                 at_frame: self.frames.len().saturating_sub(1),
@@ -535,25 +670,17 @@ impl CaptureManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dstar_gateway_core::{Callsign, Suffix};
-    use std::net::{IpAddr, Ipv4Addr};
+    use dstar_gateway_core::{Callsign, HeaderFlags, Suffix};
 
-    fn origin() -> StreamOrigin {
-        StreamOrigin {
-            reflector: "REF030".to_string(),
-            module: Module::C,
-            protocol: "dplus",
-            host: "ref030.example.org".to_string(),
-            port: 20001,
-            peer: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 20001),
-        }
+    type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
+
+    fn origin() -> TestResult<StreamOrigin> {
+        Ok(StreamOrigin::imported("REF030-C".parse()?))
     }
 
     fn header() -> DstarHeader {
         DstarHeader {
-            flag1: 0,
-            flag2: 0,
-            flag3: 0,
+            flags: HeaderFlags::NONE,
             rpt2: Callsign::from_wire_bytes(*b"REF030 G"),
             rpt1: Callsign::from_wire_bytes(*b"REF030 C"),
             ur_call: Callsign::from_wire_bytes(*b"CQCQCQ  "),
@@ -562,8 +689,11 @@ mod tests {
         }
     }
 
-    fn sid(raw: u16) -> StreamId {
-        StreamId::new(raw).unwrap_or_else(|| unreachable!("test stream ids are nonzero"))
+    const fn sid(raw: u16) -> StreamId {
+        match StreamId::new(raw) {
+            Some(value) => value,
+            None => unreachable!(),
+        }
     }
 
     fn frame(seq: u8) -> VoiceFrame {
@@ -573,18 +703,16 @@ mod tests {
         }
     }
 
-    fn limit(seconds: u64) -> CaptureDurationLimit {
-        CaptureDurationLimit::try_from_seconds(seconds)
-            .unwrap_or_else(|error| unreachable!("valid test capture limit: {error}"))
+    fn limit(seconds: u64) -> TestResult<CaptureDurationLimit> {
+        Ok(CaptureDurationLimit::try_from_seconds(seconds)?)
     }
 
-    fn concurrent(count: u64) -> ConcurrentCaptureLimit {
-        ConcurrentCaptureLimit::try_from_count(count)
-            .unwrap_or_else(|error| unreachable!("valid test concurrency limit: {error}"))
+    fn concurrent(count: u64) -> TestResult<ConcurrentCaptureLimit> {
+        Ok(ConcurrentCaptureLimit::try_from_count(count)?)
     }
 
-    fn manager() -> CaptureManager {
-        CaptureManager::new(origin(), limit(60), concurrent(4))
+    fn manager() -> TestResult<CaptureManager> {
+        Ok(CaptureManager::new(origin()?, limit(60)?, concurrent(4)?))
     }
 
     fn start(mgr: &mut CaptureManager, stream_id: StreamId) {
@@ -618,8 +746,8 @@ mod tests {
     }
 
     #[test]
-    fn capture_duration_limit_is_exact_and_rejects_zero() {
-        let one_second = limit(1);
+    fn capture_duration_limit_is_exact_and_rejects_zero() -> TestResult {
+        let one_second = limit(1)?;
         assert_eq!(one_second.as_seconds(), 1);
         assert_eq!(one_second.as_frames(), 50);
         assert_eq!(
@@ -630,15 +758,25 @@ mod tests {
             ConcurrentCaptureLimit::try_from_count(0),
             Err(ConcurrentCaptureLimitError::Zero)
         );
+        assert!(CaptureDurationLimit::try_from_seconds(u64::MAX / 50).is_err());
+        let maximum = (u64::try_from(usize::MAX)? / 50).min(u64::MAX / 1000);
+        assert_eq!(
+            CaptureDurationLimit::try_from_seconds(maximum)?.as_seconds(),
+            maximum
+        );
+        assert!(matches!(
+            CaptureDurationLimit::try_from_seconds(maximum + 1),
+            Err(CaptureLimitError::TooLarge { .. })
+        ));
+        Ok(())
     }
 
     #[test]
-    fn exact_capture_limit_can_still_end_normally() {
-        let mut mgr = CaptureManager::new(origin(), limit(1), concurrent(1));
+    fn exact_capture_limit_can_still_end_normally() -> TestResult {
+        let mut mgr = CaptureManager::new(origin()?, limit(1)?, concurrent(1)?);
         start(&mut mgr, sid(1));
         for index in 0..50usize {
-            let seq = u8::try_from(index % usize::from(SEQ_MODULUS))
-                .unwrap_or_else(|_| unreachable!("D-STAR sequence values are representable as u8"));
+            let seq = u8::try_from(index % usize::from(SEQ_MODULUS))?;
             retain(&mut mgr, sid(1), seq, &frame(seq));
         }
 
@@ -647,15 +785,15 @@ mod tests {
             matches!(recording, Some(ref value) if value.frames.len() == 50 && value.end_reason == EndReason::Eot),
             "the configured frame count itself must not be treated as loss: {recording:?}"
         );
+        Ok(())
     }
 
     #[test]
-    fn first_excess_frame_finalizes_visible_prefix_and_suppresses_tail() {
-        let mut mgr = CaptureManager::new(origin(), limit(1), concurrent(1));
+    fn first_excess_frame_finalizes_visible_prefix_and_suppresses_tail() -> TestResult {
+        let mut mgr = CaptureManager::new(origin()?, limit(1)?, concurrent(1)?);
         start(&mut mgr, sid(1));
         for index in 0..50usize {
-            let seq = u8::try_from(index % usize::from(SEQ_MODULUS))
-                .unwrap_or_else(|_| unreachable!("D-STAR sequence values are representable as u8"));
+            let seq = u8::try_from(index % usize::from(SEQ_MODULUS))?;
             retain(&mut mgr, sid(1), seq, &frame(seq));
         }
 
@@ -685,11 +823,12 @@ mod tests {
             1,
             "a stream id must be reusable after its normal end"
         );
+        Ok(())
     }
 
     #[test]
-    fn concurrent_limit_rejects_new_id_and_inactivity_frees_capacity() {
-        let mut mgr = CaptureManager::new(origin(), limit(60), concurrent(1));
+    fn concurrent_limit_rejects_new_id_and_inactivity_frees_capacity() -> TestResult {
+        let mut mgr = CaptureManager::new(origin()?, limit(60)?, concurrent(1)?);
         start(&mut mgr, sid(1));
         let rejected = mgr.on_voice_start(sid(2), header(), Vec::new(), t0());
         assert_eq!(
@@ -719,19 +858,19 @@ mod tests {
         );
         start(&mut mgr, sid(2));
         assert_eq!(mgr.active_count(), 1);
+        Ok(())
     }
 
     #[test]
-    fn happy_path_assembles_frames_in_order() {
-        let mut mgr = manager();
+    fn happy_path_assembles_frames_in_order() -> TestResult {
+        let mut mgr = manager()?;
         start(&mut mgr, sid(0x04D2));
         for seq in 0..=4u8 {
             retain(&mut mgr, sid(0x04D2), seq, &frame(seq));
         }
-        let rec = mgr.on_voice_end(sid(0x04D2), EndReason::Eot, t0());
-        let Some(rec) = rec else {
-            unreachable!("stream was open");
-        };
+        let rec = mgr
+            .on_voice_end(sid(0x04D2), EndReason::Eot, t0())
+            .ok_or("stream was open")?;
         assert_eq!(rec.frames.len(), 5);
         assert_eq!(rec.gaps, 0);
         assert_eq!(rec.expected_frames(), 5);
@@ -739,11 +878,12 @@ mod tests {
         assert_eq!(rec.end_reason, EndReason::Eot);
         assert!(rec.header.is_some());
         assert_eq!(mgr.active_count(), 0);
+        Ok(())
     }
 
     #[test]
-    fn seq_gap_is_counted_including_wrap() {
-        let mut mgr = manager();
+    fn seq_gap_is_counted_including_wrap() -> TestResult {
+        let mut mgr = manager()?;
         start(&mut mgr, sid(1));
         // seq 18, 19, then jump to 1 (missing 20, 0) = gap 2
         for seq in [18u8, 19, 1] {
@@ -754,15 +894,13 @@ mod tests {
             matches!(rec, Some(ref r) if r.gaps == 2 && r.expected_frames() == 5),
             "got {rec:?}"
         );
+        Ok(())
     }
 
-    /// Wire seq bytes are untrusted: a corrupted frame observed live
-    /// carried an out-of-alphabet value, and the modular gap math
-    /// underflowed. Wild values must be survivable and must not
-    /// corrupt the gap count.
+    /// Raw sequence bytes outside the alphabet are retained without inferred gaps.
     #[test]
-    fn out_of_alphabet_seq_does_not_panic_or_count_gaps() {
-        let mut mgr = manager();
+    fn out_of_alphabet_seq_does_not_panic_or_count_gaps() -> TestResult {
+        let mut mgr = manager()?;
         start(&mut mgr, sid(1));
         for seq in [3u8, 200, 3, 0xFF, 4] {
             retain(&mut mgr, sid(1), seq, &frame(seq));
@@ -772,22 +910,24 @@ mod tests {
             matches!(rec, Some(ref r) if r.frames.len() == 5 && r.gaps == 0),
             "wild seq must be archived but never drive gap math: {rec:?}"
         );
+        Ok(())
     }
 
     #[test]
-    fn duplicate_seq_is_not_a_gap() {
-        let mut mgr = manager();
+    fn duplicate_seq_is_not_a_gap() -> TestResult {
+        let mut mgr = manager()?;
         start(&mut mgr, sid(1));
         for seq in [3u8, 3, 4] {
             retain(&mut mgr, sid(1), seq, &frame(seq));
         }
         let rec = mgr.on_voice_end(sid(1), EndReason::Eot, t0());
         assert!(matches!(rec, Some(ref r) if r.gaps == 0), "got {rec:?}");
+        Ok(())
     }
 
     #[test]
-    fn frames_before_header_open_a_capture_and_header_attaches() {
-        let mut mgr = manager();
+    fn frames_before_header_open_a_capture_and_header_attaches() -> TestResult {
+        let mut mgr = manager()?;
         retain(&mut mgr, sid(7), 0, &frame(0));
         retain(&mut mgr, sid(7), 1, &frame(1));
         assert_eq!(mgr.active_count(), 1);
@@ -798,22 +938,24 @@ mod tests {
             matches!(rec, Some(ref r) if r.frames.len() == 3 && r.header.is_some()),
             "header attach must not reset frames: {rec:?}"
         );
+        Ok(())
     }
 
     #[test]
-    fn never_headered_stream_completes_headerless() {
-        let mut mgr = manager();
+    fn never_headered_stream_completes_headerless() -> TestResult {
+        let mut mgr = manager()?;
         retain(&mut mgr, sid(9), 0, &frame(0));
         let rec = mgr.on_voice_end(sid(9), EndReason::Inactivity, t0());
         assert!(
             matches!(rec, Some(ref r) if r.header.is_none()),
             "got {rec:?}"
         );
+        Ok(())
     }
 
     #[test]
-    fn interleaved_streams_stay_separate() {
-        let mut mgr = manager();
+    fn interleaved_streams_stay_separate() -> TestResult {
+        let mut mgr = manager()?;
         start(&mut mgr, sid(1));
         start(&mut mgr, sid(2));
         retain(&mut mgr, sid(1), 0, &frame(0));
@@ -826,11 +968,12 @@ mod tests {
             "got {r1:?}"
         );
         assert_eq!(mgr.active_count(), 1);
+        Ok(())
     }
 
     #[test]
-    fn finalize_all_flushes_open_streams_with_reason() {
-        let mut mgr = manager();
+    fn finalize_all_flushes_open_streams_with_reason() -> TestResult {
+        let mut mgr = manager()?;
         start(&mut mgr, sid(1));
         retain(&mut mgr, sid(1), 0, &frame(0));
         start(&mut mgr, sid(2));
@@ -838,26 +981,28 @@ mod tests {
         assert_eq!(recs.len(), 2);
         assert!(recs.iter().all(|r| r.end_reason == EndReason::Shutdown));
         assert_eq!(mgr.active_count(), 0);
+        Ok(())
     }
 
     #[test]
-    fn end_for_unknown_stream_is_none() {
-        let mut mgr = manager();
+    fn end_for_unknown_stream_is_none() -> TestResult {
+        let mut mgr = manager()?;
         assert!(mgr.on_voice_end(sid(42), EndReason::Eot, t0()).is_none());
+        Ok(())
     }
 
     #[test]
     fn text_message_is_collected_from_encoded_fragments() -> Result<(), Box<dyn std::error::Error>>
     {
-        let mut mgr = manager();
+        let mut mgr = manager()?;
         start(&mut mgr, sid(1));
         let message =
             dstar_gateway_core::slowdata::SlowDataTextMessage::try_from_text("Asheville NC")?;
-        let fragments = dstar_gateway_core::slowdata::encode_text_message(message);
+        let fragments = message.encode();
         // Frame 0 is the sync frame; text fragments ride frames 1..
         retain(&mut mgr, sid(1), 0, &frame(0));
         for (i, frag) in fragments.iter().enumerate() {
-            let seq = u8::try_from((i + 1) % 21).unwrap_or(1);
+            let seq = u8::try_from((i + 1) % 21)?;
             let vf = VoiceFrame {
                 ambe: [0u8; 9],
                 slow_data: *frag,
@@ -879,9 +1024,9 @@ mod tests {
     #[test]
     fn invalid_first_text_message_is_retained_losslessly() -> Result<(), Box<dyn std::error::Error>>
     {
-        use dstar_gateway_core::slowdata::{SlowDataTextMessage, encode_text_message};
+        use dstar_gateway_core::slowdata::SlowDataTextMessage;
 
-        let mut mgr = manager();
+        let mut mgr = manager()?;
         start(&mut mgr, sid(1));
         retain(&mut mgr, sid(1), 0, &frame(0));
 
@@ -889,9 +1034,10 @@ mod tests {
         invalid_bytes[0] = 0xB6;
         let invalid = SlowDataTextMessage::from_wire_bytes(invalid_bytes);
         let valid = SlowDataTextMessage::try_from_text("later valid")?;
-        for (index, fragment) in encode_text_message(invalid)
+        for (index, fragment) in invalid
+            .encode()
             .into_iter()
-            .chain(encode_text_message(valid))
+            .chain(valid.encode())
             .enumerate()
         {
             let seq = u8::try_from(index + 1)?;
@@ -919,19 +1065,38 @@ mod tests {
     }
 
     #[test]
-    fn dprs_sentence_parses_into_report_with_frame_index() {
-        // The parser accepts any 4-hex CRC field (it is parsed, not
-        // validated); same synthesized sentence the dprs module's
-        // own tests use.
-        let sentence = "$$CRC0000,W1AW    *>APDPRS,DSTAR*:!3530.00N/08233.00W#/Asheville test";
+    fn dprs_sentence_parses_into_report_with_frame_index() -> TestResult {
+        use dstar_gateway_core::dprs::{
+            DprsComment, DprsPosition, DprsSource, DprsSymbol, Latitude, Longitude, SymbolCode,
+            SymbolTable,
+        };
+        let sentence = DprsReport::new(
+            DprsSource::new("W1AW")?,
+            DprsPosition {
+                latitude: Latitude::new(35.5)?,
+                longitude: Longitude::new(-82.55)?,
+            },
+            DprsSymbol::new(SymbolTable::Primary, SymbolCode::new('#')?),
+            DprsComment::new("/Asheville test")?,
+        )
+        .to_sentence();
         let mut capture = StreamCapture::new(t0());
         capture.push_frame(0, &frame(0));
-        capture.consume_gps_sentence(sentence);
+        capture.consume_gps_sentence(&sentence);
         assert_eq!(capture.dprs.len(), 1);
         let seen = capture.dprs.first().map(|d| d.at_frame);
         assert_eq!(seen, Some(0));
-        let lat = capture.dprs.first().map(|d| d.report.latitude.degrees());
+        let lat = capture.dprs.first().map(|d| d.report.latitude().degrees());
         assert!(lat.is_some_and(|l| (l - 35.5).abs() < 0.001), "got {lat:?}");
+        capture.consume_gps_sentence(
+            "$$CRC0000,W1AW*>APDPRS,DSTAR*:!3530.00N/08233.00W#/Asheville test",
+        );
+        assert_eq!(
+            capture.dprs.len(),
+            1,
+            "invalid checksums must not enter metadata"
+        );
+        Ok(())
     }
 
     #[test]

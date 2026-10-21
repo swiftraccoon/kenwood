@@ -6,19 +6,20 @@
 //! a re-run is idempotent (retrying only past failures).
 
 use std::collections::HashMap;
-use std::io::{Read as _, Write as _};
-use std::net::TcpListener;
+use std::num::NonZeroUsize;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use stargazer::harvest::{HarvestOptions, Harvester, ManifestRecord};
+use stargazer::harvest::{FetchStage, HarvestFailure, HarvestOptions, Harvester, ManifestRecord};
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use tokio::net::TcpListener;
 
 // Compilation-unit dep acknowledgements (unused_crate_dependencies):
 use chrono as _;
 use clap as _;
 use dstar_gateway as _;
-use dstar_gateway_core as _;
+use dstar_gateway_core::RoutingCallsign;
 use mbelib_rs as _;
 use reqwest as _;
 use serde as _;
@@ -72,46 +73,103 @@ fn routes() -> HashMap<String, (u16, Vec<u8>)> {
     map
 }
 
-/// Minimal blocking HTTP/1.1 responder on a detached thread.
-fn spawn_server(
+#[derive(Debug)]
+struct TestServer {
+    base_url: String,
+    requests: Arc<Mutex<Vec<(String, tokio::time::Instant)>>>,
+    task: tokio::task::JoinHandle<std::io::Result<()>>,
+}
+
+impl TestServer {
+    fn url(&self) -> &str {
+        &self.base_url
+    }
+    fn requests(&self) -> Result<Vec<(String, tokio::time::Instant)>, Box<dyn std::error::Error>> {
+        Ok(self
+            .requests
+            .lock()
+            .map_err(|error| std::io::Error::other(error.to_string()))?
+            .clone())
+    }
+    async fn stop(mut self) -> TestResult {
+        self.task.abort();
+        match (&mut self.task).await {
+            Ok(result) => Ok(result?),
+            Err(error) if error.is_cancelled() => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+}
+
+impl Drop for TestServer {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+async fn spawn_server(
     table: HashMap<String, (u16, Vec<u8>)>,
-) -> Result<String, Box<dyn std::error::Error>> {
-    let listener = TcpListener::bind("127.0.0.1:0")?;
+) -> Result<TestServer, Box<dyn std::error::Error>> {
+    let wire = table
+        .into_iter()
+        .map(|(path, (status, body))| {
+            let mut response = format!(
+                "HTTP/1.1 {status} Response\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .into_bytes();
+            response.extend_from_slice(&body);
+            (path, response)
+        })
+        .collect();
+    spawn_wire_server(wire).await
+}
+
+async fn spawn_wire_server(
+    table: HashMap<String, Vec<u8>>,
+) -> Result<TestServer, Box<dyn std::error::Error>> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
-    let table = Arc::new(table);
-    let _unused = std::thread::spawn(move || {
-        for stream in listener.incoming() {
-            let Ok(mut sock) = stream else { return };
-            let table = Arc::clone(&table);
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let observed = Arc::clone(&requests);
+    let task = tokio::spawn(async move {
+        loop {
+            let (mut sock, _peer) = listener.accept().await?;
             let mut buf = Vec::new();
             let mut chunk = [0u8; 1024];
             loop {
-                match sock.read(&mut chunk) {
+                match sock.read(&mut chunk).await {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
                         buf.extend_from_slice(chunk.get(..n).unwrap_or_default());
                         if buf.windows(4).any(|w| w == b"\r\n\r\n") {
                             break;
                         }
+                        if buf.len() > 16_384 {
+                            return Err(std::io::Error::other("fixture request too long"));
+                        }
                     }
                 }
             }
             let text = String::from_utf8_lossy(&buf);
             let path = text.split_whitespace().nth(1).unwrap_or("/").to_string();
-            let (status, body) = table
-                .get(&path)
-                .cloned()
-                .unwrap_or_else(|| (404, b"not found".to_vec()));
-            let reason = if status == 200 { "OK" } else { "Not Found" };
-            let head = format!(
-                "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len()
+            observed
+                .lock()
+                .map_err(|error| std::io::Error::other(error.to_string()))?
+                .push((path.clone(), tokio::time::Instant::now()));
+            let response = table.get(&path).map_or(
+                b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    .as_slice(),
+                Vec::as_slice,
             );
-            let _unused = sock.write_all(head.as_bytes());
-            let _unused = sock.write_all(&body);
+            let _written = sock.write_all(response).await;
         }
     });
-    Ok(format!("http://{addr}/"))
+    Ok(TestServer {
+        base_url: format!("http://{addr}/"),
+        requests,
+        task,
+    })
 }
 
 /// A real-shaped local sidecar matching `STEM_A` (gap-free).
@@ -139,18 +197,17 @@ fn read_manifest(published: &Path) -> Result<Vec<ManifestRecord>, Box<dyn std::e
 }
 
 fn harvester(base_url: &str, dry_run: bool) -> Result<Harvester, Box<dyn std::error::Error>> {
-    Ok(Harvester::new(HarvestOptions {
-        base_url: Some(base_url.to_string()),
-        limit: None,
-        dry_run,
-        fetch_gap: Duration::ZERO,
-        operator: None,
-    })?)
+    Ok(Harvester::new(
+        HarvestOptions::new(RoutingCallsign::new("N0CALL")?)
+            .with_base_url(base_url.parse()?)
+            .with_dry_run(dry_run),
+    )?)
 }
 
 #[tokio::test]
 async fn harvest_end_to_end_dry_run_real_run_and_idempotent_rerun() -> TestResult {
-    let base_url = spawn_server(routes())?;
+    let server = spawn_server(routes()).await?;
+    let base_url = server.url();
     let recordings = tempfile::tempdir()?;
     let date_dir = recordings.path().join("REF030-C").join("2026-07-11");
     write_local_recording(&date_dir)?;
@@ -158,8 +215,8 @@ async fn harvest_end_to_end_dry_run_real_run_and_idempotent_rerun() -> TestResul
     let published = date_dir.join("published");
 
     // -- Phase 1: dry run plans but writes nothing --
-    let rec = harvester(&base_url, true)?
-        .harvest_dir(recordings.path(), "REF030-C", date)
+    let rec = harvester(base_url, true)?
+        .harvest_dir(recordings.path(), &"REF030-C".parse()?, date)
         .await?;
     assert_eq!(rec.http_status, Some(200));
     assert_eq!(rec.published_tx, 3);
@@ -174,8 +231,8 @@ async fn harvest_end_to_end_dry_run_real_run_and_idempotent_rerun() -> TestResul
     assert!(!published.exists(), "dry run must not create published/");
 
     // -- Phase 2: real run downloads and records provenance --
-    let rec = harvester(&base_url, false)?
-        .harvest_dir(recordings.path(), "REF030-C", date)
+    let rec = harvester(base_url, false)?
+        .harvest_dir(recordings.path(), &"REF030-C".parse()?, date)
         .await?;
     assert_eq!(rec.planned, 6);
     assert_eq!(rec.downloaded, 5, "{rec:?}");
@@ -199,11 +256,13 @@ async fn harvest_end_to_end_dry_run_real_run_and_idempotent_rerun() -> TestResul
         "failed download leaves no file"
     );
     // No temp litter.
-    let litter: Vec<String> = std::fs::read_dir(&published)?
-        .filter_map(Result::ok)
-        .map(|e| e.file_name().to_string_lossy().to_string())
-        .filter(|n| Path::new(n).extension() == Some("tmp".as_ref()))
-        .collect();
+    let mut litter = Vec::new();
+    for entry in std::fs::read_dir(&published)? {
+        let name = entry?.file_name().to_string_lossy().into_owned();
+        if Path::new(&name).extension() == Some("tmp".as_ref()) {
+            litter.push(name);
+        }
+    }
     assert!(litter.is_empty(), "{litter:?}");
 
     let manifest = read_manifest(&published)?;
@@ -241,8 +300,8 @@ async fn harvest_end_to_end_dry_run_real_run_and_idempotent_rerun() -> TestResul
     );
 
     // -- Phase 3: re-run is idempotent, retrying only the failure --
-    let rec = harvester(&base_url, false)?
-        .harvest_dir(recordings.path(), "REF030-C", date)
+    let rec = harvester(base_url, false)?
+        .harvest_dir(recordings.path(), &"REF030-C".parse()?, date)
         .await?;
     assert_eq!(rec.skipped_existing, 5);
     assert_eq!(rec.planned, 1, "only the previously failed file");
@@ -250,23 +309,25 @@ async fn harvest_end_to_end_dry_run_real_run_and_idempotent_rerun() -> TestResul
     assert_eq!(rec.failed, 1);
     let manifest = read_manifest(&published)?;
     assert_eq!(manifest.len(), 7 + 2, "one file attempt + one run appended");
+    server.stop().await?;
     Ok(())
 }
 
 #[tokio::test]
 async fn harvest_records_listing_absence_without_failing() -> TestResult {
-    let base_url = spawn_server(routes())?;
+    let server = spawn_server(routes()).await?;
+    let base_url = server.url();
     let recordings = tempfile::tempdir()?;
     std::fs::create_dir_all(recordings.path().join("REF030-C"))?;
     // A date the server has nothing for → 404 listing, zero coverage.
     let date = chrono::NaiveDate::from_ymd_opt(2026, 7, 10).ok_or("date")?;
-    let rec = harvester(&base_url, false)?
-        .harvest_dir(recordings.path(), "REF030-C", date)
+    let rec = harvester(base_url, false)?
+        .harvest_dir(recordings.path(), &"REF030-C".parse()?, date)
         .await?;
     assert_eq!(rec.http_status, Some(404));
     assert_eq!(rec.published_tx, 0);
     assert_eq!(rec.planned, 0);
-    assert!(rec.error.is_none(), "nothing-published is not an error");
+    assert!(rec.error().is_none(), "nothing-published is not an error");
     assert!(
         !recordings
             .path()
@@ -275,29 +336,38 @@ async fn harvest_records_listing_absence_without_failing() -> TestResult {
             .exists(),
         "a nothing-day must not create directory litter"
     );
+    server.stop().await?;
     Ok(())
 }
 
 #[tokio::test]
 async fn harvest_respects_download_limit() -> TestResult {
-    let base_url = spawn_server(routes())?;
+    let server = spawn_server(routes()).await?;
+    let base_url = server.url();
     let recordings = tempfile::tempdir()?;
     let date_dir = recordings.path().join("REF030-C").join("2026-07-11");
     write_local_recording(&date_dir)?;
     let date = chrono::NaiveDate::from_ymd_opt(2026, 7, 11).ok_or("date")?;
 
-    let harvester = Harvester::new(HarvestOptions {
-        base_url: Some(base_url),
-        limit: Some(2),
-        dry_run: false,
-        fetch_gap: Duration::ZERO,
-        operator: None,
-    })?;
+    let mut harvester = Harvester::new(
+        HarvestOptions::new(RoutingCallsign::new("N0CALL")?)
+            .with_base_url(base_url.parse()?)
+            .with_limit(NonZeroUsize::new(2).ok_or("limit")?),
+    )?;
     let rec = harvester
-        .harvest_dir(recordings.path(), "REF030-C", date)
+        .harvest_dir(recordings.path(), &"REF030-C".parse()?, date)
         .await?;
     assert_eq!(rec.downloaded + rec.failed, 2, "{rec:?}");
     assert!(rec.truncated);
+    let downloads: Vec<_> = server
+        .requests()?
+        .into_iter()
+        .filter(|(path, _)| path.starts_with(DATE_PATH) && path != DATE_PATH)
+        .collect();
+    let first = downloads.first().ok_or("first download")?;
+    let second = downloads.get(1).ok_or("second download")?;
+    assert!(second.1.duration_since(first.1) >= Duration::from_secs(2));
+    server.stop().await?;
     Ok(())
 }
 
@@ -308,19 +378,17 @@ async fn robots_disallow_stops_the_run_before_the_listing() -> TestResult {
         "/robots.txt".to_string(),
         (200, b"User-agent: *\nDisallow: /streams/\n".to_vec()),
     );
-    let base_url = spawn_server(table)?;
+    let server = spawn_server(table).await?;
+    let base_url = server.url();
     let recordings = tempfile::tempdir()?;
     let date_dir = recordings.path().join("REF030-C").join("2026-07-11");
     write_local_recording(&date_dir)?;
     let date = chrono::NaiveDate::from_ymd_opt(2026, 7, 11).ok_or("date")?;
 
-    let rec = harvester(&base_url, false)?
-        .harvest_dir(recordings.path(), "REF030-C", date)
+    let rec = harvester(base_url, false)?
+        .harvest_dir(recordings.path(), &"REF030-C".parse()?, date)
         .await?;
-    assert!(
-        rec.error.as_deref().is_some_and(|e| e.contains("robots")),
-        "{rec:?}"
-    );
+    assert!(rec.error().is_some_and(|e| e.contains("robots")), "{rec:?}");
     assert_eq!(rec.published_tx, 0, "listing never fetched");
     assert_eq!(rec.planned, 0);
     assert_eq!(rec.downloaded, 0);
@@ -328,6 +396,15 @@ async fn robots_disallow_stops_the_run_before_the_listing() -> TestResult {
         !date_dir.join("published").exists(),
         "a robots-blocked run leaves no trace"
     );
+    assert_eq!(
+        server
+            .requests()?
+            .iter()
+            .map(|(path, _)| path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["/robots.txt"]
+    );
+    server.stop().await?;
     Ok(())
 }
 
@@ -347,13 +424,14 @@ async fn consecutive_failures_trip_the_breaker() -> TestResult {
     html.push_str("</table></body></html>");
     let mut table = HashMap::new();
     let _unused = table.insert(DATE_PATH.to_string(), (200, html.into_bytes()));
-    let base_url = spawn_server(table)?;
+    let server = spawn_server(table).await?;
+    let base_url = server.url();
 
     let recordings = tempfile::tempdir()?;
     std::fs::create_dir_all(recordings.path().join("REF030-C"))?;
     let date = chrono::NaiveDate::from_ymd_opt(2026, 7, 11).ok_or("date")?;
-    let rec = harvester(&base_url, false)?
-        .harvest_dir(recordings.path(), "REF030-C", date)
+    let rec = harvester(base_url, false)?
+        .harvest_dir(recordings.path(), &"REF030-C".parse()?, date)
         .await?;
     assert_eq!(rec.planned, 4);
     assert_eq!(
@@ -362,10 +440,101 @@ async fn consecutive_failures_trip_the_breaker() -> TestResult {
     );
     assert_eq!(rec.downloaded, 0);
     assert!(
-        rec.error
-            .as_deref()
-            .is_some_and(|e| e.contains("consecutive")),
+        rec.error().is_some_and(|e| e.contains("consecutive")),
         "{rec:?}"
     );
+    server.stop().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn robots_server_failure_prevents_listing_and_downloads() -> TestResult {
+    let mut table = routes();
+    let _previous = table.insert("/robots.txt".to_owned(), (503, b"unavailable".to_vec()));
+    let server = spawn_server(table).await?;
+    let directory = tempfile::tempdir()?;
+    let date = chrono::NaiveDate::from_ymd_opt(2026, 7, 11).ok_or("date")?;
+    let record = harvester(server.url(), false)?
+        .harvest_dir(directory.path(), &"REF030-C".parse()?, date)
+        .await?;
+    assert!(
+        matches!(record.failure(), Some(HarvestFailure::HttpStatus { stage: FetchStage::Robots, status }) if *status == reqwest::StatusCode::SERVICE_UNAVAILABLE),
+        "{record:?}"
+    );
+    assert_eq!(
+        server
+            .requests()?
+            .iter()
+            .map(|(path, _)| path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["/robots.txt"]
+    );
+    assert_eq!(std::fs::read_dir(directory.path())?.count(), 0);
+    server.stop().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn robots_wildcards_and_allow_exceptions_filter_individual_artifacts() -> TestResult {
+    let mut table = routes();
+    let robots = format!(
+        "User-agent: stargazer-harvest\nDisallow: /*.mp3$\nAllow: {DATE_PATH}{STEM_A}.mp3$\n"
+    );
+    let _previous = table.insert("/robots.txt".to_owned(), (200, robots.into_bytes()));
+    let server = spawn_server(table).await?;
+    let directory = tempfile::tempdir()?;
+    let date = chrono::NaiveDate::from_ymd_opt(2026, 7, 11).ok_or("date")?;
+    let record = harvester(server.url(), true)?
+        .harvest_dir(directory.path(), &"REF030-C".parse()?, date)
+        .await?;
+    assert_eq!(record.blocked_by_robots, 2);
+    assert_eq!(record.planned, 5);
+    assert_eq!(server.requests()?.len(), 2);
+    server.stop().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn declared_and_chunked_responses_enforce_the_selected_bound() -> TestResult {
+    for response in [
+        b"HTTP/1.1 200 OK\r\nContent-Length: 64\r\nConnection: close\r\n\r\n0123456789012345678901234567890123456789012345678901234567890123".to_vec(),
+        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n40\r\n0123456789012345678901234567890123456789012345678901234567890123\r\n0\r\n\r\n".to_vec(),
+    ] {
+        let server = spawn_wire_server(HashMap::from([(DATE_PATH.to_owned(), response)])).await?;
+        let directory = tempfile::tempdir()?;
+        let maximum = NonZeroUsize::new(32).ok_or("limit")?;
+        let options = HarvestOptions::new(RoutingCallsign::new("N0CALL")?).with_base_url(server.url().parse()?).with_response_limit(maximum).with_dry_run(true);
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 7, 11).ok_or("date")?;
+        let record = Harvester::new(options)?.harvest_dir(directory.path(), &"REF030-C".parse()?, date).await?;
+        assert!(matches!(record.failure(), Some(HarvestFailure::Fetch { stage: FetchStage::Listing, source: stargazer::FetchError::TooLarge { maximum: actual } }) if *actual == maximum), "{record:?}");
+        assert_eq!(record.planned, 0);
+        server.stop().await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn redirect_chain_stops_at_the_client_limit() -> TestResult {
+    let mut table = HashMap::new();
+    for index in 0..7 {
+        let path = if index == 0 {
+            DATE_PATH.to_owned()
+        } else {
+            format!("/redirect{index}")
+        };
+        let _previous = table.insert(path, format!("HTTP/1.1 302 Found\r\nLocation: /redirect{}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", index + 1).into_bytes());
+    }
+    let server = spawn_wire_server(table).await?;
+    let directory = tempfile::tempdir()?;
+    let date = chrono::NaiveDate::from_ymd_opt(2026, 7, 11).ok_or("date")?;
+    let record = harvester(server.url(), true)?
+        .harvest_dir(directory.path(), &"REF030-C".parse()?, date)
+        .await?;
+    assert!(
+        matches!(record.failure(), Some(HarvestFailure::Fetch { stage: FetchStage::Listing, source: stargazer::FetchError::Http(error) }) if error.is_redirect()),
+        "{record:?}"
+    );
+    assert!(server.requests()?.len() <= 7);
+    server.stop().await?;
     Ok(())
 }
