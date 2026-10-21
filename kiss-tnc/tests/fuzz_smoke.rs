@@ -1,13 +1,7 @@
 //! Smoke fuzzing for the KISS codec.
 //!
-//! This is not a real `cargo-fuzz` harness; that requires nightly.
-//! Instead, both the one-shot `decode_kiss_frame` and the streaming
-//! `KissDecoder` are fed many pseudo-random byte sequences, asserting
-//! that none of them panic. The seeds are fixed so the runs are
-//! reproducible.
-//!
-//! For real fuzzing (libfuzzer/AFL), the same bodies can be lifted into
-//! a `fuzz_targets/` crate.
+//! One-shot and streaming decoders receive deterministic pseudo-random
+//! byte sequences. A panic fails the test; fixed seeds reproduce its input.
 
 // Integration tests are separate compilation units that re-evaluate
 // workspace deps; acknowledge the transitively-reachable lib deps these
@@ -15,7 +9,7 @@
 use proptest as _;
 use thiserror as _;
 
-use kiss_tnc::{KissDecoder, decode_kiss_frame};
+use kiss_tnc::{KissDecoder, KissFrame};
 
 /// Tiny xorshift32 RNG: deterministic, no `rand` dependency.
 struct Xor32(u32);
@@ -51,7 +45,7 @@ fn fuzz_kiss_decode_no_panic() {
             // return a `Result`, never panic. `matches!` consumes the
             // value and documents the "just don't panic" intent.
             assert!(
-                matches!(decode_kiss_frame(&buf), Ok(_) | Err(_)),
+                matches!(KissFrame::from_bytes(&buf), Ok(_) | Err(_)),
                 "decoder must return a Result, not panic",
             );
         }
@@ -75,6 +69,11 @@ fn fuzz_kiss_decoder_stream_no_panic() {
                     break;
                 }
             }
+            let remaining = decoder.next_frame();
+            assert!(
+                matches!(remaining, Ok(None)),
+                "decoder must consume complete frames and errors: {remaining:?}",
+            );
         }
     }
 }

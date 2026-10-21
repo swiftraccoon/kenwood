@@ -1,55 +1,11 @@
-//! KISS TNC (Terminal Node Controller) wire protocol codec.
-//!
-//! This crate is a **runtime-agnostic, I/O-free** implementation of the
-//! KISS TNC framing protocol described by Chepponis & Karn (1987). It
-//! provides:
-//!
-//! - Constants for the KISS special bytes ([`FEND`], [`FESC`], [`TFEND`],
-//!   [`TFESC`]) and the command type bytes ([`CMD_DATA`],
-//!   [`CMD_TX_DELAY`], etc.).
-//! - Typed [`KissCommand`] and [`KissPort`] wrappers over the raw
-//!   nibble-encoded type byte.
-//! - A decoded [`KissFrame`] type with convenience constructors.
-//! - One-shot [`encode_kiss_frame`] / [`encode_kiss_frame_into`] and
-//!   [`decode_kiss_frame`] helpers for a full frame in a single buffer.
-//! - A streaming [`KissDecoder`] that accepts arbitrary byte chunks
-//!   from a serial port and yields complete frames as they arrive.
-//!
-//! The crate is `#![no_std]`; the only allocator-backed types come from
-//! [`alloc`], which callers must provide.
-//!
-//! # Example
-//!
-//! ```
-//! use kiss_tnc::{FEND, KissCommand, KissDecoder, KissPort};
-//!
-//! // A complete KISS data frame on the wire: FEND, type byte 0x00
-//! // (port 0, command Data), one payload byte 0x41, FEND.
-//! let mut decoder = KissDecoder::new();
-//! decoder.push(&[FEND, 0x00, 0x41, FEND]);
-//!
-//! let frame = decoder
-//!     .next_frame()?
-//!     .expect("the pushed bytes form one complete frame");
-//! assert_eq!(frame.port, KissPort::TH_D75);
-//! assert_eq!(frame.command, KissCommand::Data);
-//! assert_eq!(frame.data, [0x41]);
-//! # Ok::<(), kiss_tnc::KissError>(())
-//! ```
-//!
-//! # References
-//!
-//! - KISS protocol: <http://www.ka9q.net/papers/kiss.html>
-//! - AX.25 v2.2: <http://www.ax25.net/AX25.2.2-Jul%2098-2.pdf>
-
+#![doc = include_str!("../README.md")]
 #![no_std]
 
 extern crate alloc;
 
-mod command;
-mod decoder;
-mod error;
-mod frame;
+// The library test target includes the integration suites' dev-dependency.
+#[cfg(test)]
+use proptest as _;
 
 pub use command::{
     CMD_DATA, CMD_FULL_DUPLEX, CMD_PERSISTENCE, CMD_RETURN, CMD_SET_HARDWARE, CMD_SLOT_TIME,
@@ -57,10 +13,9 @@ pub use command::{
 };
 pub use decoder::{DEFAULT_MAX_FRAME_LEN, KissDecoder};
 pub use error::KissError;
-pub use frame::{KissFrame, decode_kiss_frame, encode_kiss_frame, encode_kiss_frame_into};
+pub use frame::KissFrame;
 
-// `proptest` is a dev-dependency used only in the integration test
-// suites. Acknowledge it here to keep `-D unused-crate-dependencies`
-// happy when the lib test crate compiles with dev-deps in scope.
-#[cfg(test)]
-use proptest as _;
+mod command;
+mod decoder;
+mod error;
+mod frame;

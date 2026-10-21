@@ -4,10 +4,7 @@
 use proptest as _;
 use thiserror as _;
 
-use kiss_tnc::{
-    CMD_RETURN, FEND, FESC, KissCommand, KissError, KissFrame, KissPort, TFEND, TFESC,
-    decode_kiss_frame, encode_kiss_frame, encode_kiss_frame_into,
-};
+use kiss_tnc::{CMD_RETURN, FEND, FESC, KissCommand, KissError, KissFrame, KissPort, TFEND, TFESC};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -36,7 +33,7 @@ fn roundtrip_preserves_port_command_and_data() -> TestResult {
                 command,
                 data: data.clone(),
             };
-            let decoded = decode_kiss_frame(&encode_kiss_frame(&frame))?;
+            let decoded = KissFrame::from_bytes(&frame.to_bytes())?;
             assert_eq!(decoded.port, port, "port {port:?} command {command:?}");
             assert_eq!(
                 decoded.command, command,
@@ -58,13 +55,13 @@ fn port_15_data_frame_does_not_collide_with_return() -> TestResult {
         command: KissCommand::Data,
         data: vec![0xAB],
     };
-    let wire = encode_kiss_frame(&frame);
+    let wire = frame.to_bytes();
     assert_ne!(
         wire.get(1).copied(),
         Some(CMD_RETURN),
         "type byte must not be 0xFF",
     );
-    let decoded = decode_kiss_frame(&wire)?;
+    let decoded = KissFrame::from_bytes(&wire)?;
     assert_eq!(decoded.port.get(), 15);
     assert_eq!(decoded.command, KissCommand::Data);
     Ok(())
@@ -81,7 +78,7 @@ fn type_byte_equal_to_fend_is_escaped() -> TestResult {
         command: KissCommand::Data,
         data: vec![0x01],
     };
-    let wire = encode_kiss_frame(&frame);
+    let wire = frame.to_bytes();
     // No raw FEND may appear between the opening and closing delimiters.
     let interior = wire
         .get(1..wire.len() - 1)
@@ -90,7 +87,7 @@ fn type_byte_equal_to_fend_is_escaped() -> TestResult {
         !interior.contains(&FEND),
         "type byte 0xC0 must be escaped, not raw: {wire:02X?}",
     );
-    let decoded = decode_kiss_frame(&wire)?;
+    let decoded = KissFrame::from_bytes(&wire)?;
     assert_eq!(decoded.port, port);
     assert_eq!(decoded.command, KissCommand::Data);
     assert_eq!(decoded.data, vec![0x01]);
@@ -100,11 +97,11 @@ fn type_byte_equal_to_fend_is_escaped() -> TestResult {
 #[test]
 fn return_frame_encodes_as_three_bare_bytes() -> TestResult {
     // A Return frame is the whole-byte 0xFF command: FEND 0xFF FEND.
-    let wire = encode_kiss_frame(&KissFrame::return_command());
+    let wire = KissFrame::return_command().to_bytes();
     assert_eq!(wire, vec![FEND, CMD_RETURN, FEND]);
-    let decoded = decode_kiss_frame(&wire)?;
+    let decoded = KissFrame::from_bytes(&wire)?;
     assert_eq!(decoded.command, KissCommand::Return);
-    assert!(decoded.data.is_empty());
+    assert!(decoded.data.is_empty(), "return constructor has no payload");
     Ok(())
 }
 
@@ -117,16 +114,16 @@ fn return_frame_ignores_port_and_data_on_the_wire() -> TestResult {
         command: KissCommand::Return,
         data: vec![0xDE, 0xAD],
     };
-    assert_eq!(encode_kiss_frame(&frame), vec![FEND, CMD_RETURN, FEND]);
+    assert_eq!(frame.to_bytes(), vec![FEND, CMD_RETURN, FEND]);
     Ok(())
 }
 
 #[test]
 fn data_constructor_builds_a_port0_data_frame() -> TestResult {
     let frame = KissFrame::data(vec![1, 2, 3]);
-    assert_eq!(frame.port, KissPort::TH_D75);
+    assert_eq!(frame.port, KissPort::ZERO);
     assert_eq!(frame.command, KissCommand::Data);
-    let decoded = decode_kiss_frame(&encode_kiss_frame(&frame))?;
+    let decoded = KissFrame::from_bytes(&frame.to_bytes())?;
     assert_eq!(decoded.data, vec![1, 2, 3]);
     Ok(())
 }
@@ -134,29 +131,32 @@ fn data_constructor_builds_a_port0_data_frame() -> TestResult {
 #[test]
 fn encode_into_appends_without_clobbering_existing_bytes() {
     let mut buf = vec![0xEE, 0xEE];
-    encode_kiss_frame_into(&KissFrame::data(vec![0xAA]), &mut buf);
+    KissFrame::data(vec![0xAA]).append_to(&mut buf);
     assert_eq!(buf, vec![0xEE, 0xEE, FEND, 0x00, 0xAA, FEND]);
 }
 
 #[test]
 fn encode_stuffs_special_payload_bytes() {
     // FEND -> FESC TFEND, FESC -> FESC TFESC.
-    let wire = encode_kiss_frame(&KissFrame::data(vec![FEND, FESC]));
+    let wire = KissFrame::data(vec![FEND, FESC]).to_bytes();
     assert_eq!(wire, vec![FEND, 0x00, FESC, TFEND, FESC, TFESC, FEND]);
 }
 
 #[test]
 fn decode_accepts_minimum_length_empty_payload_frame() -> TestResult {
-    let frame = decode_kiss_frame(&[FEND, 0x00, FEND])?;
+    let frame = KissFrame::from_bytes(&[FEND, 0x00, FEND])?;
     assert_eq!(frame.command, KissCommand::Data);
-    assert!(frame.data.is_empty());
+    assert!(
+        frame.data.is_empty(),
+        "minimum frame contains only its type byte"
+    );
     Ok(())
 }
 
 #[test]
 fn decode_rejects_unknown_command_nibble() {
     // Low nibble 0x07 is not an assigned KISS command.
-    let result = decode_kiss_frame(&[FEND, 0x07, FEND]);
+    let result = KissFrame::from_bytes(&[FEND, 0x07, FEND]);
     assert!(
         matches!(result, Err(KissError::UnknownCommand(0x07))),
         "expected UnknownCommand(7), got {result:?}",
@@ -165,7 +165,7 @@ fn decode_rejects_unknown_command_nibble() {
 
 #[test]
 fn decode_rejects_frame_shorter_than_two_bytes() {
-    let result = decode_kiss_frame(&[FEND]);
+    let result = KissFrame::from_bytes(&[FEND]);
     assert!(
         matches!(result, Err(KissError::FrameTooShort)),
         "got {result:?}",
@@ -174,7 +174,7 @@ fn decode_rejects_frame_shorter_than_two_bytes() {
 
 #[test]
 fn decode_rejects_missing_start_delimiter() {
-    let result = decode_kiss_frame(&[0x00, 0xAA, FEND]);
+    let result = KissFrame::from_bytes(&[0x00, 0xAA, FEND]);
     assert!(
         matches!(result, Err(KissError::MissingStartDelimiter)),
         "got {result:?}",
@@ -183,7 +183,7 @@ fn decode_rejects_missing_start_delimiter() {
 
 #[test]
 fn decode_rejects_missing_end_delimiter() {
-    let result = decode_kiss_frame(&[FEND, 0x00, 0xAA]);
+    let result = KissFrame::from_bytes(&[FEND, 0x00, 0xAA]);
     assert!(
         matches!(result, Err(KissError::MissingEndDelimiter)),
         "got {result:?}",
@@ -193,7 +193,7 @@ fn decode_rejects_missing_end_delimiter() {
 #[test]
 fn decode_classifies_bare_delimiters_as_empty_frame() {
     // `FEND FEND` has both delimiters but no type byte.
-    let result = decode_kiss_frame(&[FEND, FEND]);
+    let result = KissFrame::from_bytes(&[FEND, FEND]);
     assert!(
         matches!(result, Err(KissError::EmptyFrame)),
         "got {result:?}",
@@ -203,7 +203,7 @@ fn decode_classifies_bare_delimiters_as_empty_frame() {
 #[test]
 fn decode_rejects_invalid_escape_sequence() {
     // FESC must be followed by TFEND or TFESC; 0x99 is neither.
-    let result = decode_kiss_frame(&[FEND, 0x00, FESC, 0x99, FEND]);
+    let result = KissFrame::from_bytes(&[FEND, 0x00, FESC, 0x99, FEND]);
     assert!(
         matches!(result, Err(KissError::InvalidEscapeSequence)),
         "got {result:?}",
@@ -213,7 +213,7 @@ fn decode_rejects_invalid_escape_sequence() {
 #[test]
 fn decode_rejects_truncated_escape_sequence() {
     // FESC as the final body byte: nothing follows it.
-    let result = decode_kiss_frame(&[FEND, 0x00, FESC, FEND]);
+    let result = KissFrame::from_bytes(&[FEND, 0x00, FESC, FEND]);
     assert!(
         matches!(result, Err(KissError::TruncatedEscapeSequence)),
         "got {result:?}",
@@ -223,9 +223,19 @@ fn decode_rejects_truncated_escape_sequence() {
 #[test]
 fn decode_rejects_raw_fend_inside_body() {
     // A raw, unescaped FEND in the payload region is malformed.
-    let result = decode_kiss_frame(&[FEND, 0x00, 0xAA, FEND, 0xBB, FEND]);
+    let result = KissFrame::from_bytes(&[FEND, 0x00, 0xAA, FEND, 0xBB, FEND]);
     assert!(
         matches!(result, Err(KissError::UnexpectedFrameDelimiter)),
         "got {result:?}",
     );
+}
+
+#[test]
+fn return_decode_preserves_received_payload_and_normalizes_port() -> TestResult {
+    let frame = KissFrame::from_bytes(&[FEND, CMD_RETURN, 0x41, FEND])?;
+    assert_eq!(frame.port, KissPort::ZERO);
+    assert_eq!(frame.command, KissCommand::Return);
+    assert_eq!(frame.data, vec![0x41]);
+    assert_eq!(frame.to_bytes(), vec![FEND, CMD_RETURN, FEND]);
+    Ok(())
 }

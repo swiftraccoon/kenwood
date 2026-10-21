@@ -1,15 +1,24 @@
 # kiss-tnc
 
-Generic KISS TNC wire framing, spec-correct per Chepponis and Karn (1987).
+Generic KISS TNC wire framing using Chepponis and Karn (1987).
 `#![no_std]` plus `alloc`, sans-io, zero async or I/O. Leaf crate: no workspace
 path dependencies. The layering rule lives in the root `AGENTS.md` section
 `Workspace boundaries`.
 
-## D75-specific quirks are NOT here
+## Protocol contracts
 
-- The TH-D75 firmware reportedly nibble-splits `CMD_RETURN` where the spec says it should not. This crate stays spec-correct so the TM-D750 and other TNCs can share it.
-- That quirk is currently unimplemented anywhere, not implemented elsewhere: the KISS session site is `thd75/src/radio/kiss_session.rs`, and its `exit()` sends this crate's `KissFrame::return_command()`, the spec-correct whole byte `0xFF`. Re-verify against hardware KISS before relying on the quirk claim at all.
-- The invariant a nibble split would break is in `src/frame.rs`: a non-Return command's wire byte is always `0x00..=0x06`, so the port (high nibble) and command (low nibble) never overlap, while `Return` is the whole byte `0xFF` and carries neither port nor payload.
+- Keep radio-specific framing quirks outside this crate.
+- Non-return command codes occupy `0x00..=0x06`. Return is the whole-byte
+  `0xFF`; encoding it omits the frame record's port and payload.
+- Reject malformed escape sequences for the whole frame. Preserve this strict
+  decoding policy and document its difference from the specification.
+- The decoder limit counts stuffed wire bytes and both delimiters. Enforce it
+  during polling without dropping later valid frames in the same input chunk.
+- Input ingestion retains the whole chunk. Do not describe the frame limit as
+  a bound on queued bytes or retained allocation.
+- Keep the closing delimiter after consuming a completed frame, including
+  malformed and oversized frames, so shared delimiters remain supported.
+- Preserve the dependency policy and add traits only when their semantics fit.
 
 ## Tests
 

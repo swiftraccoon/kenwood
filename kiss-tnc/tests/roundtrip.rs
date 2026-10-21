@@ -5,7 +5,7 @@
 // file does not name directly.
 use thiserror as _;
 
-use kiss_tnc::{KissCommand, KissFrame, KissPort, decode_kiss_frame, encode_kiss_frame};
+use kiss_tnc::{KissCommand, KissFrame, KissPort};
 use proptest::prelude::*;
 
 /// Strategy producing any of the seven nibble-encoded KISS commands.
@@ -35,7 +35,7 @@ proptest! {
             command,
             data: data.clone(),
         };
-        let decoded = decode_kiss_frame(&encode_kiss_frame(&frame))?;
+        let decoded = KissFrame::from_bytes(&frame.to_bytes())?;
         prop_assert_eq!(decoded.port, port);
         prop_assert_eq!(decoded.command, command);
         prop_assert_eq!(decoded.data, data);

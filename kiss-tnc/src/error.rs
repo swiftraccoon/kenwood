@@ -2,8 +2,12 @@
 
 use thiserror::Error;
 
-/// Errors that can occur during KISS frame processing.
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
+/// Errors from KISS frame decoding and command or port conversion.
+///
+/// Errors are value diagnostics: copying preserves the failure kind and any
+/// rejected byte, without retaining frame buffers or decoder state.
+/// See the [decoding error example](crate#limits-and-errors).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 #[non_exhaustive]
 pub enum KissError {
     /// Fewer than two bytes: too short to hold even the start and end
@@ -20,10 +24,15 @@ pub enum KissError {
     /// byte.
     #[error("empty KISS frame (no type byte)")]
     EmptyFrame,
-    /// The type byte's command nibble is not an assigned KISS command.
-    /// Carries the unrecognized nibble (`0x00..=0x0F`).
-    #[error("unknown KISS command nibble {0:#04x}")]
+    /// A command byte is not an assigned KISS command code.
+    ///
+    /// [`crate::KissCommand::try_from`] returns the input byte. Frame
+    /// decoding returns the type byte's unrecognized low nibble.
+    #[error("unknown KISS command {0:#04x}")]
     UnknownCommand(u8),
+    /// A raw port byte exceeds the four-bit `0..=15` port address range.
+    #[error("KISS port {0} exceeds 15")]
+    InvalidPort(u8),
     /// A frame-escape (FESC) byte is followed by a byte other than
     /// TFEND or TFESC.
     #[error("invalid KISS escape sequence")]
@@ -36,9 +45,12 @@ pub enum KissError {
     /// it should have been stuffed as `FESC TFEND`.
     #[error("unexpected FEND inside KISS frame body")]
     UnexpectedFrameDelimiter,
-    /// A frame (or a run of bytes with no usable delimiter) exceeded
-    /// the streaming decoder's configured maximum length and was
-    /// discarded to bound memory use.
+    /// Buffered input exceeded the streaming decoder's wire-length limit.
+    ///
+    /// A complete frame includes both FEND delimiters. An incomplete
+    /// frame or buffer without a FEND is rejected when its buffered length
+    /// exceeds the limit. Rejected bytes are discarded by
+    /// [`crate::KissDecoder::next_frame`].
     #[error("KISS frame exceeds maximum length")]
     FrameTooLong,
 }

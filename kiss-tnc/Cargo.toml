@@ -1,15 +1,15 @@
 [package]
 name = "kiss-tnc"
 version = "0.1.0"
+authors = ["swiftraccoon"]
+categories = ["encoding", "parser-implementations", "no-std"]
 edition = "2024"
+keywords = ["kiss", "ax25", "tnc", "ham-radio", "amateur-radio"]
+license = "GPL-2.0-or-later"
+publish = false
+repository = "https://github.com/swiftraccoon/kenwood"
 rust-version = "1.94"
 description = "KISS TNC (Terminal Node Controller) wire protocol codec"
-license = "GPL-2.0-or-later"
-authors = ["swiftraccoon"]
-repository = "https://github.com/swiftraccoon/kenwood"
-keywords = ["kiss", "ax25", "tnc", "ham-radio", "amateur-radio"]
-categories = ["encoding", "parser-implementations", "no-std"]
-publish = false
 
 [dependencies]
 thiserror = { version = "2", default-features = false }

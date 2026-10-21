@@ -1,5 +1,7 @@
 //! KISS wire constants and typed command/port representations.
 
+use crate::error::KissError;
+
 // ---------------------------------------------------------------------------
 // KISS constants
 // ---------------------------------------------------------------------------
@@ -29,7 +31,7 @@ pub const CMD_TX_DELAY: u8 = 0x01;
 /// Set persistence parameter for CSMA. Range: 0-255.
 pub const CMD_PERSISTENCE: u8 = 0x02;
 
-/// Set slot time (units of 10 ms) for CSMA. Range: 0-250.
+/// Set the CSMA slot interval, in units of 10 ms, using one payload byte.
 pub const CMD_SLOT_TIME: u8 = 0x03;
 
 /// Set TX tail time (units of 10 ms). Range: 0-255.
@@ -53,8 +55,8 @@ pub const CMD_RETURN: u8 = 0xFF;
 /// lets the library classify frames at parse time and construct frames
 /// without reaching for raw byte constants.
 ///
-/// Note the TH-D75 is always port 0 on the wire; the high nibble is
-/// tracked separately via [`KissPort`].
+/// The port's high nibble is represented separately by [`KissPort`].
+/// See the [command conversion example](crate#ports-and-commands).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum KissCommand {
     /// `0x00`: data frame (payload is an AX.25 frame).
@@ -63,7 +65,7 @@ pub enum KissCommand {
     TxDelay,
     /// `0x02`: CSMA persistence (0-255).
     Persistence,
-    /// `0x03`: CSMA slot time in 10 ms units (0-250).
+    /// `0x03`: CSMA slot interval in 10 ms units, encoded in one byte.
     SlotTime,
     /// `0x04`: TX tail time in 10 ms units (0-255).
     TxTail,
@@ -79,6 +81,7 @@ impl KissCommand {
     /// Convert a raw low-nibble or full-byte value to a [`KissCommand`].
     ///
     /// Returns `None` for unrecognised values.
+    /// See the [command conversion example](crate#ports-and-commands).
     #[must_use]
     pub const fn from_byte(b: u8) -> Option<Self> {
         match b {
@@ -96,6 +99,7 @@ impl KissCommand {
 
     /// Convert back to the wire byte value (low-nibble of the type byte,
     /// or `0xFF` for `Return`).
+    /// See the [command conversion example](crate#ports-and-commands).
     #[must_use]
     pub const fn as_byte(self) -> u8 {
         match self {
@@ -110,27 +114,47 @@ impl KissCommand {
         }
     }
 
-    /// `true` if this is the special full-byte `Return` command which
-    /// does NOT participate in the port/command nibble encoding.
+    /// Returns whether this is the whole-byte [`Self::Return`] command.
+    /// See the [return command example](crate#return-command).
     #[must_use]
     pub const fn is_return(self) -> bool {
         matches!(self, Self::Return)
     }
 }
 
+impl From<KissCommand> for u8 {
+    fn from(command: KissCommand) -> Self {
+        command.as_byte()
+    }
+}
+
+impl TryFrom<u8> for KissCommand {
+    type Error = KissError;
+
+    /// Classifies an exact command byte, including the whole-byte `0xFF`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KissError::UnknownCommand`] with the input byte when it is
+    /// neither an assigned command code in `0x00..=0x06` nor `0xFF`.
+    fn try_from(byte: u8) -> Result<Self, Self::Error> {
+        Self::from_byte(byte).ok_or(KissError::UnknownCommand(byte))
+    }
+}
+
 /// A KISS TNC port number, validated to `0..=15` (a 4-bit nibble).
 ///
 /// Per the KISS spec, the high nibble of the type byte addresses one of
-/// up to 16 TNC ports. The TH-D75 is always port 0; [`KissPort::TH_D75`]
-/// is a convenience constant for that common case.
+/// up to 16 TNC ports. [`Self::ZERO`] is the default port.
+/// See the [port conversion example](crate#ports-and-commands).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[doc(alias = "tnc-port")]
 #[doc(alias = "kiss-port")]
 pub struct KissPort(u8);
 
 impl KissPort {
-    /// The TH-D75 always uses port 0.
-    pub const TH_D75: Self = Self(0);
+    /// Port zero, the default port.
+    pub const ZERO: Self = Self(0);
 
     /// The maximum valid port; the type byte's port nibble holds 4 bits.
     pub const MAX: Self = Self(15);
@@ -138,6 +162,7 @@ impl KissPort {
     /// Create a port from a raw `u8`, validating the `0..=15` range.
     ///
     /// Returns `None` for values outside the nibble range.
+    /// See the [port conversion example](crate#ports-and-commands).
     #[must_use]
     pub const fn new(n: u8) -> Option<Self> {
         if n <= Self::MAX.get() {
@@ -150,20 +175,43 @@ impl KissPort {
     /// Extract the port from a KISS type byte (its high nibble).
     ///
     /// Always succeeds: a 4-bit nibble is intrinsically within `0..=15`.
+    /// Callers classify the whole-byte return command before extracting a
+    /// frame's port. See the [port conversion example](crate#ports-and-commands).
     #[must_use]
     pub const fn from_type_byte(type_byte: u8) -> Self {
         Self(type_byte >> 4)
     }
 
     /// Return the raw port value.
+    /// See the [port conversion example](crate#ports-and-commands).
     #[must_use]
     pub const fn get(self) -> u8 {
         self.0
     }
 }
 
+impl From<KissPort> for u8 {
+    fn from(port: KissPort) -> Self {
+        port.get()
+    }
+}
+
+impl TryFrom<u8> for KissPort {
+    type Error = KissError;
+
+    /// Validates a port byte against the `0..=15` address range.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`KissError::InvalidPort`] with the input byte when it exceeds
+    /// [`Self::MAX`].
+    fn try_from(byte: u8) -> Result<Self, Self::Error> {
+        Self::new(byte).ok_or(KissError::InvalidPort(byte))
+    }
+}
+
 impl Default for KissPort {
     fn default() -> Self {
-        Self::TH_D75
+        Self::ZERO
     }
 }

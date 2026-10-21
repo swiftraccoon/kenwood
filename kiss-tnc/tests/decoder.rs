@@ -3,7 +3,9 @@
 use proptest as _;
 use thiserror as _;
 
-use kiss_tnc::{FEND, FESC, KissDecoder, KissError, TFEND, TFESC};
+use kiss_tnc::{
+    FEND, FESC, KissCommand, KissDecoder, KissError, KissFrame, KissPort, TFEND, TFESC,
+};
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -52,7 +54,10 @@ fn double_fend_between_frames_yields_both() -> TestResult {
 fn partial_frame_completes_after_more_bytes() -> TestResult {
     let mut d = KissDecoder::new();
     d.push(&[FEND, 0x00, 0xAA]);
-    assert!(drain_payloads(&mut d)?.is_empty());
+    assert!(
+        drain_payloads(&mut d)?.is_empty(),
+        "the closing FEND has not arrived"
+    );
     d.push(&[0xBB, FEND]);
     assert_eq!(drain_payloads(&mut d)?, vec![vec![0xAA, 0xBB]]);
     Ok(())
@@ -151,4 +156,98 @@ fn default_cap_accepts_a_normal_frame() -> TestResult {
     d.push(&[FEND, 0x00, 0xAA, 0xBB, FEND]);
     assert_eq!(drain_payloads(&mut d)?, vec![vec![0xAA, 0xBB]]);
     Ok(())
+}
+
+#[test]
+fn wire_cap_counts_stuffed_type_payload_and_both_delimiters() -> TestResult {
+    let frame = KissFrame {
+        port: KissPort::try_from(12_u8)?,
+        command: KissCommand::Data,
+        data: vec![FESC],
+    };
+    let wire = frame.to_bytes();
+    assert_eq!(
+        wire.len(),
+        6,
+        "type and payload each require two stuffed bytes"
+    );
+
+    let mut exact = KissDecoder::with_max_frame_len(wire.len());
+    exact.push(&wire);
+    assert_eq!(exact.next_frame()?, Some(frame));
+    assert_eq!(exact.next_frame()?, None);
+
+    let mut exceeded = KissDecoder::with_max_frame_len(wire.len() - 1);
+    exceeded.push(&wire);
+    let result = exceeded.next_frame();
+    assert!(
+        matches!(result, Err(KissError::FrameTooLong)),
+        "one wire byte over the limit must be rejected: {result:?}",
+    );
+    Ok(())
+}
+
+#[test]
+fn queued_valid_frames_can_together_exceed_the_frame_cap() -> TestResult {
+    let mut decoder = KissDecoder::with_max_frame_len(4);
+    decoder.push(&[FEND, 0x00, 0xA0, FEND, 0x00, 0xA1, FEND, 0x00, 0xA2, FEND]);
+    assert_eq!(
+        drain_payloads(&mut decoder)?,
+        vec![vec![0xA0], vec![0xA1], vec![0xA2]],
+        "the per-frame cap must preserve every queued valid frame",
+    );
+    Ok(())
+}
+
+#[test]
+fn escape_pair_can_cross_an_input_chunk_boundary() -> TestResult {
+    let mut decoder = KissDecoder::new();
+    decoder.push(&[FEND, 0x00, FESC]);
+    assert_eq!(decoder.next_frame()?, None);
+    decoder.push(&[TFEND, FEND]);
+    assert_eq!(drain_payloads(&mut decoder)?, vec![vec![FEND]]);
+    Ok(())
+}
+
+#[test]
+fn malformed_frame_preserves_the_following_shared_delimiter_frame() -> TestResult {
+    let mut decoder = KissDecoder::new();
+    decoder.push(&[FEND, 0x00, FESC, 0x99, FEND, 0x00, 0xAA, FEND]);
+    let result = decoder.next_frame();
+    assert!(
+        matches!(result, Err(KissError::InvalidEscapeSequence)),
+        "the malformed frame must be rejected: {result:?}",
+    );
+    assert_eq!(drain_payloads(&mut decoder)?, vec![vec![0xAA]]);
+    Ok(())
+}
+
+#[test]
+fn incomplete_frame_at_cap_waits_and_over_cap_resynchronizes() -> TestResult {
+    let mut decoder = KissDecoder::with_max_frame_len(4);
+    decoder.push(&[FEND, 0x00, 0xAA, 0xBB]);
+    assert_eq!(decoder.next_frame()?, None);
+    decoder.push(&[0xCC]);
+    let result = decoder.next_frame();
+    assert!(
+        matches!(result, Err(KissError::FrameTooLong)),
+        "the oversized incomplete frame must be discarded: {result:?}",
+    );
+    assert_eq!(decoder.next_frame()?, None);
+    decoder.push(&[0x11, FEND, 0x00, 0xDD, FEND]);
+    assert_eq!(drain_payloads(&mut decoder)?, vec![vec![0xDD]]);
+    Ok(())
+}
+
+#[test]
+fn caps_below_the_minimum_reject_complete_frames() {
+    for cap in 0..3 {
+        let mut decoder = KissDecoder::with_max_frame_len(cap);
+        decoder.push(&[FEND, 0x00, FEND]);
+        let result = decoder.next_frame();
+        assert!(
+            matches!(result, Err(KissError::FrameTooLong)),
+            "cap {cap} must reject a three-byte frame: {result:?}",
+        );
+    }
 }
