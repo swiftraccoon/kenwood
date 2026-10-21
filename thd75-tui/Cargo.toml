@@ -1,61 +1,53 @@
 [package]
 name = "thd75-tui"
 version = "0.1.0"
+authors = ["swiftraccoon"]
+categories = ["command-line-utilities"]
 edition = "2024"
+keywords = ["ham-radio", "kenwood", "tui", "amateur-radio"]
+license = "GPL-2.0-or-later"
+publish = false
+readme = "README.md"
+repository = "https://github.com/swiftraccoon/kenwood"
 rust-version = "1.94"
 description = "Terminal UI for the Kenwood TH-D75 transceiver"
-license = "GPL-2.0-or-later"
-authors = ["swiftraccoon"]
-repository = "https://github.com/swiftraccoon/kenwood"
-readme = "README.md"
-keywords = ["ham-radio", "kenwood", "tui", "amateur-radio"]
-categories = ["command-line-utilities"]
-publish = false
 
 [dependencies]
+clap = { version = "4", features = ["derive"] }
+crossterm = "0.29"
 kenwood-thd75 = { path = "../thd75" }
 kenwood-transport = { path = "../kenwood-transport", default-features = false }
-dstar-gateway-core = { path = "../dstar-gateway-core" }
-mmdvm = { path = "../mmdvm", default-features = false, features = ["dstar"] }
 ratatui = "0.30"
-crossterm = "0.29"
-clap = { version = "4", features = ["derive"] }
-tokio = { version = "1", features = [
-  "rt-multi-thread",
-  "macros",
-  "sync",
-  "time",
-] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # KNOWN DIVERGENCE FROM WORKSPACE (this block replaces, never merges with,
 # the workspace `[lints.rust]`):
-# - `unsafe_code` matches the workspace `forbid`: macOS IOBluetooth now runs
-#   entirely inside the library's process-isolated helper, so the TUI has no
-#   native CFRunLoop FFI.
+# - `unsafe_code` matches the workspace `forbid`; this binary contains no
+#   handwritten unsafe code.
 # - Everything else mirrors the workspace block.
 [lints.rust]
-unsafe_code = "forbid"
-missing_docs = "deny"
-missing_debug_implementations = "deny"
-unreachable_pub = "deny"
-unused_results = "deny"
 elided_lifetimes_in_paths = "deny"
-trivial_casts = "deny"
-trivial_numeric_casts = "deny"
-unused_import_braces = "deny"
-unused_qualifications = "deny"
+let_underscore_drop = "deny"
+missing_debug_implementations = "deny"
+missing_docs = "deny"
 non_ascii_idents = "deny"
 single_use_lifetimes = "deny"
-let_underscore_drop = "deny"
+trivial_casts = "deny"
+trivial_numeric_casts = "deny"
+unreachable_pub = "deny"
+unsafe_code = "forbid"
 unused_crate_dependencies = "deny"
+unused_import_braces = "deny"
+unused_qualifications = "deny"
+unused_results = "deny"
 
 [lints.clippy]
 all = { level = "deny", priority = -1 }
-pedantic = { level = "deny", priority = -1 }
-nursery = { level = "deny", priority = -1 }
 cargo = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
 restriction = { level = "allow", priority = -1 }
 # Ban `#[allow]`: every suppression must be `#[expect(..., reason = "...")]`.
 # Mirrors the root `[workspace.lints.clippy]` ban; restated here because this crate's
@@ -63,34 +55,34 @@ restriction = { level = "allow", priority = -1 }
 allow_attributes = "deny"
 allow_attributes_without_reason = "deny"
 # Forward-protection lints, mirroring the workspace block exactly.
-todo = "deny"
-unimplemented = "deny"
 dbg_macro = "deny"
-mem_forget = "deny"
 format_push_string = "deny"
 infinite_loop = "deny"
+mem_forget = "deny"
 module_name_repetitions = "allow"
 multiple_crate_versions = "allow"
+todo = "deny"
+unimplemented = "deny"
 # Binary crate with private modules: `pub(crate)` satisfies `unreachable_pub` but
 # trips `redundant_pub_crate` (from the nursery group). The conflict is universal
 # and would ordinarily inherit from workspace, but this block replaces workspace
 # entirely so we restate it here.
 redundant_pub_crate = "allow"
 # Restriction-lint denies mirror the workspace; no divergence.
-undocumented_unsafe_blocks = "deny"
+expect_used = "deny"
+indexing_slicing = "deny"
 missing_assert_message = "deny"
 missing_const_for_fn = "deny"
 panic = "deny"
+undocumented_unsafe_blocks = "deny"
 unwrap_used = "deny"
-expect_used = "deny"
-indexing_slicing = "deny"
 
 # Mirrors the workspace `[lints.rustdoc]` block; restated here because this crate's
 # `[lints]` block replaces the workspace one entirely.
 [lints.rustdoc]
-broken_intra_doc_links = "deny"
-private_intra_doc_links = "deny"
-missing_crate_level_docs = "deny"
-invalid_codeblock_attributes = "deny"
 bare_urls = "deny"
+broken_intra_doc_links = "deny"
+invalid_codeblock_attributes = "deny"
+missing_crate_level_docs = "deny"
+private_intra_doc_links = "deny"
 unescaped_backticks = "deny"

@@ -1,19 +1,28 @@
 use std::path::{Path, PathBuf};
-use std::time::{Instant, SystemTime};
+use std::time::Instant;
 
 use kenwood_thd75::error::ValidationError;
-use kenwood_thd75::memory::dstar::DstarReadError;
 use kenwood_thd75::memory::{MemoryError, MemoryImage};
 use kenwood_thd75::types::{
     AfGainLevel, AltitudeRainUnit, AmHighCut, AutoMuteReturnDelay, AutoPowerOff, BacklightControl,
     BacklightTimer, BandMode, BatteryLevel, BatterySaverInterval, BeaconMode, BeatShift,
-    CwFilterWidth, CwPitch, DisplayUnits, DtmfPause, DtmfToneDuration, EmrVolume, Frequency,
-    FrontPanelPfFunction, GpsSettings, Language, LinkedVolumeLevel, MicSensitivity, NmeaSentences,
-    OperatingMode, PcOutputInterface, PowerLevel, RegularChannel, RepeaterCallKey, SMeterReading,
-    ScanRestartDelay, ScanResumeMethod, SpeedDistanceUnit, SquelchLevel, SsbHighCut,
-    StoredFrontPanelPfAssignment, TemperatureUnit, TncDataBand, TransmitTimeout, VoiceAnnounceMode,
-    VoiceGuideSpeed, VoxDelay, VoxGain,
+    CwFilterWidth, CwPitch, DisplayUnits, DstarCallsign, DstarSuffix, DtmfPause, DtmfToneDuration,
+    EmrVolume, Frequency, FrontPanelPfFunction, GpsSettings, Language, LinkedVolumeLevel,
+    MicSensitivity, Module, NmeaSentences, OperatingMode, PcOutputInterface, PowerLevel,
+    ReflectorCallsign, RegularChannel, RepeaterCallKey, SMeterReading, ScanRestartDelay,
+    ScanResumeMethod, SpeedDistanceUnit, SquelchLevel, SsbHighCut, StoredFrontPanelPfAssignment,
+    TemperatureUnit, TncDataBand, TransmitTimeout, VoiceAnnounceMode, VoiceGuideSpeed, VoxDelay,
+    VoxGain,
 };
+
+use crate::settings_edit::SettingsEdit;
+
+/// Maximum station rows retained by the dashboard independently of the client.
+const APRS_STATION_CAPACITY: usize = 256;
+/// Maximum outgoing delivery records displayed by the dashboard.
+const APRS_HISTORY_CAPACITY: usize = 128;
+/// Maximum UTF-8 bytes retained by a keyboard input buffer.
+const INPUT_CAPACITY: usize = 1024;
 
 /// Path to the MCP cache file.
 ///
@@ -21,9 +30,8 @@ use kenwood_thd75::types::{
 /// - macOS: `~/Library/Caches`
 /// - Linux: `$XDG_CACHE_HOME` or `~/.cache`
 /// - Windows: `%LOCALAPPDATA%`
-fn cache_path() -> PathBuf {
-    let base = cache_dir().unwrap_or_else(|| PathBuf::from("."));
-    base.join("thd75-tui").join("mcp.bin")
+fn cache_path() -> Option<PathBuf> {
+    cache_dir().map(|base| base.join("thd75-tui").join("mcp.bin"))
 }
 
 /// Platform-specific cache directory.
@@ -44,34 +52,6 @@ fn cache_dir() -> Option<PathBuf> {
     }
 }
 
-/// Save raw MCP image to the cache file at `path`.
-///
-/// Logs errors but does not propagate; a failed cache write should not
-/// block radio operation. The user will see a warning in the log.
-pub(crate) fn save_cache_to(path: &Path, data: &[u8]) {
-    if let Some(parent) = path.parent()
-        && let Err(e) = std::fs::create_dir_all(parent)
-    {
-        tracing::error!(path = %parent.display(), "failed to create cache dir: {e}");
-        return;
-    }
-    if let Err(e) = std::fs::write(path, data) {
-        tracing::error!(path = %path.display(), "failed to write MCP cache: {e}");
-    }
-}
-
-/// Load cached MCP image from `path`. Returns (image, age).
-pub(crate) fn load_cache(path: &Path) -> Option<(MemoryImage, std::time::Duration)> {
-    let data = std::fs::read(path).ok()?;
-    let age = std::fs::metadata(path)
-        .ok()
-        .and_then(|m| m.modified().ok())
-        .and_then(|t| SystemTime::now().duration_since(t).ok())
-        .unwrap_or_default();
-    let image = MemoryImage::from_raw(data).ok()?;
-    Some((image, age))
-}
-
 /// Parse D-STAR reflector-connect input into `(name, module)`.
 ///
 /// Accepts two forms:
@@ -86,34 +66,25 @@ pub(crate) fn load_cache(path: &Path) -> Option<(MemoryImage, std::time::Duratio
 /// The returned name is uppercased. Anything else, including empty input
 /// and a non-ASCII final character (which would make a byte-index slice
 /// panic on a char boundary), returns `None`.
-fn parse_reflector_input(input: &str) -> Option<(String, char)> {
-    let parts: Vec<&str> = input.split_whitespace().collect();
-    match parts.as_slice() {
-        [name, module_token, ..] => {
-            let module = module_token.chars().next()?;
-            if !module.is_ascii_uppercase() {
-                return None;
-            }
-            Some((name.to_uppercase(), module))
+fn parse_reflector_input(input: &str) -> Option<(ReflectorCallsign, Module)> {
+    let mut parts = input.split_whitespace();
+    let first = parts.next()?;
+    let (name, module) = if let Some(module) = parts.next() {
+        if parts.next().is_some() || module.len() != 1 {
+            return None;
         }
-        [single] => {
-            if single.len() < 4 {
-                return None;
-            }
-            let module = single.chars().last()?;
-            if !module.is_ascii_uppercase() {
-                return None;
-            }
-            // `module` is ASCII (1 byte), so `len - 1` is a char boundary.
-            let name = single.get(..single.len() - 1)?;
-            Some((name.to_uppercase(), module))
+        (first, module.chars().next()?)
+    } else {
+        let module = first.chars().last()?;
+        if !module.is_ascii() {
+            return None;
         }
-        [] => None,
-    }
+        (first.get(..first.len().checked_sub(1)?)?, module)
+    };
+    let module = Module::try_from_char(module).ok()?;
+    let name = ReflectorCallsign::try_from_str(&name.to_ascii_uppercase()).ok()?;
+    Some((name, module))
 }
-
-/// Number of rows in the settings list (must match `SettingRow::ALL.len()`).
-pub(crate) const SETTINGS_COUNT: usize = 75;
 
 /// Settings row identifiers for the interactive settings list.
 ///
@@ -309,7 +280,7 @@ pub(crate) enum SettingRow {
 
 impl SettingRow {
     /// All settings rows in display order.
-    pub(crate) const ALL: [Self; SETTINGS_COUNT] = [
+    pub(crate) const ALL: &[Self] = &[
         // RX
         Self::SquelchA,
         Self::SquelchB,
@@ -481,7 +452,7 @@ impl SettingRow {
             Self::AutoInfo => "Auto Info",
             Self::AprsCallsign => "APRS My Callsign",
             Self::DstarSlot => "D-STAR Slot",
-            Self::ScanResumeCat => "SR (unqualified)",
+            Self::ScanResumeCat => "SR (quarantined)",
         }
     }
 
@@ -610,7 +581,7 @@ pub(crate) fn cat_settings() -> Vec<SettingRow> {
         .collect()
 }
 
-/// Settings that require MCP page write (~3s, brief disconnect).
+/// Settings that require a guarded MCP page exchange and CAT restoration.
 pub(crate) fn mcp_settings() -> Vec<SettingRow> {
     SettingRow::ALL
         .iter()
@@ -636,62 +607,33 @@ fn step_selection<T: Copy + PartialEq>(current: T, delta: i8, values: &[T]) -> O
     values.get(next_index).copied()
 }
 
+fn cycle_selection<T: Copy + PartialEq>(current: T, values: &[T]) -> Option<T> {
+    let index = values.iter().position(|&value| value == current)?;
+    values
+        .get(index.saturating_add(1))
+        .or_else(|| values.first())
+        .copied()
+}
+
 /// Step a PF-key assignment through the official gapped menu domain.
 /// Off-menu bytes are intentionally not coerced to an official assignment.
 fn next_pf_key(current: StoredFrontPanelPfAssignment, delta: i8) -> Option<FrontPanelPfFunction> {
     let StoredFrontPanelPfAssignment::Official(current) = current else {
         return None;
     };
-    step_selection(
-        current,
-        delta,
-        &[
-            FrontPanelPfFunction::Recording,
-            FrontPanelPfFunction::VoiceMessage1,
-            FrontPanelPfFunction::VoiceMessage2,
-            FrontPanelPfFunction::VoiceMessage3,
-            FrontPanelPfFunction::VoiceMessage4,
-            FrontPanelPfFunction::VoiceGuidance,
-            FrontPanelPfFunction::BatteryLevel,
-            FrontPanelPfFunction::Vox,
-            FrontPanelPfFunction::GroupName,
-            FrontPanelPfFunction::Balance,
-            FrontPanelPfFunction::Gps,
-            FrontPanelPfFunction::TrackLog,
-            FrontPanelPfFunction::Squelch,
-            FrontPanelPfFunction::Shift,
-            FrontPanelPfFunction::Step,
-            FrontPanelPfFunction::Power,
-            FrontPanelPfFunction::KeyLock,
-            FrontPanelPfFunction::Lockout,
-            FrontPanelPfFunction::MemoryToVfo,
-            FrontPanelPfFunction::ToneSelect,
-            FrontPanelPfFunction::NewMemory,
-            FrontPanelPfFunction::VoiceAlert,
-            FrontPanelPfFunction::LcdBrightness,
-            FrontPanelPfFunction::DtmfChannel0,
-            FrontPanelPfFunction::EcholinkChannel0,
-            FrontPanelPfFunction::Tone1750Hz,
-            FrontPanelPfFunction::MemoryInput,
-        ],
-    )
+    step_selection(current, delta, &FrontPanelPfFunction::ALL)
 }
 
 fn next_linked_volume(
     current: LinkedVolumeLevel,
     delta: i8,
 ) -> Result<LinkedVolumeLevel, ValidationError> {
-    let current = current.as_raw();
     let next = if delta > 0 {
-        current.saturating_add(1).min(7)
+        current.as_raw().saturating_add(1)
     } else {
-        current.saturating_sub(1)
+        current.as_raw().saturating_sub(1)
     };
-    if next == 0 {
-        Ok(LinkedVolumeLevel::VOLUME_LINK)
-    } else {
-        LinkedVolumeLevel::fixed(next)
-    }
+    LinkedVolumeLevel::try_from(next).or(Ok(current))
 }
 
 /// Which pane currently has input focus.
@@ -729,7 +671,7 @@ pub(crate) enum MainView {
     Channels,
     /// CAT settings: instant, no disconnect.
     SettingsCat,
-    /// MCP settings: ~3s per change, brief disconnect.
+    /// Stored settings changed through guarded MCP page exchanges.
     SettingsMcp,
     Aprs,
     Dstar,
@@ -783,49 +725,33 @@ pub(crate) enum InputMode {
 }
 
 /// Live state for one band, updated by the radio poller.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct BandState {
-    pub frequency: Frequency,
-    pub mode: OperatingMode,
+    pub frequency: Option<Frequency>,
+    pub mode: Option<OperatingMode>,
     /// S-meter level (0–5). Driven by AI-pushed BY notifications, not polled.
-    pub s_meter: SMeterReading,
+    pub s_meter: Option<SMeterReading>,
     /// Squelch setting (0–6 on D75).
-    pub squelch: SquelchLevel,
-    pub power_level: PowerLevel,
+    pub squelch: Option<SquelchLevel>,
+    pub power_level: Option<PowerLevel>,
     /// Squelch is open (receiving). Driven by AI-pushed BY notifications.
-    pub busy: bool,
-    pub attenuator: bool,
+    pub busy: Option<bool>,
+    pub attenuator: Option<bool>,
     pub step_size: Option<kenwood_thd75::types::StepSize>,
 }
 
-impl Default for BandState {
-    fn default() -> Self {
-        Self {
-            frequency: Frequency::new(145_000_000),
-            mode: OperatingMode::Fm,
-            s_meter: SMeterReading::ZERO,
-            squelch: SquelchLevel::OPEN,
-            power_level: PowerLevel::High,
-            busy: false,
-            attenuator: false,
-            step_size: None,
-        }
-    }
-}
-
 /// Aggregated radio state from the poller.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct RadioState {
     pub band_a: BandState,
     pub band_b: BandState,
-    pub battery_level: BatteryLevel,
-    pub beep: bool,
-    pub band_mode: BandMode,
-    pub bluetooth: bool,
-    pub vox: bool,
-    pub vox_gain: VoxGain,
-    pub vox_delay: VoxDelay,
-    pub af_gain: AfGainLevel,
+    pub battery_level: Option<BatteryLevel>,
+    pub band_mode: Option<BandMode>,
+    pub bluetooth: Option<bool>,
+    pub vox: Option<bool>,
+    pub vox_gain: Option<VoxGain>,
+    pub vox_delay: Option<VoxDelay>,
+    pub af_gain: Option<AfGainLevel>,
     pub firmware_version: String,
     pub radio_type: String,
     pub gps_settings: Option<GpsSettings>,
@@ -833,74 +759,23 @@ pub(crate) struct RadioState {
     pub gps_sentences: Option<NmeaSentences>,
     /// GPS/Radio operating mode (GM read).
     pub gps_mode: Option<kenwood_thd75::types::GpsRadioMode>,
-    pub beacon_mode: BeaconMode,
+    pub beacon_mode: Option<BeaconMode>,
     pub fine_step: Option<kenwood_thd75::types::FineStep>,
     pub filter_width_ssb: Option<kenwood_thd75::types::FilterWidthIndex>,
     pub filter_width_cw: Option<kenwood_thd75::types::FilterWidthIndex>,
     pub filter_width_am: Option<kenwood_thd75::types::FilterWidthIndex>,
     /// D-STAR URCALL callsign (8-char, space-padded).
-    pub dstar_urcall: String,
-    /// D-STAR URCALL suffix (4-char, space-padded).
-    pub dstar_urcall_suffix: String,
+    pub dstar_urcall: Option<kenwood_thd75::types::DstarCallsignEntry>,
     /// D-STAR RPT1 callsign.
-    pub dstar_rpt1: String,
-    /// D-STAR RPT1 suffix.
-    pub dstar_rpt1_suffix: String,
+    pub dstar_rpt1: Option<kenwood_thd75::types::DstarCallsignEntry>,
     /// D-STAR RPT2 callsign.
-    pub dstar_rpt2: String,
-    /// D-STAR RPT2 suffix.
-    pub dstar_rpt2_suffix: String,
+    pub dstar_rpt2: Option<kenwood_thd75::types::DstarCallsignEntry>,
     /// D-STAR gateway mode.
     pub dstar_gateway_mode: Option<kenwood_thd75::types::DvGatewayMode>,
     /// Active D-STAR slot.
     pub dstar_slot: Option<kenwood_thd75::types::DstarSlot>,
     /// Live APRS My Callsign read through CAT CS.
     pub aprs_callsign: Option<kenwood_thd75::types::AprsCallsign>,
-}
-
-impl Default for RadioState {
-    fn default() -> Self {
-        Self {
-            band_a: BandState::default(),
-            band_b: BandState::default(),
-            battery_level: BatteryLevel::Empty,
-            beep: false,
-            band_mode: BandMode::Single,
-            bluetooth: false,
-            vox: false,
-            vox_gain: VoxGain::ZERO,
-            vox_delay: VoxDelay::MS_250,
-            af_gain: AfGainLevel::ZERO,
-            firmware_version: String::new(),
-            radio_type: String::new(),
-            gps_settings: None,
-            gps_sentences: None,
-            gps_mode: None,
-            beacon_mode: BeaconMode::Manual,
-            fine_step: None,
-            filter_width_ssb: None,
-            filter_width_cw: None,
-            filter_width_am: None,
-            dstar_urcall: String::new(),
-            dstar_urcall_suffix: String::new(),
-            dstar_rpt1: String::new(),
-            dstar_rpt1_suffix: String::new(),
-            dstar_rpt2: String::new(),
-            dstar_rpt2_suffix: String::new(),
-            dstar_gateway_mode: None,
-            dstar_slot: None,
-            aprs_callsign: None,
-        }
-    }
-}
-
-/// Whether the D-STAR gateway is active in the radio task.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DstarMode {
-    /// Not in gateway mode: show CAT settings on the D-STAR panel.
-    Inactive,
-    /// Gateway mode active: `DstarGateway` is running in the radio task.
-    Active,
 }
 
 /// Whether the APRS client is active in the radio task.
@@ -916,7 +791,7 @@ pub(crate) enum AprsMode {
 #[derive(Debug, Clone)]
 pub(crate) struct AprsMessageStatus {
     /// Destination callsign.
-    pub addressee: kenwood_thd75::MessageAddressee,
+    pub addressee: kenwood_thd75::DirectMessageAddressee,
     /// Message text.
     pub text: kenwood_thd75::MessageText,
     /// Message ID from the messenger.
@@ -940,15 +815,13 @@ pub(crate) enum AprsMessageState {
 
 /// Cached APRS station for the TUI display.
 ///
-/// The library's `StationEntry` uses `Instant` for timestamps which is
-/// not useful for display. This caches the fields needed plus a
-/// wall-clock time for "ago" display.
+/// Retains the library's monotonic receive timestamp for elapsed-age display.
 #[derive(Debug, Clone)]
 pub(crate) struct AprsStationCache {
     pub callsign: String,
     pub latitude: Option<f64>,
     pub longitude: Option<f64>,
-    pub speed_knots: Option<u16>,
+    pub speed_knots: Option<f64>,
     pub course_degrees: Option<u16>,
     pub symbol_table: Option<char>,
     pub symbol_code: Option<char>,
@@ -965,10 +838,13 @@ pub(crate) enum McpState {
     Reading {
         page: u16,
         total: u16,
+        /// Confirmed image retained while a replacement read is in flight.
+        cached: Option<MemoryImage>,
     },
     Loaded {
         image: MemoryImage,
-        modified: bool,
+        /// A failed write or stale comparison requires a fresh read before edits.
+        requires_refresh: bool,
     },
     Writing {
         page: u16,
@@ -976,15 +852,35 @@ pub(crate) enum McpState {
         /// Image retained while the write is in flight so success and failure
         /// both return the operator to a usable cached image.
         image: MemoryImage,
+        /// Exact staged request awaiting its verified completion.
+        edit: Box<SettingsEdit>,
     },
 }
 
 /// All events that can flow into the update loop.
 #[derive(Debug)]
 pub(crate) enum Message {
+    /// Scheduler wakeup for observing retained worker completion.
+    Tick,
     Key(crossterm::event::KeyEvent),
     RadioUpdate(RadioState),
-    RadioError(String),
+    RadioError(crate::radio_task::RadioFailure),
+    /// Typed backend discovery/open failure during a replacement attempt.
+    ConnectionError(std::sync::Arc<crate::radio_task::OpenFailure>),
+    /// Informational progress, separate from a failed operation.
+    Status(String),
+    /// Connection metadata, separate from periodically unavailable observations.
+    RadioIdentity {
+        firmware_version: String,
+        radio_type: String,
+    },
+    /// The sole terminal input thread failed; stop the dashboard.
+    TerminalFailure(std::io::Error),
+    /// A request did not reach its radio operation.
+    CommandRejected {
+        command: crate::event::RadioCommand,
+        reason: crate::event::CommandRejection,
+    },
     Disconnected,
     Reconnected,
     McpProgress {
@@ -992,14 +888,9 @@ pub(crate) enum Message {
         total: u16,
     },
     McpReadComplete(Vec<u8>),
-    McpWriteComplete,
-    /// A single MCP byte was written successfully; update the in-memory
-    /// cache without requiring a full re-read.
-    McpByteWritten {
-        offset: u16,
-        value: u8,
-    },
-    McpError(String),
+    /// A guarded typed setting completed with read-back verification.
+    McpSettingApplied(Box<SettingsEdit>),
+    McpError(crate::radio_task::McpFailure),
     /// The radio task has entered APRS mode successfully.
     AprsStarted,
     /// The radio task has exited APRS mode.
@@ -1007,38 +898,20 @@ pub(crate) enum Message {
     /// APRS did not return a radio with proved ordinary CAT control.
     AprsRecoveryFailed(String),
     /// An APRS event was received from the radio task.
-    AprsEvent(kenwood_thd75::AprsEvent),
-    /// An APRS message was sent and assigned a message ID for tracking.
-    AprsMessageSent {
-        addressee: kenwood_thd75::MessageAddressee,
+    AprsEvent(Box<kenwood_thd75::AprsEvent>),
+    /// The messenger accepted an outgoing message; transmission is still pending.
+    AprsMessageQueued {
+        addressee: kenwood_thd75::DirectMessageAddressee,
         text: kenwood_thd75::MessageText,
         message_id: kenwood_thd75::MessageId,
     },
-    /// Error from the APRS subsystem.
-    AprsError(String),
-    /// The radio task has entered D-STAR gateway mode successfully.
-    DstarStarted,
-    /// The radio task has exited D-STAR gateway mode.
-    DstarStopped,
-    /// D-STAR did not return a radio with proved ordinary CAT control.
-    DstarRecoveryFailed(String),
-    /// A D-STAR event was received from the radio task (gateway mode).
-    DstarEvent(mmdvm::dstar::DstarEvent),
-    /// Error from the D-STAR subsystem.
-    DstarError(String),
     Quit,
 }
 
 /// Central application state.
 #[expect(
     clippy::struct_excessive_bools,
-    reason = "App aggregates the TUI's global mode flags (connected, should_quit, \
-              quit_pending, show_help) plus several view-specific toggles. Each flag \
-              drives a distinct Ratatui branch in the event/render loop and mutates at a \
-              distinct site; collapsing into a `HashSet<AppFlag>` would force every \
-              dispatch to go through a hash lookup for no reader benefit, and the flags \
-              are not semantically related enough to form a coherent enum. This is the \
-              right data model, even if it looks bool-heavy to clippy."
+    reason = "Independent view toggles and connection/quit flags accompany mutually exclusive panel and APRS mode enums."
 )]
 pub(crate) struct App {
     /// Where the MCP image is cached on disk. `None` disables caching
@@ -1054,7 +927,6 @@ pub(crate) struct App {
     pub input_mode: InputMode,
     pub mcp: McpState,
     pub should_quit: bool,
-    pub quit_pending: bool,
     pub status_message: Option<String>,
     pub show_help: bool,
     pub channel_list_index: usize,
@@ -1067,7 +939,7 @@ pub(crate) struct App {
     /// Which band receives channel recalls and step/mode changes.
     pub target_band: kenwood_thd75::types::Band,
     /// Sender for commands to the radio background task.
-    pub cmd_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::event::RadioCommand>>,
+    pub cmd_tx: Option<crate::event::CommandSender>,
     /// APRS mode state.
     pub aprs_mode: AprsMode,
     /// Cached APRS stations, sorted by last heard (most recent first).
@@ -1078,18 +950,6 @@ pub(crate) struct App {
     pub aprs_station_index: usize,
     /// When set, the APRS message compose prompt is active.
     pub aprs_compose: Option<String>,
-    /// D-STAR mode state.
-    pub dstar_mode: DstarMode,
-    /// D-STAR last heard entries (gateway mode).
-    pub dstar_last_heard: Vec<mmdvm::dstar::LastHeardEntry>,
-    /// Selected index in the D-STAR last heard list.
-    pub dstar_last_heard_index: usize,
-    /// Current D-STAR text message (from slow data).
-    pub dstar_text_message: Option<dstar_gateway_core::SlowDataTextMessage>,
-    /// Current D-STAR RX header (gateway mode).
-    pub dstar_rx_header: Option<dstar_gateway_core::DstarHeader>,
-    /// Whether a D-STAR voice transmission is active.
-    pub dstar_rx_active: bool,
     /// D-STAR URCALL input buffer (when prompting).
     pub dstar_urcall_input: Option<String>,
     /// D-STAR reflector input buffer (when prompting).
@@ -1101,13 +961,22 @@ pub(crate) struct App {
     /// Text buffer for the currently edited field.
     pub channel_edit_buffer: String,
     /// FM radio status (true = on). Tracked locally since FR is write-only.
-    pub fm_radio_on: bool,
+    pub fm_radio_on: Option<bool>,
 }
 
 impl App {
+    /// Borrow the last confirmed image while another read or write is pending.
+    pub(crate) const fn confirmed_image(&self) -> Option<&MemoryImage> {
+        match &self.mcp {
+            McpState::Loaded { image, .. } | McpState::Writing { image, .. } => Some(image),
+            McpState::Reading { cached, .. } => cached.as_ref(),
+            McpState::Idle => None,
+        }
+    }
+
     /// Returns the list of used channel numbers, filtered by `search_filter`.
     pub(crate) fn filtered_channels(&self) -> Result<Vec<RegularChannel>, MemoryError> {
-        if let McpState::Loaded { ref image, .. } = self.mcp {
+        if let Some(image) = self.confirmed_image() {
             let channels = image.channels();
             let filter = self.search_filter.to_uppercase();
             let mut filtered = Vec::new();
@@ -1136,7 +1005,7 @@ impl App {
 
     /// Create a new app instance, loading MCP cache from disk if available.
     pub(crate) fn new(port_path: String) -> Self {
-        Self::with_cache_path(port_path, Some(cache_path().as_path()))
+        Self::with_cache_path(port_path, cache_path().as_deref())
     }
 
     /// Create a new app instance, loading the MCP image from the given cache
@@ -1146,25 +1015,34 @@ impl App {
     /// filesystem side effects; tests use this to avoid reading the real
     /// per-user cache directory.
     pub(crate) fn with_cache_path(port_path: String, cache: Option<&Path>) -> Self {
-        let (mcp, status_message) = match cache.and_then(load_cache) {
-            Some((image, age)) => {
-                let mins = age.as_secs() / 60;
-                let msg = if mins < 60 {
-                    format!("Loaded cached MCP data ({mins}m ago)")
-                } else if mins < 1440 {
-                    format!("Loaded cached MCP data ({}h ago)", mins / 60)
-                } else {
-                    format!("Loaded cached MCP data ({}d ago)", mins / 1440)
-                };
+        let (mcp, status_message) = match cache.map_or(Ok(None), crate::cache::load) {
+            Ok(Some(crate::cache::CachedImage { image, age })) => {
+                let msg = age.map_or_else(
+                    || "Loaded cached MCP data (age unavailable)".to_owned(),
+                    |age| {
+                        let mins = age.as_secs() / 60;
+                        if mins < 60 {
+                            format!("Loaded cached MCP data ({mins}m ago)")
+                        } else if mins < 1440 {
+                            format!("Loaded cached MCP data ({}h ago)", mins / 60)
+                        } else {
+                            format!("Loaded cached MCP data ({}d ago)", mins / 1440)
+                        }
+                    },
+                );
                 (
                     McpState::Loaded {
                         image,
-                        modified: false,
+                        requires_refresh: false,
                     },
                     Some(msg),
                 )
             }
-            None => (McpState::Idle, None),
+            Ok(None) => (McpState::Idle, None),
+            Err(error) => (
+                McpState::Idle,
+                Some(format!("MCP cache unavailable: {error}")),
+            ),
         };
 
         Self {
@@ -1177,7 +1055,6 @@ impl App {
             input_mode: InputMode::Normal,
             mcp,
             should_quit: false,
-            quit_pending: false,
             status_message,
             show_help: false,
             channel_list_index: 0,
@@ -1191,78 +1068,91 @@ impl App {
             aprs_messages: Vec::new(),
             aprs_station_index: 0,
             aprs_compose: None,
-            dstar_mode: DstarMode::Inactive,
-            dstar_last_heard: Vec::new(),
-            dstar_last_heard_index: 0,
-            dstar_text_message: None,
-            dstar_rx_header: None,
-            dstar_rx_active: false,
             dstar_urcall_input: None,
             dstar_reflector_input: None,
             channel_edit_mode: false,
             channel_edit_field: ChannelEditField::Name,
             channel_edit_buffer: String::new(),
-            fm_radio_on: false,
+            fm_radio_on: None,
         }
     }
 
     /// Process a message and update state. Returns true if a render is needed.
     #[expect(
         clippy::too_many_lines,
-        reason = "`update` is the TUI's single message-dispatch entry point: it matches \
-                  over every `Message` variant (radio state updates, status text, D-STAR \
-                  events, APRS events, TX responses, etc.) and translates each into the \
-                  corresponding `App` state change. Splitting per variant would create a \
-                  fan of one-line helper methods with no real abstraction benefit; the \
-                  match statement itself IS the dispatch table."
+        reason = "The reducer matches every worker/input message and makes each resulting state transition explicit in one table."
     )]
     pub(crate) fn update(&mut self, msg: Message) -> bool {
         match msg {
+            Message::Tick => false,
             Message::Quit => {
                 self.should_quit = true;
                 true
             }
             Message::Key(key) => self.handle_key(key),
             Message::RadioUpdate(mut state) => {
-                // Preserve static fields that are only read once at connect
-                if state.firmware_version.is_empty() {
-                    state.firmware_version = std::mem::take(&mut self.state.firmware_version);
-                }
-                if state.radio_type.is_empty() {
-                    state.radio_type = std::mem::take(&mut self.state.radio_type);
-                }
-                // Preserve D-STAR state when not provided by poll
-                if state.dstar_urcall.is_empty() {
-                    state.dstar_urcall = std::mem::take(&mut self.state.dstar_urcall);
-                    state.dstar_urcall_suffix = std::mem::take(&mut self.state.dstar_urcall_suffix);
-                }
-                if state.dstar_rpt1.is_empty() {
-                    state.dstar_rpt1 = std::mem::take(&mut self.state.dstar_rpt1);
-                    state.dstar_rpt1_suffix = std::mem::take(&mut self.state.dstar_rpt1_suffix);
-                }
-                if state.dstar_rpt2.is_empty() {
-                    state.dstar_rpt2 = std::mem::take(&mut self.state.dstar_rpt2);
-                    state.dstar_rpt2_suffix = std::mem::take(&mut self.state.dstar_rpt2_suffix);
-                }
-                if state.dstar_gateway_mode.is_none() {
-                    state.dstar_gateway_mode = self.state.dstar_gateway_mode;
-                }
-                if state.dstar_slot.is_none() {
-                    state.dstar_slot = self.state.dstar_slot;
-                }
-                if state.aprs_callsign.is_none() {
-                    state.aprs_callsign.clone_from(&self.state.aprs_callsign);
-                }
+                state.firmware_version = std::mem::take(&mut self.state.firmware_version);
+                state.radio_type = std::mem::take(&mut self.state.radio_type);
                 self.state = state;
                 self.connected = true;
                 true
             }
             Message::RadioError(err) => {
-                self.status_message = Some(err);
+                self.status_message = Some(err.to_string());
+                true
+            }
+            Message::ConnectionError(error) => {
+                self.status_message = Some(error.to_string());
+                true
+            }
+            Message::Status(status) => {
+                self.status_message = Some(status);
+                true
+            }
+            Message::RadioIdentity {
+                firmware_version,
+                radio_type,
+            } => {
+                self.state.firmware_version = firmware_version;
+                self.state.radio_type = radio_type;
+                true
+            }
+            Message::TerminalFailure(error) => {
+                self.status_message = Some(format!("Terminal input failed: {error}"));
+                self.should_quit = true;
+                true
+            }
+            Message::CommandRejected { command, reason } => {
+                if let crate::event::RadioCommand::ApplySetting(rejected) = command {
+                    let previous = std::mem::replace(&mut self.mcp, McpState::Idle);
+                    self.mcp = match previous {
+                        McpState::Writing { image, edit, .. } if edit == rejected => {
+                            McpState::Loaded {
+                                image,
+                                requires_refresh: false,
+                            }
+                        }
+                        other => other,
+                    };
+                } else if matches!(command, crate::event::RadioCommand::ReadMemory) {
+                    let previous = std::mem::replace(&mut self.mcp, McpState::Idle);
+                    self.mcp = match previous {
+                        McpState::Reading {
+                            cached: Some(image),
+                            ..
+                        } => McpState::Loaded {
+                            image,
+                            requires_refresh: true,
+                        },
+                        other => other,
+                    };
+                }
+                self.status_message = Some(format!("Command was not applied: {reason}"));
                 true
             }
             Message::Disconnected => {
                 self.connected = false;
+                self.state = RadioState::default();
                 self.status_message = Some("Disconnected, reconnecting...".into());
                 true
             }
@@ -1280,73 +1170,89 @@ impl App {
                 {
                     *current_page = page;
                     *current_total = total;
-                } else {
-                    self.mcp = McpState::Reading { page, total };
+                } else if let McpState::Reading {
+                    page: current_page,
+                    total: current_total,
+                    ..
+                } = &mut self.mcp
+                {
+                    *current_page = page;
+                    *current_total = total;
                 }
                 true
             }
             Message::McpReadComplete(data) => {
-                if let Some(ref path) = self.cache_path {
-                    save_cache_to(path, &data);
-                }
                 match MemoryImage::from_raw(data) {
                     Ok(image) => {
+                        let cache = self.cache_image(&image);
                         self.mcp = McpState::Loaded {
                             image,
-                            modified: false,
+                            requires_refresh: false,
                         };
-                        self.status_message = Some("MCP read complete, cached to disk".into());
+                        self.status_message = Some(format!("MCP read complete; {cache}"));
                     }
                     Err(e) => {
-                        self.mcp = McpState::Idle;
+                        let previous = std::mem::replace(&mut self.mcp, McpState::Idle);
+                        if let McpState::Reading {
+                            cached: Some(image),
+                            ..
+                        } = previous
+                        {
+                            self.mcp = McpState::Loaded {
+                                image,
+                                requires_refresh: true,
+                            };
+                        }
                         self.status_message = Some(format!("MCP parse error: {e}"));
                     }
                 }
                 true
             }
-            Message::McpWriteComplete => {
+            Message::McpSettingApplied(completed) => {
                 let previous = std::mem::replace(&mut self.mcp, McpState::Idle);
-                self.mcp = match previous {
-                    McpState::Writing { image, .. } => {
-                        if let Some(ref path) = self.cache_path {
-                            save_cache_to(path, image.as_raw());
+                match previous {
+                    McpState::Writing {
+                        mut image, edit, ..
+                    } if edit == completed => match edit.commit(&mut image) {
+                        Ok(()) => {
+                            let cache = self.cache_image(&image);
+                            self.mcp = McpState::Loaded {
+                                image,
+                                requires_refresh: false,
+                            };
+                            self.status_message =
+                                Some(format!("Setting write verified; CAT restored; {cache}"));
                         }
-                        McpState::Loaded {
-                            image,
-                            modified: false,
+                        Err(error) => {
+                            self.mcp = McpState::Loaded {
+                                image,
+                                requires_refresh: true,
+                            };
+                            self.status_message = Some(format!(
+                                "Setting write completed; cached snapshot needs refresh: {error}"
+                            ));
                         }
-                    }
-                    other => other,
-                };
-                self.status_message = Some("MCP write complete; radio control restored".into());
-                true
-            }
-            Message::McpByteWritten { offset, value } => {
-                // Update the cached memory image with the single byte that
-                // was just written via MCP, so the TUI stays in sync without
-                // requiring a full re-read after the radio's internal reset.
-                if let McpState::Loaded { ref mut image, .. } = self.mcp {
-                    if let Some(byte) = image.as_raw_mut().get_mut(offset as usize) {
-                        *byte = value;
-                    }
-                    if let Some(ref path) = self.cache_path {
-                        save_cache_to(path, image.as_raw());
+                    },
+                    other => {
+                        self.mcp = other;
+                        self.status_message =
+                            Some("Unexpected setting completion; re-read MCP data".into());
                     }
                 }
-                self.status_message = Some(format!(
-                    "MCP 0x{offset:04X} = {value}; radio control restored"
-                ));
                 true
             }
             Message::McpError(err) => {
-                // A failed write retains the exact image the operator was
-                // trying to write. Only a failed read with no prior image
-                // returns to Idle.
+                // Uncertain writes and failed reads retain the last confirmed
+                // image. A read without a prior image returns to Idle.
                 let previous = std::mem::replace(&mut self.mcp, McpState::Idle);
                 self.mcp = match previous {
-                    McpState::Writing { image, .. } => McpState::Loaded {
+                    McpState::Writing { image, .. }
+                    | McpState::Reading {
+                        cached: Some(image),
+                        ..
+                    } => McpState::Loaded {
                         image,
-                        modified: true,
+                        requires_refresh: true,
                     },
                     loaded @ McpState::Loaded { .. } => loaded,
                     _ => McpState::Idle,
@@ -1373,14 +1279,17 @@ impl App {
                 true
             }
             Message::AprsEvent(event) => {
-                self.handle_aprs_event(event);
+                self.handle_aprs_event(*event);
                 true
             }
-            Message::AprsMessageSent {
+            Message::AprsMessageQueued {
                 addressee,
                 text,
                 message_id,
             } => {
+                if self.aprs_messages.len() >= APRS_HISTORY_CAPACITY {
+                    let _oldest = self.aprs_messages.remove(0);
+                }
                 self.aprs_messages.push(AprsMessageStatus {
                     addressee,
                     text,
@@ -1389,55 +1298,13 @@ impl App {
                 });
                 true
             }
-            Message::AprsError(err) => {
-                self.status_message = Some(format!("APRS: {err}"));
-                true
-            }
-            Message::DstarStarted => {
-                self.dstar_mode = DstarMode::Active;
-                self.status_message = Some("D-STAR gateway mode active".into());
-                true
-            }
-            Message::DstarStopped => {
-                self.dstar_mode = DstarMode::Inactive;
-                self.dstar_rx_active = false;
-                self.dstar_rx_header = None;
-                self.status_message =
-                    Some("D-STAR gateway mode stopped, CAT polling resumed".into());
-                true
-            }
-            Message::DstarRecoveryFailed(error) => {
-                self.dstar_mode = DstarMode::Inactive;
-                self.dstar_rx_active = false;
-                self.dstar_rx_header = None;
-                self.connected = false;
-                self.status_message = Some(format!(
-                    "D-STAR session ended without usable CAT control: {error}; reconnecting..."
-                ));
-                true
-            }
-            Message::DstarEvent(event) => {
-                self.handle_dstar_event(event);
-                true
-            }
-            Message::DstarError(err) => {
-                self.status_message = Some(format!("D-STAR: {err}"));
-                true
-            }
         }
     }
 
     #[expect(
         clippy::cognitive_complexity,
         clippy::too_many_lines,
-        reason = "`handle_key` is the TUI's single keyboard dispatch entry point: it \
-                  branches on (`InputMode`, `MainView`, key) to route every keystroke in \
-                  the app. Splitting per mode would either (a) duplicate the Ctrl-C \
-                  global-quit handling at every site or (b) add a second-level dispatch \
-                  layer for no reader benefit. The function is linear: read input mode, \
-                  match keystroke, update state, return whether a redraw is needed. \
-                  `too_many_lines` fires because this single dispatch covers every mode, \
-                  which is the correct granularity."
+        reason = "Keyboard dispatch shares global quit handling across input modes, panes and panel-specific operations."
     )]
     fn handle_key(&mut self, key: crossterm::event::KeyEvent) -> bool {
         use crossterm::event::{KeyCode, KeyModifiers};
@@ -1465,7 +1332,9 @@ impl App {
                     self.channel_list_index = 0;
                 }
                 KeyCode::Char(c) => {
-                    buf.push(c);
+                    if buf.len().saturating_add(c.len_utf8()) <= INPUT_CAPACITY {
+                        buf.push(c);
+                    }
                     self.search_filter = buf.clone();
                     self.channel_list_index = 0;
                 }
@@ -1485,10 +1354,9 @@ impl App {
                     self.aprs_compose = None;
                     if !text.is_empty()
                         && let Some(station) = self.aprs_stations.get(self.aprs_station_index)
-                        && let Some(ref tx) = self.cmd_tx
                     {
                         let addressee =
-                            match kenwood_thd75::MessageAddressee::new(&station.callsign) {
+                            match kenwood_thd75::DirectMessageAddressee::new(&station.callsign) {
                                 Ok(addressee) => addressee,
                                 Err(error) => {
                                     self.status_message = Some(format!(
@@ -1506,18 +1374,20 @@ impl App {
                                 return true;
                             }
                         };
-                        let _send = tx.send(crate::event::RadioCommand::SendAprsMessage {
-                            addressee: addressee.clone(),
-                            text: text.clone(),
-                        });
-                        self.status_message = Some(format!("Sending to {addressee}: {text}"));
+                        let label = format!("Message request for {addressee}");
+                        self.queue_radio_command(
+                            crate::event::RadioCommand::SendAprsMessage { addressee, text },
+                            &label,
+                        );
                     }
                 }
                 KeyCode::Backspace => {
                     let _ = buf.pop();
                 }
                 KeyCode::Char(c) => {
-                    buf.push(c);
+                    if buf.len().saturating_add(c.len_utf8()) <= INPUT_CAPACITY {
+                        buf.push(c);
+                    }
                 }
                 _ => {}
             }
@@ -1533,21 +1403,26 @@ impl App {
                 KeyCode::Enter => {
                     let input = buf.clone();
                     self.dstar_urcall_input = None;
-                    if !input.is_empty()
-                        && let Some(ref tx) = self.cmd_tx
-                    {
-                        let _send = tx.send(crate::event::RadioCommand::SetUrcall {
-                            callsign: input.clone(),
-                            suffix: String::new(),
-                        });
-                        self.status_message = Some(format!("URCALL set to {input}"));
+                    if !input.is_empty() {
+                        match DstarCallsign::new(&input) {
+                            Ok(callsign) => self.queue_radio_command(
+                                crate::event::RadioCommand::SetUrcall {
+                                    callsign,
+                                    suffix: DstarSuffix::default(),
+                                },
+                                &format!("URCALL change to {input}"),
+                            ),
+                            Err(error) => {
+                                self.status_message = Some(format!("Invalid URCALL: {error}"));
+                            }
+                        }
                     }
                 }
                 KeyCode::Backspace => {
                     let _ = buf.pop();
                 }
                 KeyCode::Char(c) => {
-                    if buf.len() < 8 {
+                    if buf.len().saturating_add(c.len_utf8()) <= DstarCallsign::MAX_LEN {
                         buf.push(c.to_ascii_uppercase());
                     }
                 }
@@ -1570,15 +1445,10 @@ impl App {
                         self.status_message = Some("Invalid reflector (e.g. REF030 C)".into());
                         return true;
                     };
-                    if let Some(ref tx) = self.cmd_tx {
-                        let _send = tx.send(crate::event::RadioCommand::PrepareReflectorLink {
-                            name: name.clone(),
-                            module,
-                        });
-                        self.status_message = Some(format!(
-                            "Preparing {name} module {module}; key up to send the link command"
-                        ));
-                    }
+                    self.queue_radio_command(
+                        crate::event::RadioCommand::PrepareReflectorLink { name, module },
+                        &format!("Reflector {name} module {module} preparation"),
+                    );
                 }
                 KeyCode::Backspace => {
                     let _ = buf.pop();
@@ -1587,7 +1457,7 @@ impl App {
                     // Only characters that can appear in a reflector spec:
                     // rejecting non-ASCII here keeps the buffer single-byte
                     // per char, so parsing can never split a char boundary.
-                    if buf.len() < 12 && (c.is_ascii_alphanumeric() || c == ' ') {
+                    if buf.len() < INPUT_CAPACITY && (c.is_ascii_alphanumeric() || c == ' ') {
                         buf.push(c.to_ascii_uppercase());
                     }
                 }
@@ -1616,7 +1486,10 @@ impl App {
                     let _ = self.channel_edit_buffer.pop();
                 }
                 KeyCode::Char(c) => {
-                    self.channel_edit_buffer.push(c);
+                    if self.channel_edit_buffer.len().saturating_add(c.len_utf8()) <= INPUT_CAPACITY
+                    {
+                        self.channel_edit_buffer.push(c);
+                    }
                 }
                 KeyCode::Enter => {
                     let field = self.channel_edit_field;
@@ -1631,22 +1504,9 @@ impl App {
 
         // --- Normal mode ---
 
-        // Reset quit confirmation on any key that isn't 'q'
-        if key.code != KeyCode::Char('q') {
-            self.quit_pending = false;
-        }
-
         match key.code {
             KeyCode::Char('q') => {
-                if self.quit_pending {
-                    self.should_quit = true;
-                } else if let McpState::Loaded { modified: true, .. } = &self.mcp {
-                    self.quit_pending = true;
-                    self.status_message =
-                        Some("Unsaved MCP changes! Press q again to confirm quit.".into());
-                } else {
-                    self.should_quit = true;
-                }
+                self.should_quit = true;
                 true
             }
             KeyCode::Char('?') => {
@@ -1717,8 +1577,7 @@ impl App {
                         self.channel_edit_mode = true;
                         self.channel_edit_field = ChannelEditField::Name;
                         self.channel_edit_buffer.clear();
-                        self.status_message =
-                            Some("Edit mode: Tab=next field, Enter=apply, Esc=cancel".into());
+                        self.status_message = Some("Channel actions: Tab=select, Enter=inspect or queue live mode, Esc=close".into());
                     }
                     Ok(_) => {}
                     Err(error) => {
@@ -1753,7 +1612,7 @@ impl App {
             KeyCode::Char('d') => {
                 if self.main_view == MainView::Dstar && self.focus == Pane::Main {
                     // Toggle D-STAR gateway mode on/off when already viewing D-STAR panel.
-                    self.toggle_dstar_mode();
+                    self.show_dstar_availability();
                 } else {
                     self.main_view = MainView::Dstar;
                     self.focus = Pane::Main;
@@ -1823,26 +1682,19 @@ impl App {
                             self.aprs_station_index =
                                 self.aprs_station_index.saturating_add(1).min(max);
                         }
-                        MainView::Dstar => {
-                            let max = self.dstar_last_heard.len().saturating_sub(1);
-                            self.dstar_last_heard_index =
-                                self.dstar_last_heard_index.saturating_add(1).min(max);
-                        }
-                        MainView::Gps | MainView::Mcp | MainView::FmRadio => {}
+                        MainView::Dstar | MainView::Gps | MainView::Mcp | MainView::FmRadio => {}
                     },
                     Pane::BandA => {
-                        if let Some(ref tx) = self.cmd_tx {
-                            let _send = tx.send(crate::event::RadioCommand::FreqDown(
-                                kenwood_thd75::types::Band::A,
-                            ));
-                        }
+                        self.queue_radio_command(
+                            crate::event::RadioCommand::FreqDown(kenwood_thd75::types::Band::A),
+                            "Band A frequency step down",
+                        );
                     }
                     Pane::BandB => {
-                        if let Some(ref tx) = self.cmd_tx {
-                            let _send = tx.send(crate::event::RadioCommand::FreqDown(
-                                kenwood_thd75::types::Band::B,
-                            ));
-                        }
+                        self.queue_radio_command(
+                            crate::event::RadioCommand::FreqDown(kenwood_thd75::types::Band::B),
+                            "Band B frequency step down",
+                        );
                     }
                     Pane::Detail => {}
                 }
@@ -1863,25 +1715,19 @@ impl App {
                         MainView::Aprs => {
                             self.aprs_station_index = self.aprs_station_index.saturating_sub(1);
                         }
-                        MainView::Dstar => {
-                            self.dstar_last_heard_index =
-                                self.dstar_last_heard_index.saturating_sub(1);
-                        }
-                        MainView::Gps | MainView::Mcp | MainView::FmRadio => {}
+                        MainView::Dstar | MainView::Gps | MainView::Mcp | MainView::FmRadio => {}
                     },
                     Pane::BandA => {
-                        if let Some(ref tx) = self.cmd_tx {
-                            let _send = tx.send(crate::event::RadioCommand::FreqUp(
-                                kenwood_thd75::types::Band::A,
-                            ));
-                        }
+                        self.queue_radio_command(
+                            crate::event::RadioCommand::FreqUp(kenwood_thd75::types::Band::A),
+                            "Band A frequency step up",
+                        );
                     }
                     Pane::BandB => {
-                        if let Some(ref tx) = self.cmd_tx {
-                            let _send = tx.send(crate::event::RadioCommand::FreqUp(
-                                kenwood_thd75::types::Band::B,
-                            ));
-                        }
+                        self.queue_radio_command(
+                            crate::event::RadioCommand::FreqUp(kenwood_thd75::types::Band::B),
+                            "Band B frequency step up",
+                        );
                     }
                     Pane::Detail => {}
                 }
@@ -1890,20 +1736,14 @@ impl App {
             KeyCode::Enter if self.focus == Pane::Main && self.main_view == MainView::Channels => {
                 match self.filtered_channels() {
                     Ok(used) => {
-                        if let Some(&channel) = used.get(self.channel_list_index)
-                            && let Some(ref tx) = self.cmd_tx
-                        {
-                            let band_label = if self.target_band == kenwood_thd75::types::Band::B {
-                                "B"
-                            } else {
-                                "A"
-                            };
-                            let _send = tx.send(crate::event::RadioCommand::TuneChannel {
-                                band: self.target_band,
-                                channel,
-                            });
-                            self.status_message =
-                                Some(format!("Tuning Band {band_label} to channel {channel}..."));
+                        if let Some(&channel) = used.get(self.channel_list_index) {
+                            self.queue_radio_command(
+                                crate::event::RadioCommand::TuneChannel {
+                                    band: self.target_band,
+                                    channel,
+                                },
+                                &format!("Band {} channel {channel} recall", self.target_band),
+                            );
                         }
                     }
                     Err(error) => {
@@ -1954,15 +1794,19 @@ impl App {
                 } else {
                     &self.state.band_b.power_level
                 };
+                let Some(current) = self.observed(*current) else {
+                    return true;
+                };
                 let next = match current {
                     PowerLevel::High => PowerLevel::Medium,
                     PowerLevel::Medium => PowerLevel::Low,
                     PowerLevel::Low => PowerLevel::ExtraLow,
                     PowerLevel::ExtraLow => PowerLevel::High,
                 };
-                if let Some(ref tx) = self.cmd_tx {
-                    let _send = tx.send(crate::event::RadioCommand::SetPower { band, level: next });
-                }
+                self.queue_radio_command(
+                    crate::event::RadioCommand::SetPower { band, level: next },
+                    &format!("Band {band} power change to {next}"),
+                );
                 true
             }
             // Attenuator toggle on band pane
@@ -1972,51 +1816,52 @@ impl App {
                 } else {
                     (kenwood_thd75::types::Band::B, self.state.band_b.attenuator)
                 };
-                if let Some(ref tx) = self.cmd_tx {
-                    let _send = tx.send(crate::event::RadioCommand::SetAttenuator {
+                let Some(cur) = self.observed(cur) else {
+                    return true;
+                };
+                self.queue_radio_command(
+                    crate::event::RadioCommand::SetAttenuator {
                         band,
                         enabled: !cur,
-                    });
-                    self.status_message = Some(format!("Attenuator → {}", on_off(!cur)));
-                }
+                    },
+                    &format!("Band {band} attenuator change to {}", on_off(!cur)),
+                );
                 true
             }
             // Squelch adjust on band pane: [ and ]
             KeyCode::Char('[') if matches!(self.focus, Pane::BandA | Pane::BandB) => {
                 let (band, cur) = if self.focus == Pane::BandA {
-                    (
-                        kenwood_thd75::types::Band::A,
-                        self.state.band_a.squelch.as_raw(),
-                    )
+                    (kenwood_thd75::types::Band::A, self.state.band_a.squelch)
                 } else {
-                    (
-                        kenwood_thd75::types::Band::B,
-                        self.state.band_b.squelch.as_raw(),
-                    )
+                    (kenwood_thd75::types::Band::B, self.state.band_b.squelch)
                 };
-                let next = cur.saturating_sub(1);
-                if let (Some(tx), Ok(level)) = (&self.cmd_tx, SquelchLevel::new(next)) {
-                    let _send = tx.send(crate::event::RadioCommand::SetSquelch { band, level });
-                    self.status_message = Some(format!("Squelch → {next}"));
+                let Some(cur) = self.observed(cur) else {
+                    return true;
+                };
+                let next = cur.as_raw().saturating_sub(1);
+                if let Ok(level) = SquelchLevel::new(next) {
+                    self.queue_radio_command(
+                        crate::event::RadioCommand::SetSquelch { band, level },
+                        &format!("Band {band} squelch change to {next}"),
+                    );
                 }
                 true
             }
             KeyCode::Char(']') if matches!(self.focus, Pane::BandA | Pane::BandB) => {
                 let (band, cur) = if self.focus == Pane::BandA {
-                    (
-                        kenwood_thd75::types::Band::A,
-                        self.state.band_a.squelch.as_raw(),
-                    )
+                    (kenwood_thd75::types::Band::A, self.state.band_a.squelch)
                 } else {
-                    (
-                        kenwood_thd75::types::Band::B,
-                        self.state.band_b.squelch.as_raw(),
-                    )
+                    (kenwood_thd75::types::Band::B, self.state.band_b.squelch)
                 };
-                let next = cur.saturating_add(1).min(6);
-                if let (Some(tx), Ok(level)) = (&self.cmd_tx, SquelchLevel::new(next)) {
-                    let _send = tx.send(crate::event::RadioCommand::SetSquelch { band, level });
-                    self.status_message = Some(format!("Squelch → {next}"));
+                let Some(cur) = self.observed(cur) else {
+                    return true;
+                };
+                let next = cur.as_raw().saturating_add(1).min(SquelchLevel::MAX);
+                if let Ok(level) = SquelchLevel::new(next) {
+                    self.queue_radio_command(
+                        crate::event::RadioCommand::SetSquelch { band, level },
+                        &format!("Band {band} squelch change to {next}"),
+                    );
                 }
                 true
             }
@@ -2049,103 +1894,128 @@ impl App {
                     && self.focus == Pane::Main
                     && self.aprs_mode == AprsMode::Active =>
             {
-                if let Some(ref tx) = self.cmd_tx {
-                    // Use 0,0 as placeholder; real GPS position would come from the radio.
-                    let _send = tx.send(crate::event::RadioCommand::BeaconPosition {
-                        latitude: kenwood_thd75::Latitude::EQUATOR,
-                        longitude: kenwood_thd75::Longitude::PRIME_MERIDIAN,
-                        comment: kenwood_thd75::PositionReportText::default(),
-                    });
-                    self.status_message = Some("Beacon sent".into());
-                }
+                self.status_message =
+                    Some("Manual beacon unavailable: no validated live local position".into());
                 true
             }
             KeyCode::Char('r') if self.main_view == MainView::Mcp => {
-                if matches!(self.mcp, McpState::Idle | McpState::Loaded { .. }) {
+                if matches!(self.mcp, McpState::Idle | McpState::Loaded { .. })
+                    && let Some(tx) = &self.cmd_tx
+                    && tx.send(crate::event::RadioCommand::ReadMemory).is_ok()
+                {
+                    let previous = std::mem::replace(&mut self.mcp, McpState::Idle);
+                    let cached = match previous {
+                        McpState::Loaded { image, .. } => Some(image),
+                        _ => None,
+                    };
                     self.mcp = McpState::Reading {
                         page: 0,
                         total: kenwood_thd75::protocol::programming::TOTAL_PAGES,
+                        cached,
                     };
-                    self.status_message = Some("Starting MCP read...".into());
-                    if let Some(ref tx) = self.cmd_tx {
-                        let _send = tx.send(crate::event::RadioCommand::ReadMemory);
-                    }
-                }
-                true
-            }
-            KeyCode::Char('w') if self.main_view == MainView::Mcp => {
-                let previous = std::mem::replace(&mut self.mcp, McpState::Idle);
-                if let McpState::Loaded { image, .. } = previous {
-                    let data = image.as_raw().to_vec();
-                    self.mcp = McpState::Writing {
-                        page: 0,
-                        total: kenwood_thd75::protocol::programming::TOTAL_PAGES,
-                        image,
-                    };
-                    self.status_message = Some("Starting MCP write...".into());
-                    if let Some(ref tx) = self.cmd_tx {
-                        let _send = tx.send(crate::event::RadioCommand::WriteMemory(data));
-                    }
-                } else {
-                    self.mcp = previous;
+                    self.status_message = Some("MCP read queued".into());
                 }
                 true
             }
             // D-STAR: set CQ (URCALL = CQCQCQ)
-            KeyCode::Char('C')
-                if self.main_view == MainView::Dstar
-                    && self.focus == Pane::Main
-                    && self.dstar_mode == DstarMode::Inactive =>
-            {
-                if let Some(ref tx) = self.cmd_tx {
-                    let _send = tx.send(crate::event::RadioCommand::SetCQ);
-                    self.status_message = Some("URCALL set to CQCQCQ".into());
-                }
+            KeyCode::Char('C') if self.main_view == MainView::Dstar && self.focus == Pane::Main => {
+                self.queue_radio_command(crate::event::RadioCommand::SetCQ, "CQ preparation");
                 true
             }
             // D-STAR: set URCALL (prompt)
-            KeyCode::Char('u')
-                if self.main_view == MainView::Dstar
-                    && self.focus == Pane::Main
-                    && self.dstar_mode == DstarMode::Inactive =>
-            {
+            KeyCode::Char('u') if self.main_view == MainView::Dstar && self.focus == Pane::Main => {
                 self.dstar_urcall_input = Some(String::new());
                 true
             }
             // D-STAR: prepare reflector link (prompt)
-            KeyCode::Char('r')
-                if self.main_view == MainView::Dstar
-                    && self.focus == Pane::Main
-                    && self.dstar_mode == DstarMode::Inactive =>
-            {
+            KeyCode::Char('r') if self.main_view == MainView::Dstar && self.focus == Pane::Main => {
                 self.dstar_reflector_input = Some(String::new());
                 true
             }
             // D-STAR: prepare reflector unlink
-            KeyCode::Char('U')
-                if self.main_view == MainView::Dstar
-                    && self.focus == Pane::Main
-                    && self.dstar_mode == DstarMode::Inactive =>
-            {
-                if let Some(ref tx) = self.cmd_tx {
-                    let _send = tx.send(crate::event::RadioCommand::PrepareReflectorUnlink);
-                    self.status_message =
-                        Some("Preparing unlink; key up to send the command".into());
-                }
+            KeyCode::Char('U') if self.main_view == MainView::Dstar && self.focus == Pane::Main => {
+                self.queue_radio_command(
+                    crate::event::RadioCommand::PrepareReflectorUnlink,
+                    "Reflector unlink preparation",
+                );
                 true
             }
             _ => false,
         }
     }
 
+    /// Report caching independently from completed radio work.
+    fn cache_image(&self, image: &MemoryImage) -> String {
+        self.cache_path.as_ref().map_or_else(
+            || "disk cache disabled".to_owned(),
+            |path| match crate::cache::save(path, image) {
+                Ok(()) => "disk cache updated".to_owned(),
+                Err(error) => format!("disk cache failed: {error}"),
+            },
+        )
+    }
+
+    /// Require an observation from the current connection before relative edits.
+    fn observed<T>(&mut self, value: Option<T>) -> Option<T> {
+        if value.is_none() {
+            self.status_message =
+                Some("Current value unavailable; wait for a successful radio read".into());
+        }
+        value
+    }
+
+    /// Describe acceptance separately from later radio completion or failure.
+    fn queue_radio_command(&mut self, command: crate::event::RadioCommand, label: &str) {
+        self.status_message = Some(self.cmd_tx.as_ref().map_or_else(
+            || format!("{label}: not queued (radio worker unavailable)"),
+            |sender| match sender.send(command) {
+                Ok(()) => format!("{label}: queued"),
+                Err(error) => format!("{label}: not queued ({error})"),
+            },
+        ));
+    }
+
+    /// Queue one staged edit before changing its pending display state.
+    fn queue_setting_edit(&mut self, edit: SettingsEdit, label: &str) {
+        if !matches!(
+            self.mcp,
+            McpState::Loaded {
+                requires_refresh: false,
+                ..
+            }
+        ) {
+            self.status_message =
+                Some("A setting write is pending or MCP data needs refresh".into());
+            return;
+        }
+        let Some(sender) = &self.cmd_tx else {
+            self.status_message =
+                Some("Setting change was not queued: radio worker unavailable".into());
+            return;
+        };
+        let edit = Box::new(edit);
+        if let Err(error) = sender.send(crate::event::RadioCommand::ApplySetting(edit.clone())) {
+            self.status_message = Some(format!("Setting change was not queued: {error}"));
+            return;
+        }
+        let previous = std::mem::replace(&mut self.mcp, McpState::Idle);
+        if let McpState::Loaded { image, .. } = previous {
+            self.mcp = McpState::Writing {
+                image,
+                edit,
+                page: 0,
+                total: 1,
+            };
+            self.status_message = Some(format!("{label}: queued for guarded write"));
+        } else {
+            self.mcp = previous;
+        }
+    }
+
     /// Toggle a boolean setting or show hint for numeric ones.
     #[expect(
         clippy::too_many_lines,
-        reason = "`toggle_setting` is paired with `adjust_setting`; together they are \
-                  the TUI's dispatch into the settings-mutation path. It matches over \
-                  every settings row and issues the corresponding RadioCommand. Splitting \
-                  would duplicate the row-resolution logic; keeping it linear matches the \
-                  settings table's order."
+        reason = "The dispatch follows the settings table and shares selection, staged-write and validation feedback across rows."
     )]
     fn toggle_setting(&mut self) {
         let (rows, idx) = if self.main_view == MainView::SettingsCat {
@@ -2159,50 +2029,75 @@ impl App {
         };
 
         // CAT-backed boolean settings
-        if let Some(ref tx) = self.cmd_tx.clone() {
+        if self.cmd_tx.is_some() {
             match row {
                 SettingRow::DualBand => {
-                    let next = match self.state.band_mode {
+                    let Some(current) = self.observed(self.state.band_mode) else {
+                        return;
+                    };
+                    let next = match current {
                         BandMode::Dual => BandMode::Single,
                         BandMode::Single => BandMode::Dual,
                     };
-                    let _send = tx.send(crate::event::RadioCommand::SetBandMode(next));
-                    self.status_message = Some(format!("Band mode → {next}"));
+                    self.queue_radio_command(
+                        crate::event::RadioCommand::SetBandMode(next),
+                        &format!("Band mode → {next}"),
+                    );
                     return;
                 }
                 SettingRow::Bluetooth => {
-                    let next = !self.state.bluetooth;
-                    let _send = tx.send(crate::event::RadioCommand::SetBluetooth(next));
-                    self.status_message = Some(format!("Bluetooth → {}", on_off(next)));
+                    let Some(current) = self.observed(self.state.bluetooth) else {
+                        return;
+                    };
+                    let next = !current;
+                    self.queue_radio_command(
+                        crate::event::RadioCommand::SetBluetooth(next),
+                        &format!("Bluetooth → {}", on_off(next)),
+                    );
                     return;
                 }
                 SettingRow::VoxEnabled => {
-                    let next = !self.state.vox;
-                    let _send = tx.send(crate::event::RadioCommand::SetVox(next));
-                    self.status_message = Some(format!("VOX → {}", on_off(next)));
+                    let Some(current) = self.observed(self.state.vox) else {
+                        return;
+                    };
+                    let next = !current;
+                    self.queue_radio_command(
+                        crate::event::RadioCommand::SetVox(next),
+                        &format!("VOX → {}", on_off(next)),
+                    );
                     return;
                 }
                 SettingRow::AttenuatorA => {
-                    let next = !self.state.band_a.attenuator;
-                    let _send = tx.send(crate::event::RadioCommand::SetAttenuator {
-                        band: kenwood_thd75::types::Band::A,
-                        enabled: next,
-                    });
-                    self.status_message = Some(format!("Atten A → {}", on_off(next)));
+                    let Some(current) = self.observed(self.state.band_a.attenuator) else {
+                        return;
+                    };
+                    let next = !current;
+                    self.queue_radio_command(
+                        crate::event::RadioCommand::SetAttenuator {
+                            band: kenwood_thd75::types::Band::A,
+                            enabled: next,
+                        },
+                        &format!("Atten A → {}", on_off(next)),
+                    );
                     return;
                 }
                 SettingRow::AttenuatorB => {
-                    let next = !self.state.band_b.attenuator;
-                    let _send = tx.send(crate::event::RadioCommand::SetAttenuator {
-                        band: kenwood_thd75::types::Band::B,
-                        enabled: next,
-                    });
-                    self.status_message = Some(format!("Atten B → {}", on_off(next)));
+                    let Some(current) = self.observed(self.state.band_b.attenuator) else {
+                        return;
+                    };
+                    let next = !current;
+                    self.queue_radio_command(
+                        crate::event::RadioCommand::SetAttenuator {
+                            band: kenwood_thd75::types::Band::B,
+                            enabled: next,
+                        },
+                        &format!("Atten B → {}", on_off(next)),
+                    );
                     return;
                 }
                 SettingRow::FmRadio => {
                     self.status_message = Some(
-                        "FM Radio is read-only here: the radio answers N to FR writes; change it in Menu 700"
+                        "FM controls are unavailable in this dashboard; use the radio controls"
                             .into(),
                     );
                     return;
@@ -2214,9 +2109,11 @@ impl App {
                         return;
                     };
                     let next = !current.enabled();
-                    let settings = GpsSettings::new(next, current.pc_output());
-                    let _send = tx.send(crate::event::RadioCommand::SetGpsSettings(settings));
-                    self.status_message = Some(format!("GPS → {}", on_off(next)));
+                    let settings = current.with_enabled(next);
+                    self.queue_radio_command(
+                        crate::event::RadioCommand::SetGpsSettings(settings),
+                        &format!("GPS → {}", on_off(next)),
+                    );
                     return;
                 }
                 SettingRow::GpsPcOutput => {
@@ -2226,13 +2123,16 @@ impl App {
                         return;
                     };
                     let next = !current.pc_output();
-                    let settings = GpsSettings::new(current.enabled(), next);
-                    let _send = tx.send(crate::event::RadioCommand::SetGpsSettings(settings));
-                    self.status_message = Some(format!("GPS PC Output → {}", on_off(next)));
+                    let settings = current.with_pc_output(next);
+                    self.queue_radio_command(
+                        crate::event::RadioCommand::SetGpsSettings(settings),
+                        &format!("GPS PC output → {}", on_off(next)),
+                    );
                     return;
                 }
                 SettingRow::AutoInfo => {
-                    self.status_message = Some("Auto Info: not yet wired".into());
+                    self.status_message =
+                        Some("Auto-information controls are unavailable in this dashboard".into());
                     return;
                 }
                 SettingRow::AprsCallsign => {
@@ -2251,11 +2151,15 @@ impl App {
         }
 
         // MCP-backed boolean settings: write directly to radio via single-page MCP
-        let Some(tx) = self.cmd_tx.clone() else {
+        if self.cmd_tx.is_none() {
             return;
-        };
+        }
 
-        let McpState::Loaded { ref mut image, .. } = self.mcp else {
+        let McpState::Loaded {
+            ref image,
+            requires_refresh: false,
+        } = self.mcp
+        else {
             self.status_message = Some(format!("{}: load MCP data first (m → r)", row.label()));
             return;
         };
@@ -2265,17 +2169,12 @@ impl App {
                 match image.settings().$getter() {
                     Ok(current) => {
                         let new_val = !current;
-                        match image.modify_setting(|writer| writer.$setter(new_val)) {
-                            Ok(Some((offset, value))) => {
-                                let _send = tx.send(crate::event::RadioCommand::McpWriteByte {
-                                    offset,
-                                    value,
-                                });
-                                self.status_message = Some(format!(
-                                    "{} → {}, applying...",
-                                    $label,
-                                    on_off(new_val)
-                                ));
+                        match SettingsEdit::stage(image, |writer| writer.$setter(new_val)) {
+                            Ok(Some(edit)) => {
+                                self.queue_setting_edit(
+                                    edit,
+                                    &format!("{} → {}", $label, on_off(new_val)),
+                                );
                             }
                             Ok(None) => {
                                 self.status_message =
@@ -2340,12 +2239,7 @@ impl App {
     #[expect(
         clippy::cognitive_complexity,
         clippy::too_many_lines,
-        reason = "`adjust_setting` is the TUI's single entry point for +/- delta edits to \
-                  every CAT- or MCP-backed numeric setting. Dispatches on the settings \
-                  row's type (enum CAT setting, numeric CAT setting, MCP setting, …) to \
-                  the appropriate wire-format encoder and sends via the `RadioCommand` \
-                  channel. Splitting per setting-type would require duplicating the \
-                  delta-clamping and feedback logic at every site."
+        reason = "The settings-row dispatch shares checked stepping and staged-write feedback across the model's distinct setting domains."
     )]
     fn adjust_setting(&mut self, delta: i8) {
         let (rows, idx) = if self.main_view == MainView::SettingsCat {
@@ -2359,138 +2253,118 @@ impl App {
         };
 
         // CAT-backed numeric settings
-        if let Some(ref tx) = self.cmd_tx.clone() {
+        if self.cmd_tx.is_some() {
             match row {
                 SettingRow::SquelchA => {
-                    let cur = self.state.band_a.squelch.as_raw();
+                    let Some(current) = self.observed(self.state.band_a.squelch) else {
+                        return;
+                    };
+                    let cur = current.as_raw();
                     let next = if delta > 0 {
-                        cur.saturating_add(1).min(6)
+                        cur.saturating_add(1).min(SquelchLevel::MAX)
                     } else {
                         cur.saturating_sub(1)
                     };
                     if let Ok(level) = SquelchLevel::new(next) {
-                        let _send = tx.send(crate::event::RadioCommand::SetSquelch {
-                            band: kenwood_thd75::types::Band::A,
-                            level,
-                        });
+                        self.queue_radio_command(
+                            crate::event::RadioCommand::SetSquelch {
+                                band: kenwood_thd75::types::Band::A,
+                                level,
+                            },
+                            &format!("Squelch A → {next}"),
+                        );
                     }
-                    self.status_message = Some(format!("Squelch A → {next}"));
                     return;
                 }
                 SettingRow::SquelchB => {
-                    let cur = self.state.band_b.squelch.as_raw();
+                    let Some(current) = self.observed(self.state.band_b.squelch) else {
+                        return;
+                    };
+                    let cur = current.as_raw();
                     let next = if delta > 0 {
-                        cur.saturating_add(1).min(6)
+                        cur.saturating_add(1).min(SquelchLevel::MAX)
                     } else {
                         cur.saturating_sub(1)
                     };
                     if let Ok(level) = SquelchLevel::new(next) {
-                        let _send = tx.send(crate::event::RadioCommand::SetSquelch {
-                            band: kenwood_thd75::types::Band::B,
-                            level,
-                        });
+                        self.queue_radio_command(
+                            crate::event::RadioCommand::SetSquelch {
+                                band: kenwood_thd75::types::Band::B,
+                                level,
+                            },
+                            &format!("Squelch B → {next}"),
+                        );
                     }
-                    self.status_message = Some(format!("Squelch B → {next}"));
                     return;
                 }
                 SettingRow::VoxGain => {
-                    let cur = self.state.vox_gain.as_raw();
+                    let Some(current) = self.observed(self.state.vox_gain) else {
+                        return;
+                    };
+                    let cur = current.as_raw();
                     let next = if delta > 0 {
                         cur.saturating_add(1).min(VoxGain::MAX)
                     } else {
                         cur.saturating_sub(1)
                     };
                     if let Ok(gain) = VoxGain::new(next) {
-                        let _send = tx.send(crate::event::RadioCommand::SetVoxGain(gain));
-                        self.status_message = Some(format!("VOX Gain → {next}"));
+                        self.queue_radio_command(
+                            crate::event::RadioCommand::SetVoxGain(gain),
+                            &format!("VOX gain → {next}"),
+                        );
                     }
                     return;
                 }
                 SettingRow::VoxDelay => {
-                    let cur = self.state.vox_delay.as_raw();
+                    let Some(current) = self.observed(self.state.vox_delay) else {
+                        return;
+                    };
+                    let cur = current.as_raw();
                     let next = if delta > 0 {
                         cur.saturating_add(1).min(VoxDelay::MAX)
                     } else {
                         cur.saturating_sub(1)
                     };
                     if let Ok(delay) = VoxDelay::new(next) {
-                        let _send = tx.send(crate::event::RadioCommand::SetVoxDelay(delay));
-                        self.status_message = Some(format!("VOX Delay → {next}"));
+                        self.queue_radio_command(
+                            crate::event::RadioCommand::SetVoxDelay(delay),
+                            &format!("VOX delay → {next}"),
+                        );
                     }
                     return;
                 }
                 SettingRow::StepSizeA => {
                     use kenwood_thd75::types::StepSize;
-                    let steps = [
-                        StepSize::Hz5000,
-                        StepSize::Hz6250,
-                        StepSize::Hz8330,
-                        StepSize::Hz9000,
-                        StepSize::Hz10000,
-                        StepSize::Hz12500,
-                        StepSize::Hz15000,
-                        StepSize::Hz20000,
-                        StepSize::Hz25000,
-                        StepSize::Hz30000,
-                        StepSize::Hz50000,
-                        StepSize::Hz100000,
-                    ];
-                    let cur_idx = self
-                        .state
-                        .band_a
-                        .step_size
-                        .and_then(|s| steps.iter().position(|&x| x == s))
-                        .unwrap_or(0);
-                    let next_idx = if delta > 0 {
-                        (cur_idx + 1).min(steps.len() - 1)
-                    } else {
-                        cur_idx.saturating_sub(1)
-                    };
-                    let Some(&next) = steps.get(next_idx) else {
+                    let Some(current) = self.observed(self.state.band_a.step_size) else {
                         return;
                     };
-                    let _send = tx.send(crate::event::RadioCommand::SetStepSize {
-                        band: kenwood_thd75::types::Band::A,
-                        step: next,
-                    });
-                    self.status_message = Some(format!("Step A → {next}"));
+                    let Some(next) = step_selection(current, delta, &StepSize::ALL) else {
+                        return;
+                    };
+                    self.queue_radio_command(
+                        crate::event::RadioCommand::SetStepSize {
+                            band: kenwood_thd75::types::Band::A,
+                            step: next,
+                        },
+                        &format!("Step A → {next}"),
+                    );
                     return;
                 }
                 SettingRow::StepSizeB => {
                     use kenwood_thd75::types::StepSize;
-                    let steps = [
-                        StepSize::Hz5000,
-                        StepSize::Hz6250,
-                        StepSize::Hz8330,
-                        StepSize::Hz9000,
-                        StepSize::Hz10000,
-                        StepSize::Hz12500,
-                        StepSize::Hz15000,
-                        StepSize::Hz20000,
-                        StepSize::Hz25000,
-                        StepSize::Hz30000,
-                        StepSize::Hz50000,
-                        StepSize::Hz100000,
-                    ];
-                    let cur_idx = self
-                        .state
-                        .band_b
-                        .step_size
-                        .and_then(|s| steps.iter().position(|&x| x == s))
-                        .unwrap_or(0);
-                    let next_idx = if delta > 0 {
-                        (cur_idx + 1).min(steps.len() - 1)
-                    } else {
-                        cur_idx.saturating_sub(1)
-                    };
-                    let Some(&next) = steps.get(next_idx) else {
+                    let Some(current) = self.observed(self.state.band_b.step_size) else {
                         return;
                     };
-                    let _send = tx.send(crate::event::RadioCommand::SetStepSize {
-                        band: kenwood_thd75::types::Band::B,
-                        step: next,
-                    });
-                    self.status_message = Some(format!("Step B → {next}"));
+                    let Some(next) = step_selection(current, delta, &StepSize::ALL) else {
+                        return;
+                    };
+                    self.queue_radio_command(
+                        crate::event::RadioCommand::SetStepSize {
+                            band: kenwood_thd75::types::Band::B,
+                            step: next,
+                        },
+                        &format!("Step B → {next}"),
+                    );
                     return;
                 }
                 SettingRow::FineStep => {
@@ -2510,85 +2384,86 @@ impl App {
                     return;
                 }
                 SettingRow::PowerA => {
-                    let next = match self.state.band_a.power_level {
-                        PowerLevel::High => PowerLevel::Medium,
-                        PowerLevel::Medium => PowerLevel::Low,
-                        PowerLevel::Low => PowerLevel::ExtraLow,
-                        PowerLevel::ExtraLow => PowerLevel::High,
+                    let Some(current) = self.observed(self.state.band_a.power_level) else {
+                        return;
                     };
-                    let _send = tx.send(crate::event::RadioCommand::SetPower {
-                        band: kenwood_thd75::types::Band::A,
-                        level: next,
-                    });
-                    self.status_message = Some(format!("Power A → {next}"));
+                    let Some(next) = cycle_selection(current, &PowerLevel::ALL) else {
+                        return;
+                    };
+                    self.queue_radio_command(
+                        crate::event::RadioCommand::SetPower {
+                            band: kenwood_thd75::types::Band::A,
+                            level: next,
+                        },
+                        &format!("Power A → {next}"),
+                    );
                     return;
                 }
                 SettingRow::PowerB => {
-                    let next = match self.state.band_b.power_level {
-                        PowerLevel::High => PowerLevel::Medium,
-                        PowerLevel::Medium => PowerLevel::Low,
-                        PowerLevel::Low => PowerLevel::ExtraLow,
-                        PowerLevel::ExtraLow => PowerLevel::High,
+                    let Some(current) = self.observed(self.state.band_b.power_level) else {
+                        return;
                     };
-                    let _send = tx.send(crate::event::RadioCommand::SetPower {
-                        band: kenwood_thd75::types::Band::B,
-                        level: next,
-                    });
-                    self.status_message = Some(format!("Power B → {next}"));
+                    let Some(next) = cycle_selection(current, &PowerLevel::ALL) else {
+                        return;
+                    };
+                    self.queue_radio_command(
+                        crate::event::RadioCommand::SetPower {
+                            band: kenwood_thd75::types::Band::B,
+                            level: next,
+                        },
+                        &format!("Power B → {next}"),
+                    );
                     return;
                 }
                 SettingRow::OperatingModeA => {
                     use kenwood_thd75::types::OperatingMode;
-                    let next = match self.state.band_a.mode {
-                        OperatingMode::Fm => OperatingMode::Nfm,
-                        OperatingMode::Nfm => OperatingMode::Am,
-                        OperatingMode::Am => OperatingMode::Lsb,
-                        OperatingMode::Lsb => OperatingMode::Usb,
-                        OperatingMode::Usb => OperatingMode::Cw,
-                        OperatingMode::Cw => OperatingMode::Dv,
-                        OperatingMode::Dv => OperatingMode::Dr,
-                        OperatingMode::Dr => OperatingMode::Wfm,
-                        OperatingMode::Wfm => OperatingMode::CwReverse,
-                        OperatingMode::CwReverse => OperatingMode::Fm,
+                    let Some(current) = self.observed(self.state.band_a.mode) else {
+                        return;
                     };
-                    let _send = tx.send(crate::event::RadioCommand::SetOperatingMode {
-                        band: kenwood_thd75::types::Band::A,
-                        mode: next,
-                    });
-                    self.status_message = Some(format!("Mode A → {next}"));
+                    let Some(next) = cycle_selection(current, &OperatingMode::ALL) else {
+                        return;
+                    };
+                    self.queue_radio_command(
+                        crate::event::RadioCommand::SetOperatingMode {
+                            band: kenwood_thd75::types::Band::A,
+                            mode: next,
+                        },
+                        &format!("Mode A → {next}"),
+                    );
                     return;
                 }
                 SettingRow::OperatingModeB => {
                     use kenwood_thd75::types::OperatingMode;
-                    let next = match self.state.band_b.mode {
-                        OperatingMode::Fm => OperatingMode::Nfm,
-                        OperatingMode::Nfm => OperatingMode::Am,
-                        OperatingMode::Am => OperatingMode::Lsb,
-                        OperatingMode::Lsb => OperatingMode::Usb,
-                        OperatingMode::Usb => OperatingMode::Cw,
-                        OperatingMode::Cw => OperatingMode::Dv,
-                        OperatingMode::Dv => OperatingMode::Dr,
-                        OperatingMode::Dr => OperatingMode::Wfm,
-                        OperatingMode::Wfm => OperatingMode::CwReverse,
-                        OperatingMode::CwReverse => OperatingMode::Fm,
+                    let Some(current) = self.observed(self.state.band_b.mode) else {
+                        return;
                     };
-                    let _send = tx.send(crate::event::RadioCommand::SetOperatingMode {
-                        band: kenwood_thd75::types::Band::B,
-                        mode: next,
-                    });
-                    self.status_message = Some(format!("Mode B → {next}"));
+                    let Some(next) = cycle_selection(current, &OperatingMode::ALL) else {
+                        return;
+                    };
+                    self.queue_radio_command(
+                        crate::event::RadioCommand::SetOperatingMode {
+                            band: kenwood_thd75::types::Band::B,
+                            mode: next,
+                        },
+                        &format!("Mode B → {next}"),
+                    );
                     return;
                 }
                 SettingRow::ActiveBand => {
-                    self.status_message = Some("Active Band: BC command not yet wired".into());
+                    self.status_message =
+                        Some("Active-band selection is unavailable in this settings list".into());
                     return;
                 }
                 SettingRow::TuningModeA => {
-                    self.status_message = Some("VFO/Mem A: VM command not yet wired".into());
+                    self.status_message = Some(
+                        "Band A VFO/memory selection is unavailable in this settings list".into(),
+                    );
                     return;
                 }
                 SettingRow::TuningModeB => {
-                    self.status_message = Some("VFO/Mem B: VM command not yet wired".into());
+                    self.status_message = Some(
+                        "Band B VFO/memory selection is unavailable in this settings list".into(),
+                    );
                     return;
                 }
                 SettingRow::PacketDataRate => {
@@ -2597,25 +2472,33 @@ impl App {
                     } else {
                         kenwood_thd75::types::PacketDataRate::Bps1200
                     };
-                    let _send = tx.send(crate::event::RadioCommand::SetPacketDataRate(data_rate));
-                    self.status_message = Some(format!("Packet Data Rate → {data_rate}"));
+                    self.queue_radio_command(
+                        crate::event::RadioCommand::SetPacketDataRate(data_rate),
+                        &format!("Packet data rate → {data_rate}"),
+                    );
                     return;
                 }
                 SettingRow::BeaconMode => {
-                    let cur = u8::from(self.state.beacon_mode);
+                    let Some(current) = self.observed(self.state.beacon_mode) else {
+                        return;
+                    };
+                    let cur = u8::from(current);
                     let next = if delta > 0 {
-                        cur.saturating_add(1).min(3)
+                        cur.saturating_add(1)
                     } else {
                         cur.saturating_sub(1)
                     };
                     if let Ok(mode) = BeaconMode::try_from(next) {
-                        let _send = tx.send(crate::event::RadioCommand::SetBeaconMode(mode));
-                        self.status_message = Some(format!("Beacon Mode → {mode}"));
+                        self.queue_radio_command(
+                            crate::event::RadioCommand::SetBeaconMode(mode),
+                            &format!("Beacon mode → {mode}"),
+                        );
                     }
                     return;
                 }
                 SettingRow::DstarSlot => {
-                    self.status_message = Some("D-STAR Slot: not yet polled, cannot adjust".into());
+                    self.status_message =
+                        Some("D-STAR slot changes are unavailable in this settings list".into());
                     return;
                 }
                 _ => {}
@@ -2623,11 +2506,15 @@ impl App {
         }
 
         // MCP-backed numeric settings: write directly via single-page MCP
-        let Some(tx) = self.cmd_tx.clone() else {
+        if self.cmd_tx.is_none() {
             return;
-        };
+        }
 
-        let McpState::Loaded { ref mut image, .. } = self.mcp else {
+        let McpState::Loaded {
+            ref image,
+            requires_refresh: false,
+        } = self.mcp
+        else {
             self.status_message = Some(format!("{}: load MCP data first (m → r)", row.label()));
             return;
         };
@@ -2640,14 +2527,12 @@ impl App {
                     Ok(current) => match ($step)(current, delta) {
                         Some(next) => {
                             let display = ($display)(next);
-                            match image.modify_setting(|writer| writer.$setter(next)) {
-                                Ok(Some((offset, value))) => {
-                                    let _send = tx.send(crate::event::RadioCommand::McpWriteByte {
-                                        offset,
-                                        value,
-                                    });
-                                    self.status_message =
-                                        Some(format!("{} → {}, applying...", $label, display));
+                            match SettingsEdit::stage(image, |writer| writer.$setter(next)) {
+                                Ok(Some(edit)) => {
+                                    self.queue_setting_edit(
+                                        edit,
+                                        &format!("{} → {}", $label, display),
+                                    );
                                 }
                                 Ok(None) => {
                                     self.status_message =
@@ -2680,14 +2565,12 @@ impl App {
                     Ok(current) => match ($step)(current, delta) {
                         Ok(next) => {
                             let display = ($display)(next);
-                            match image.modify_setting(|writer| writer.$setter(next)) {
-                                Ok(Some((offset, value))) => {
-                                    let _send = tx.send(crate::event::RadioCommand::McpWriteByte {
-                                        offset,
-                                        value,
-                                    });
-                                    self.status_message =
-                                        Some(format!("{} → {}, applying...", $label, display));
+                            match SettingsEdit::stage(image, |writer| writer.$setter(next)) {
+                                Ok(Some(edit)) => {
+                                    self.queue_setting_edit(
+                                        edit,
+                                        &format!("{} → {}", $label, display),
+                                    );
                                 }
                                 Ok(None) => {
                                     self.status_message =
@@ -2717,13 +2600,7 @@ impl App {
                     |current: SsbHighCut, direction| step_selection(
                         current,
                         direction,
-                        &[
-                            SsbHighCut::Khz2_2,
-                            SsbHighCut::Khz2_4,
-                            SsbHighCut::Khz2_6,
-                            SsbHighCut::Khz2_8,
-                            SsbHighCut::Khz3_0,
-                        ],
+                        &SsbHighCut::ALL,
                     ),
                     "SSB High Cut",
                     |value| format!("{value:?}")
@@ -2736,13 +2613,7 @@ impl App {
                     |current: CwFilterWidth, direction| step_selection(
                         current,
                         direction,
-                        &[
-                            CwFilterWidth::Khz0_3,
-                            CwFilterWidth::Khz0_5,
-                            CwFilterWidth::Khz1_0,
-                            CwFilterWidth::Khz1_5,
-                            CwFilterWidth::Khz2_0,
-                        ],
+                        &CwFilterWidth::ALL,
                     ),
                     "CW Width",
                     |value| format!("{value:?}")
@@ -2755,12 +2626,7 @@ impl App {
                     |current: AmHighCut, direction| step_selection(
                         current,
                         direction,
-                        &[
-                            AmHighCut::Khz3_0,
-                            AmHighCut::Khz4_5,
-                            AmHighCut::Khz6_0,
-                            AmHighCut::Khz7_5,
-                        ],
+                        &AmHighCut::ALL,
                     ),
                     "AM High Cut",
                     |value| format!("{value:?}")
@@ -2770,15 +2636,7 @@ impl App {
                 adjust_typed!(
                     scan_resume,
                     set_scan_resume,
-                    |current, direction| step_selection(
-                        current,
-                        direction,
-                        &[
-                            ScanResumeMethod::TimeOperated,
-                            ScanResumeMethod::CarrierOperated,
-                            ScanResumeMethod::Seek,
-                        ],
-                    ),
+                    |current, direction| step_selection(current, direction, &ScanResumeMethod::ALL,),
                     "Scan Resume",
                     |value| format!("{value:?}")
                 );
@@ -2787,15 +2645,7 @@ impl App {
                 adjust_typed!(
                     digital_scan_resume,
                     set_digital_scan_resume,
-                    |current, direction| step_selection(
-                        current,
-                        direction,
-                        &[
-                            ScanResumeMethod::TimeOperated,
-                            ScanResumeMethod::CarrierOperated,
-                            ScanResumeMethod::Seek,
-                        ],
-                    ),
+                    |current, direction| step_selection(current, direction, &ScanResumeMethod::ALL,),
                     "Dig Scan Resume",
                     |value| format!("{value:?}")
                 );
@@ -2806,11 +2656,11 @@ impl App {
                     set_scan_restart_time,
                     |current: ScanRestartDelay, direction| {
                         let seconds = if direction > 0 {
-                            current.as_seconds().saturating_add(1).min(10)
+                            current.as_seconds().saturating_add(1)
                         } else {
-                            current.as_seconds().saturating_sub(1).max(1)
+                            current.as_seconds().saturating_sub(1)
                         };
-                        ScanRestartDelay::new(seconds)
+                        ScanRestartDelay::new(seconds).or(Ok::<_, ValidationError>(current))
                     },
                     "Scan Restart Time",
                     |value: ScanRestartDelay| format!("{} s", value.as_seconds())
@@ -2822,11 +2672,11 @@ impl App {
                     set_scan_restart_carrier,
                     |current: ScanRestartDelay, direction| {
                         let seconds = if direction > 0 {
-                            current.as_seconds().saturating_add(1).min(10)
+                            current.as_seconds().saturating_add(1)
                         } else {
-                            current.as_seconds().saturating_sub(1).max(1)
+                            current.as_seconds().saturating_sub(1)
                         };
-                        ScanRestartDelay::new(seconds)
+                        ScanRestartDelay::new(seconds).or(Ok::<_, ValidationError>(current))
                     },
                     "Scan Restart Carrier",
                     |value: ScanRestartDelay| format!("{} s", value.as_seconds())
@@ -2836,23 +2686,7 @@ impl App {
                 adjust_typed!(
                     timeout_timer,
                     set_timeout_timer,
-                    |current, direction| step_selection(
-                        current,
-                        direction,
-                        &[
-                            TransmitTimeout::Seconds30,
-                            TransmitTimeout::Seconds60,
-                            TransmitTimeout::Seconds90,
-                            TransmitTimeout::Seconds120,
-                            TransmitTimeout::Seconds150,
-                            TransmitTimeout::Seconds180,
-                            TransmitTimeout::Seconds210,
-                            TransmitTimeout::Seconds240,
-                            TransmitTimeout::Seconds270,
-                            TransmitTimeout::Seconds300,
-                            TransmitTimeout::Seconds600,
-                        ],
-                    ),
+                    |current, direction| step_selection(current, direction, &TransmitTimeout::ALL,),
                     "Timeout Timer",
                     |value: TransmitTimeout| format!("{} s", value.as_seconds())
                 );
@@ -2861,20 +2695,7 @@ impl App {
                 adjust_typed!(
                     beat_shift,
                     set_beat_shift,
-                    |current, direction| step_selection(
-                        current,
-                        direction,
-                        &[
-                            BeatShift::Type1,
-                            BeatShift::Type2,
-                            BeatShift::Type3,
-                            BeatShift::Type4,
-                            BeatShift::Type5,
-                            BeatShift::Type6,
-                            BeatShift::Type7,
-                            BeatShift::Type8,
-                        ],
-                    ),
+                    |current, direction| step_selection(current, direction, &BeatShift::ALL,),
                     "Beat Shift",
                     |value: BeatShift| format!("Type {}", u8::from(value) + 1)
                 );
@@ -2915,15 +2736,7 @@ impl App {
                 adjust_typed!(
                     dtmf_speed,
                     set_dtmf_speed,
-                    |current, direction| step_selection(
-                        current,
-                        direction,
-                        &[
-                            DtmfToneDuration::Ms50,
-                            DtmfToneDuration::Ms100,
-                            DtmfToneDuration::Ms150,
-                        ],
-                    ),
+                    |current, direction| step_selection(current, direction, &DtmfToneDuration::ALL,),
                     "DTMF Speed",
                     |value| format!("{value:?}")
                 );
@@ -2932,19 +2745,7 @@ impl App {
                 adjust_typed!(
                     dtmf_pause_time,
                     set_dtmf_pause_time,
-                    |current, direction| step_selection(
-                        current,
-                        direction,
-                        &[
-                            DtmfPause::Ms100,
-                            DtmfPause::Ms250,
-                            DtmfPause::Ms500,
-                            DtmfPause::Ms750,
-                            DtmfPause::Ms1000,
-                            DtmfPause::Ms1500,
-                            DtmfPause::Ms2000,
-                        ],
-                    ),
+                    |current, direction| step_selection(current, direction, &DtmfPause::ALL,),
                     "DTMF Pause",
                     |value| format!("{value:?}")
                 );
@@ -2953,11 +2754,7 @@ impl App {
                 adjust_typed!(
                     repeater_call_key,
                     set_repeater_call_key,
-                    |current, direction| step_selection(
-                        current,
-                        direction,
-                        &[RepeaterCallKey::CallChannel, RepeaterCallKey::Tone1750Hz,],
-                    ),
+                    |current, direction| step_selection(current, direction, &RepeaterCallKey::ALL,),
                     "Call Key",
                     |value| format!("{value:?}")
                 );
@@ -2966,15 +2763,7 @@ impl App {
                 adjust_typed!(
                     mic_sensitivity,
                     set_mic_sensitivity,
-                    |current, direction| step_selection(
-                        current,
-                        direction,
-                        &[
-                            MicSensitivity::High,
-                            MicSensitivity::Medium,
-                            MicSensitivity::Low,
-                        ],
-                    ),
+                    |current, direction| step_selection(current, direction, &MicSensitivity::ALL,),
                     "Mic Sens",
                     |value| format!("{value:?}")
                 );
@@ -3001,16 +2790,7 @@ impl App {
                 adjust_typed!(
                     backlight_control,
                     set_backlight_control,
-                    |current, direction| step_selection(
-                        current,
-                        direction,
-                        &[
-                            BacklightControl::Manual,
-                            BacklightControl::On,
-                            BacklightControl::Auto,
-                            BacklightControl::AutoDcIn,
-                        ],
-                    ),
+                    |current, direction| step_selection(current, direction, &BacklightControl::ALL,),
                     "Backlight Ctrl",
                     |value| format!("{value:?}")
                 );
@@ -3021,11 +2801,11 @@ impl App {
                     set_backlight_timer,
                     |current: BacklightTimer, direction| {
                         let seconds = if direction > 0 {
-                            current.as_seconds().saturating_add(1).min(60)
+                            current.as_seconds().saturating_add(1)
                         } else {
-                            current.as_seconds().saturating_sub(1).max(3)
+                            current.as_seconds().saturating_sub(1)
                         };
-                        BacklightTimer::new(seconds)
+                        BacklightTimer::new(seconds).or(Ok::<_, ValidationError>(current))
                     },
                     "Backlight Timer",
                     |value: BacklightTimer| format!("{} s", value.as_seconds())
@@ -3053,11 +2833,11 @@ impl App {
                     set_auto_mute_return_time,
                     |current: AutoMuteReturnDelay, direction| {
                         let seconds = if direction > 0 {
-                            current.as_seconds().saturating_add(1).min(10)
+                            current.as_seconds().saturating_add(1)
                         } else {
-                            current.as_seconds().saturating_sub(1).max(1)
+                            current.as_seconds().saturating_sub(1)
                         };
-                        AutoMuteReturnDelay::new(seconds)
+                        AutoMuteReturnDelay::new(seconds).or(Ok::<_, ValidationError>(current))
                     },
                     "Auto Mute",
                     |value: AutoMuteReturnDelay| format!("{} s", value.as_seconds())
@@ -3070,12 +2850,7 @@ impl App {
                     |current, direction| step_selection(
                         current,
                         direction,
-                        &[
-                            VoiceAnnounceMode::Off,
-                            VoiceAnnounceMode::Manual,
-                            VoiceAnnounceMode::Auto1,
-                            VoiceAnnounceMode::Auto2,
-                        ],
+                        &VoiceAnnounceMode::ALL,
                     ),
                     "Announce",
                     |value| format!("{value:?}")
@@ -3107,16 +2882,7 @@ impl App {
                 adjust_typed!(
                     voice_speed,
                     set_voice_speed,
-                    |current, direction| step_selection(
-                        current,
-                        direction,
-                        &[
-                            VoiceGuideSpeed::Speed1,
-                            VoiceGuideSpeed::Speed2,
-                            VoiceGuideSpeed::Speed3,
-                            VoiceGuideSpeed::Speed4,
-                        ],
-                    ),
+                    |current, direction| step_selection(current, direction, &VoiceGuideSpeed::ALL,),
                     "Voice Speed",
                     |value: VoiceGuideSpeed| format!("Speed {}", u8::from(value) + 1)
                 );
@@ -3128,11 +2894,7 @@ impl App {
                     |current: DisplayUnits, direction| step_selection(
                         current.speed_distance,
                         direction,
-                        &[
-                            SpeedDistanceUnit::MilesPerHour,
-                            SpeedDistanceUnit::KilometersPerHour,
-                            SpeedDistanceUnit::Knots,
-                        ],
+                        &SpeedDistanceUnit::ALL,
                     ),
                     "Speed Unit",
                     |value| match value {
@@ -3149,7 +2911,7 @@ impl App {
                     |current: DisplayUnits, direction| step_selection(
                         current.altitude_rain,
                         direction,
-                        &[AltitudeRainUnit::FeetInch, AltitudeRainUnit::MetersMm],
+                        &AltitudeRainUnit::ALL,
                     ),
                     "Alt Unit",
                     |value| match value {
@@ -3165,7 +2927,7 @@ impl App {
                     |current: DisplayUnits, direction| step_selection(
                         current.temperature,
                         direction,
-                        &[TemperatureUnit::Fahrenheit, TemperatureUnit::Celsius],
+                        &TemperatureUnit::ALL,
                     ),
                     "Temp Unit",
                     |value| match value {
@@ -3181,7 +2943,7 @@ impl App {
                     |current, direction| step_selection(
                         current,
                         direction,
-                        &[PcOutputInterface::Usb, PcOutputInterface::Bluetooth],
+                        &PcOutputInterface::ALL,
                     ),
                     "GPS PC Interface",
                     |value| match value {
@@ -3197,7 +2959,7 @@ impl App {
                     |current, direction| step_selection(
                         current,
                         direction,
-                        &[PcOutputInterface::Usb, PcOutputInterface::Bluetooth],
+                        &PcOutputInterface::ALL,
                     ),
                     "APRS PC Interface",
                     |value| match value {
@@ -3210,11 +2972,7 @@ impl App {
                 adjust_typed!(
                     language,
                     set_language,
-                    |current, direction| step_selection(
-                        current,
-                        direction,
-                        &[Language::English, Language::Japanese],
-                    ),
+                    |current, direction| step_selection(current, direction, &Language::ALL,),
                     "Language",
                     |value| match value {
                         Language::English => "English".to_owned(),
@@ -3229,18 +2987,7 @@ impl App {
                     |current, direction| step_selection(
                         current,
                         direction,
-                        &[
-                            BatterySaverInterval::Off,
-                            BatterySaverInterval::Seconds0_2,
-                            BatterySaverInterval::Seconds0_4,
-                            BatterySaverInterval::Seconds0_6,
-                            BatterySaverInterval::Seconds0_8,
-                            BatterySaverInterval::Seconds1,
-                            BatterySaverInterval::Seconds2,
-                            BatterySaverInterval::Seconds3,
-                            BatterySaverInterval::Seconds4,
-                            BatterySaverInterval::Seconds5,
-                        ],
+                        &BatterySaverInterval::ALL,
                     ),
                     "Battery Saver",
                     |value| format!("{value:?}")
@@ -3250,16 +2997,7 @@ impl App {
                 adjust_typed!(
                     auto_power_off,
                     set_auto_power_off,
-                    |current, direction| step_selection(
-                        current,
-                        direction,
-                        &[
-                            AutoPowerOff::Off,
-                            AutoPowerOff::Min15,
-                            AutoPowerOff::Min30,
-                            AutoPowerOff::Min60,
-                        ],
-                    ),
+                    |current, direction| step_selection(current, direction, &AutoPowerOff::ALL,),
                     "Auto PwrOff",
                     |value| match value {
                         AutoPowerOff::Off => "Off".to_owned(),
@@ -3283,37 +3021,37 @@ impl App {
                 self.update_station_cache(&entry);
             }
             AprsEvent::PositionReceived { source, position } => {
+                let source = source.to_string();
                 // Build a minimal cache entry from position data.
                 let known = self.aprs_stations.iter().any(|s| s.callsign == source);
                 if known {
                     if let Some(cached) =
                         self.aprs_stations.iter_mut().find(|s| s.callsign == source)
                     {
-                        cached.latitude = Some(position.latitude);
-                        cached.longitude = Some(position.longitude);
-                        cached.speed_knots = position.speed_knots;
-                        cached.course_degrees = position.course_degrees;
-                        cached.symbol_table = Some(position.symbol_table);
-                        cached.symbol_code = Some(position.symbol_code);
-                        if !position.comment.is_empty() {
-                            cached.comment = Some(position.comment);
-                        }
+                        cached.latitude = Some(position.latitude().as_degrees());
+                        cached.longitude = Some(position.longitude().as_degrees());
+                        cached.speed_knots = position.speed().map(kenwood_thd75::Speed::as_knots);
+                        cached.course_degrees =
+                            position.course().map(kenwood_thd75::Course::as_degrees);
+                        cached.symbol_table = Some(position.symbol().table_char());
+                        cached.symbol_code = Some(position.symbol().code_char());
+                        cached.comment =
+                            (!position.comment().is_empty()).then(|| position.comment().to_owned());
                         cached.last_heard = Instant::now();
-                        cached.packet_count = cached.packet_count.saturating_add(1);
                     }
                 } else {
                     self.aprs_stations.push(AprsStationCache {
                         callsign: source,
-                        latitude: Some(position.latitude),
-                        longitude: Some(position.longitude),
-                        speed_knots: position.speed_knots,
-                        course_degrees: position.course_degrees,
-                        symbol_table: Some(position.symbol_table),
-                        symbol_code: Some(position.symbol_code),
-                        comment: if position.comment.is_empty() {
+                        latitude: Some(position.latitude().as_degrees()),
+                        longitude: Some(position.longitude().as_degrees()),
+                        speed_knots: position.speed().map(kenwood_thd75::Speed::as_knots),
+                        course_degrees: position.course().map(kenwood_thd75::Course::as_degrees),
+                        symbol_table: Some(position.symbol().table_char()),
+                        symbol_code: Some(position.symbol().code_char()),
+                        comment: if position.comment().is_empty() {
                             None
                         } else {
-                            Some(position.comment)
+                            Some(position.comment().to_owned())
                         },
                         packet_count: 1,
                         last_path: Vec::new(),
@@ -3323,35 +3061,26 @@ impl App {
                 self.sort_aprs_stations();
             }
             AprsEvent::MessageReceived(msg) => {
-                self.status_message =
-                    Some(format!("APRS msg from {}: {}", msg.addressee, msg.text));
+                self.status_message = Some(format!(
+                    "APRS message to {}: {}",
+                    msg.addressee(),
+                    msg.text()
+                ));
             }
             AprsEvent::MessageDelivered(id) => {
-                if let Some(m) = self
-                    .aprs_messages
-                    .iter_mut()
-                    .find(|m| m.message_id.as_str() == id.as_str())
-                {
+                if let Some(m) = self.aprs_messages.iter_mut().find(|m| m.message_id == id) {
                     m.state = AprsMessageState::Delivered;
                 }
                 self.status_message = Some(format!("Message {id} delivered"));
             }
             AprsEvent::MessageRejected(id) => {
-                if let Some(m) = self
-                    .aprs_messages
-                    .iter_mut()
-                    .find(|m| m.message_id.as_str() == id.as_str())
-                {
+                if let Some(m) = self.aprs_messages.iter_mut().find(|m| m.message_id == id) {
                     m.state = AprsMessageState::Rejected;
                 }
                 self.status_message = Some(format!("Message {id} rejected"));
             }
             AprsEvent::MessageExpired(id) => {
-                if let Some(m) = self
-                    .aprs_messages
-                    .iter_mut()
-                    .find(|m| m.message_id.as_str() == id.as_str())
-                {
+                if let Some(m) = self.aprs_messages.iter_mut().find(|m| m.message_id == id) {
                     m.state = AprsMessageState::Expired;
                 }
                 self.status_message = Some(format!("Message {id} expired"));
@@ -3361,6 +3090,9 @@ impl App {
             }
             AprsEvent::PacketDigipeated { source } => {
                 self.status_message = Some(format!("Digipeated packet from {source}"));
+            }
+            AprsEvent::DigipeaterCapacityExceeded { queue } => {
+                self.status_message = Some(format!("APRS relay queue is full: {queue:?}"));
             }
             AprsEvent::QueryResponded { to } => {
                 self.status_message = Some(format!("Responded to query from {to}"));
@@ -3374,21 +3106,26 @@ impl App {
     /// Update the station cache from a `StationEntry`.
     fn update_station_cache(&mut self, entry: &kenwood_thd75::StationEntry) {
         let cached = AprsStationCache {
-            callsign: entry.callsign.clone(),
-            latitude: entry.position.as_ref().map(|p| p.latitude),
-            longitude: entry.position.as_ref().map(|p| p.longitude),
-            speed_knots: entry.position.as_ref().and_then(|p| p.speed_knots),
-            course_degrees: entry.position.as_ref().and_then(|p| p.course_degrees),
-            symbol_table: entry.position.as_ref().map(|p| p.symbol_table),
-            symbol_code: entry.position.as_ref().map(|p| p.symbol_code),
+            callsign: entry.address().to_string(),
+            latitude: entry.position().map(|p| p.latitude().as_degrees()),
+            longitude: entry.position().map(|p| p.longitude().as_degrees()),
+            speed_knots: entry
+                .position()
+                .and_then(kenwood_thd75::AprsPosition::speed)
+                .map(kenwood_thd75::Speed::as_knots),
+            course_degrees: entry
+                .position()
+                .and_then(kenwood_thd75::AprsPosition::course)
+                .map(kenwood_thd75::Course::as_degrees),
+            symbol_table: entry.position().map(|p| p.symbol().table_char()),
+            symbol_code: entry.position().map(|p| p.symbol().code_char()),
             comment: entry
-                .position
-                .as_ref()
-                .filter(|p| !p.comment.is_empty())
-                .map(|p| p.comment.clone()),
-            packet_count: entry.packet_count,
-            last_path: entry.last_path.clone(),
-            last_heard: entry.last_heard,
+                .position()
+                .filter(|p| !p.comment().is_empty())
+                .map(|p| p.comment().to_owned()),
+            packet_count: entry.packet_count(),
+            last_path: entry.last_path().iter().map(ToString::to_string).collect(),
+            last_heard: entry.last_heard(),
         };
 
         if let Some(idx) = self
@@ -3409,67 +3146,10 @@ impl App {
     fn sort_aprs_stations(&mut self) {
         self.aprs_stations
             .sort_by(|a, b| b.last_heard.cmp(&a.last_heard));
-    }
-
-    /// Apply a D-STAR runtime event to receive state and operator feedback.
-    fn handle_dstar_event(&mut self, event: mmdvm::dstar::DstarEvent) {
-        use mmdvm::dstar::DstarEvent;
-        match event {
-            DstarEvent::VoiceStart(header) => {
-                self.dstar_rx_active = true;
-                self.dstar_rx_header = Some(header);
-                self.dstar_text_message = None;
-            }
-            DstarEvent::VoiceData(_frame) => {
-                // Voice data: no UI action needed.
-            }
-            DstarEvent::VoiceEnd => {
-                self.dstar_rx_active = false;
-            }
-            DstarEvent::VoiceLost => {
-                self.dstar_rx_active = false;
-                self.status_message = Some("D-STAR: voice lost (no clean EOT)".into());
-            }
-            DstarEvent::EchoRecordingAborted { frame_limit } => {
-                self.status_message = Some(format!(
-                    "D-STAR: echo recording exceeded {frame_limit} frames; discarded without playback. Reception continues."
-                ));
-            }
-            DstarEvent::EventsDropped { count } => {
-                self.dstar_rx_active = false;
-                self.dstar_rx_header = None;
-                self.status_message =
-                    Some(format!("D-STAR: modem event stream lost {count} event(s)"));
-            }
-            DstarEvent::ProtocolViolation(violation) => {
-                self.status_message = Some(format!("D-STAR: {violation}"));
-            }
-            DstarEvent::TextMessage(text) => {
-                self.dstar_text_message = Some(text);
-            }
-            DstarEvent::StationHeard(entry) => {
-                // Update the last-heard list (newest first).
-                if let Some(idx) = self
-                    .dstar_last_heard
-                    .iter()
-                    .position(|e| e.callsign == entry.callsign)
-                {
-                    let _removed = self.dstar_last_heard.remove(idx);
-                }
-                self.dstar_last_heard.insert(0, entry);
-                // Limit to 100 entries.
-                self.dstar_last_heard.truncate(100);
-            }
-            DstarEvent::UrCallCommand(action) => {
-                self.status_message = Some(format!("D-STAR: URCALL command detected: {action:?}"));
-            }
-            DstarEvent::StatusUpdate(_status) => {
-                // Modem status: no UI action needed.
-            }
-            DstarEvent::ModemEvent(event) => {
-                self.status_message = Some(format!("D-STAR modem: {event:?}"));
-            }
-        }
+        self.aprs_stations.truncate(APRS_STATION_CAPACITY);
+        self.aprs_station_index = self
+            .aprs_station_index
+            .min(self.aprs_stations.len().saturating_sub(1));
     }
 
     fn toggle_gps(&mut self) {
@@ -3478,12 +3158,14 @@ impl App {
             return;
         };
         let next = !current.enabled();
-        if let Some(ref tx) = self.cmd_tx {
-            let settings = GpsSettings::new(next, current.pc_output());
-            let _send = tx.send(crate::event::RadioCommand::SetGpsSettings(settings));
-            self.status_message =
-                Some(format!("GPS {}", if next { "enabled" } else { "disabled" }));
-        }
+        let settings = current.with_enabled(next);
+        self.queue_radio_command(
+            crate::event::RadioCommand::SetGpsSettings(settings),
+            &format!(
+                "GPS change to {}",
+                if next { "enabled" } else { "disabled" }
+            ),
+        );
     }
 
     fn toggle_gps_pc_output(&mut self) {
@@ -3492,81 +3174,31 @@ impl App {
             return;
         };
         let next = !current.pc_output();
-        if let Some(ref tx) = self.cmd_tx {
-            let settings = GpsSettings::new(current.enabled(), next);
-            let _send = tx.send(crate::event::RadioCommand::SetGpsSettings(settings));
-            self.status_message = Some(format!(
-                "GPS PC Output {}",
+        let settings = current.with_pc_output(next);
+        self.queue_radio_command(
+            crate::event::RadioCommand::SetGpsSettings(settings),
+            &format!(
+                "GPS PC output change to {}",
                 if next { "enabled" } else { "disabled" }
-            ));
-        }
-    }
-
-    fn toggle_dstar_mode(&mut self) {
-        match self.dstar_mode {
-            DstarMode::Inactive => {
-                let callsign = if let McpState::Loaded { image, .. } = &self.mcp {
-                    match image.dstar().my_callsign() {
-                        Ok(Some(callsign)) => callsign,
-                        Ok(None) => {
-                            self.status_message = Some(
-                                "D-STAR MY callsign is not configured; set Menu 610 before entering gateway mode"
-                                    .into(),
-                            );
-                            return;
-                        }
-                        Err(error @ DstarReadError::MissingRange { .. }) => {
-                            self.status_message =
-                                Some(format!("D-STAR MY callsign data is incomplete: {error}"));
-                            return;
-                        }
-                        Err(error) => {
-                            self.status_message =
-                                Some(format!("D-STAR MY callsign data is invalid: {error}"));
-                            return;
-                        }
-                    }
-                } else {
-                    self.status_message = Some(
-                        "D-STAR MY callsign unavailable; load MCP data before entering gateway mode"
-                            .into(),
-                    );
-                    return;
-                };
-
-                let config = match mmdvm::dstar::DstarModemConfig::new(callsign.as_str()) {
-                    Ok(config) => config,
-                    Err(error) => {
-                        self.status_message =
-                            Some(format!("D-STAR transmit callsign is invalid: {error}"));
-                        return;
-                    }
-                };
-                if let Some(ref tx) = self.cmd_tx {
-                    let _send = tx.send(crate::event::RadioCommand::EnterDstar { config });
-                    self.status_message = Some("Entering D-STAR gateway mode...".into());
-                }
-            }
-            DstarMode::Active => {
-                if let Some(ref tx) = self.cmd_tx {
-                    let _send = tx.send(crate::event::RadioCommand::ExitDstar);
-                    self.status_message = Some("Exiting D-STAR gateway mode...".into());
-                }
-            }
-        }
-    }
-
-    fn toggle_fm_radio(&mut self) {
-        self.status_message = Some(
-            "FM Radio is read-only here: the radio answers N to FR writes; change it in Menu 700"
-                .into(),
+            ),
         );
     }
 
-    /// Apply a channel edit from the edit buffer.
+    fn show_dstar_availability(&mut self) {
+        self.status_message = Some(match kenwood_thd75::DstarGateway::<kenwood_thd75::transport::EitherTransport>::wire_configuration() {
+            Err(error) => format!("D-STAR modem monitor unavailable: {error}"),
+            Ok(_configuration) => "D-STAR modem monitoring is unavailable in this dashboard".to_owned(),
+        });
+    }
+
+    fn toggle_fm_radio(&mut self) {
+        self.status_message =
+            Some("FM controls are unavailable in this dashboard; use the radio controls".into());
+    }
+
+    /// Apply an available live control from the channel detail buffer.
     ///
-    /// This does not write the selected memory record. Mode changes only the
-    /// live band, and the remaining fields report that no editor is available.
+    /// Mode changes affect the live band. Stored fields remain read-only.
     fn apply_channel_edit(&mut self, field: ChannelEditField, buf: &str) {
         if buf.is_empty() {
             self.status_message = Some("No value entered".into());
@@ -3587,37 +3219,23 @@ impl App {
 
         match field {
             ChannelEditField::Name => {
-                // Channel name editing requires MCP write (no CAT command for name-only).
-                self.status_message = Some(format!(
-                    "Ch {ch_num}: name editing requires MCP write; use MCP panel (m)"
-                ));
+                self.status_message =
+                    Some(format!("Ch {ch_num}: stored name editing is unavailable"));
             }
             ChannelEditField::OperatingMode => {
-                // Cycle mode via CAT
-                if let Some(ref tx) = self.cmd_tx {
-                    use kenwood_thd75::types::OperatingMode;
-                    let mode = match buf.to_uppercase().as_str() {
-                        "FM" => Some(OperatingMode::Fm),
-                        "NFM" => Some(OperatingMode::Nfm),
-                        "AM" => Some(OperatingMode::Am),
-                        "DV" => Some(OperatingMode::Dv),
-                        "LSB" => Some(OperatingMode::Lsb),
-                        "USB" => Some(OperatingMode::Usb),
-                        "CW" => Some(OperatingMode::Cw),
-                        "DR" => Some(OperatingMode::Dr),
-                        "WFM" => Some(OperatingMode::Wfm),
-                        _ => None,
-                    };
-                    if let Some(mode) = mode {
-                        let _send = tx.send(crate::event::RadioCommand::SetOperatingMode {
-                            band: self.target_band,
-                            mode,
-                        });
-                        self.status_message = Some(format!("Ch {ch_num}: mode set to {mode}"));
-                    } else {
-                        self.status_message = Some(format!(
-                            "Unknown mode '{buf}' (try FM/NFM/AM/DV/LSB/USB/CW/DR/WFM)"
-                        ));
+                use kenwood_thd75::types::OperatingMode;
+                match buf.parse::<OperatingMode>() {
+                    Ok(mode) => {
+                        self.queue_radio_command(
+                            crate::event::RadioCommand::SetOperatingMode {
+                                band: self.target_band,
+                                mode,
+                            },
+                            &format!("Live band {} mode change to {mode}", self.target_band),
+                        );
+                    }
+                    Err(error) => {
+                        self.status_message = Some(format!("Invalid operating mode: {error}"));
                     }
                 }
             }
@@ -3625,11 +3243,8 @@ impl App {
             | ChannelEditField::ToneFreq
             | ChannelEditField::Duplex
             | ChannelEditField::Offset => {
-                // These fields are stored in the ME channel record. No ME
-                // writer with verified readback is exposed; permanent memory
-                // storage would instead require a verified MCP editor.
                 self.status_message = Some(format!(
-                    "Ch {ch_num}: {} editing not yet implemented; requires ME write",
+                    "Ch {ch_num}: stored {} editing is unavailable",
                     field.label()
                 ));
             }
@@ -3665,17 +3280,13 @@ impl App {
                         return;
                     }
                 };
-                if let Some(ref tx) = self.cmd_tx {
-                    let _send = tx.send(crate::event::RadioCommand::EnterAprs { config });
-                    self.status_message =
-                        Some(format!("Entering APRS mode on the selected {data_band}..."));
-                }
+                self.queue_radio_command(
+                    crate::event::RadioCommand::EnterAprs { config },
+                    &format!("APRS start on {data_band}"),
+                );
             }
             AprsMode::Active => {
-                if let Some(ref tx) = self.cmd_tx {
-                    let _send = tx.send(crate::event::RadioCommand::ExitAprs);
-                    self.status_message = Some("Exiting APRS mode...".into());
-                }
+                self.queue_radio_command(crate::event::RadioCommand::ExitAprs, "APRS stop");
             }
         }
     }
@@ -3688,37 +3299,38 @@ mod tests {
         FrontPanelPfFunction, GpsSettings, LinkedVolumeLevel, StoredFrontPanelPfAssignment,
         TncDataBand,
     };
-    use tokio::sync::mpsc::UnboundedReceiver;
+    use tokio::sync::mpsc::Receiver;
 
     use super::{
-        App, AprsMode, AprsStationCache, DstarMode, InputMode, MainView, McpState, MemoryImage,
-        Message, Pane, RadioState, SettingRow, cat_settings, next_linked_volume, next_pf_key,
+        App, AprsMode, AprsStationCache, InputMode, MainView, McpState, MemoryImage, Message, Pane,
+        RadioState, SettingRow, cat_settings, next_linked_volume, next_pf_key,
         parse_reflector_input,
     };
-    use crate::event::RadioCommand;
+    use crate::event::{RadioCommand, command_channel};
+    use crate::settings_edit::SettingsEdit;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
     #[test]
-    fn echo_abort_reports_discard_without_ending_reception() {
-        use mmdvm::dstar::DstarEvent;
-
-        let mut app = App::with_cache_path(String::new(), None);
-        app.dstar_rx_active = true;
+    fn unsupported_modem_profile_never_queues_terminal_entry() -> TestResult {
+        let (mut app, mut commands) = command_app();
+        app.show_dstar_availability();
         assert!(
-            app.update(Message::DstarEvent(DstarEvent::EchoRecordingAborted {
-                frame_limit: 3000,
-            }))
+            commands.try_recv().is_err(),
+            "unsupported modem profile queued radio I/O"
         );
-        assert!(app.dstar_rx_active);
-        assert_eq!(
-            app.status_message.as_deref(),
-            Some(
-                "D-STAR: echo recording exceeded 3000 frames; discarded without playback. Reception continues."
-            )
+        let status = app
+            .status_message
+            .ok_or("missing unsupported-profile status")?;
+        let expected=kenwood_thd75::DstarGateway::<kenwood_thd75::transport::EitherTransport>::wire_configuration();
+        let Err(error) = expected else {
+            return Err("Kenwood profile unexpectedly supported".into());
+        };
+        assert!(
+            status.contains(&error.to_string()),
+            "profile refusal was hidden: {status}"
         );
-        assert!(app.update(Message::DstarEvent(DstarEvent::VoiceEnd)));
-        assert!(!app.dstar_rx_active);
+        Ok(())
     }
 
     #[test]
@@ -3764,18 +3376,13 @@ mod tests {
         );
     }
 
-    // ── Reducer: `update(Message) -> bool` ────────────────────────
-    //
-    // `App::update` is a pure state machine whose only effect channel
-    // is `cmd_tx`, an unbounded tokio channel that works without a
-    // runtime, so these need no async harness. Each test below pins a
-    // regression this file has actually shipped.
+    fn mcp_failure() -> crate::radio_task::McpFailure {
+        crate::radio_task::McpFailure::Read(std::sync::Arc::new(
+            kenwood_thd75::Error::CatRecoveryRequired,
+        ))
+    }
 
-    /// A failed MCP write must NOT wipe the loaded image.
-    ///
-    /// The cache exists so the operator can keep working (and retry the
-    /// write) after a transient MCP failure; resetting to `Idle` on
-    /// error threw away a 55-second full-memory read.
+    /// Failed reads and uncertain writes retain the last confirmed image.
     #[test]
     fn mcp_error_preserves_a_loaded_image() -> TestResult {
         let mut app = App::with_cache_path(String::new(), None);
@@ -3786,27 +3393,38 @@ mod tests {
             "precondition: the image is loaded"
         );
 
-        assert!(app.update(Message::McpError("write failed".into())));
+        assert!(app.update(Message::McpError(mcp_failure())));
         assert!(
             matches!(app.mcp, McpState::Loaded { .. }),
             "a failed MCP write must not destroy the cached image"
         );
 
-        let image = MemoryImage::from_raw(vec![0x5A; 500_480])?;
+        let image = MemoryImage::from_raw(vec![0; 500_480])?;
+        let edit = Box::new(
+            SettingsEdit::stage(&image, |writer| writer.set_key_beep(true))?
+                .ok_or("missing edit")?,
+        );
         app.mcp = McpState::Writing {
             page: 12,
             total: 100,
             image,
+            edit,
         };
-        assert!(app.update(Message::McpError("in-flight write failed".into())));
+        assert!(app.update(Message::McpError(mcp_failure())));
         assert!(
-            matches!(app.mcp, McpState::Loaded { modified: true, .. }),
+            matches!(
+                app.mcp,
+                McpState::Loaded {
+                    requires_refresh: true,
+                    ..
+                }
+            ),
             "a real in-flight write failure must restore the retained image"
         );
 
-        // With no image loaded, an error DOES return to Idle.
+        // An error without a retained image leaves the browser idle.
         let mut fresh = App::with_cache_path(String::new(), None);
-        assert!(fresh.update(Message::McpError("read failed".into())));
+        assert!(fresh.update(Message::McpError(mcp_failure())));
         assert!(
             matches!(fresh.mcp, McpState::Idle),
             "without a loaded image, an MCP error resets to Idle"
@@ -3818,51 +3436,53 @@ mod tests {
     fn mcp_write_completion_restores_loaded_state_without_reconnect() -> TestResult {
         let mut app = App::with_cache_path(String::new(), None);
         app.connected = true;
-        let image = MemoryImage::from_raw(vec![0xA5; 500_480])?;
+        let image = MemoryImage::from_raw(vec![0; 500_480])?;
+        let edit = Box::new(
+            SettingsEdit::stage(&image, |writer| writer.set_key_beep(true))?
+                .ok_or("missing edit")?,
+        );
         app.mcp = McpState::Writing {
             page: 100,
             total: 100,
             image,
+            edit: edit.clone(),
         };
 
-        assert!(app.update(Message::McpWriteComplete));
+        assert!(app.update(Message::McpSettingApplied(edit)));
         let McpState::Loaded {
             ref image,
-            modified,
+            requires_refresh,
         } = app.mcp
         else {
             return Err("completed write must restore the loaded image".into());
         };
-        assert!(!modified, "completed write must clear the modified flag");
-        assert_eq!(image.as_raw().first().copied(), Some(0xA5));
+        assert!(!requires_refresh, "verified write needs no refresh");
+        assert!(image.settings().key_beep()?);
         assert!(app.connected, "successful MCP recovery must stay connected");
         assert_eq!(
             app.status_message.as_deref(),
-            Some("MCP write complete; radio control restored")
+            Some("Setting write verified; CAT restored; disk cache disabled")
         );
         Ok(())
     }
 
-    /// `McpByteWritten` patches the cached image in place, so the TUI
-    /// stays in sync without a full re-read after the radio's internal reset.
     #[test]
-    fn mcp_byte_written_patches_the_cached_image() -> TestResult {
-        let mut app = App::with_cache_path(String::new(), None);
-        assert!(app.update(Message::McpReadComplete(vec![0u8; 500_480])));
-
-        assert!(app.update(Message::McpByteWritten {
-            offset: 0x1000,
-            value: 0x42,
-        }));
-
-        let McpState::Loaded { ref image, .. } = app.mcp else {
-            return Err("image must still be loaded".into());
+    fn failed_replacement_read_retains_confirmed_snapshot() -> TestResult {
+        let (mut app, mut commands) = command_app();
+        assert!(app.update(Message::McpReadComplete(vec![0x5A; 500_480])));
+        app.main_view = MainView::Mcp;
+        press(&mut app, KeyCode::Char('r'));
+        assert!(matches!(commands.try_recv()?, RadioCommand::ReadMemory));
+        assert!(app.update(Message::McpReadComplete(vec![0; 3])));
+        let McpState::Loaded {
+            image,
+            requires_refresh,
+        } = app.mcp
+        else {
+            return Err("failed read lost confirmed image".into());
         };
-        assert_eq!(
-            image.as_raw().get(0x1000).copied(),
-            Some(0x42),
-            "the written byte must be patched into the cached image"
-        );
+        assert!(requires_refresh);
+        assert_eq!(image.as_raw().first(), Some(&0x5A));
         Ok(())
     }
 
@@ -3871,12 +3491,18 @@ mod tests {
     /// are read a single time; the periodic poll leaves them blank, so
     /// a naive `self.state = state` blanks the header on every tick.
     #[test]
-    fn radio_update_preserves_connect_only_fields() {
+    fn radio_update_preserves_only_connect_metadata_and_clears_unavailable_observations()
+    -> TestResult {
         let mut app = App::with_cache_path(String::new(), None);
-        let initial = RadioState {
+        assert!(app.update(Message::RadioIdentity {
             firmware_version: "1.03".to_owned(),
-            radio_type: "TH-D75A".to_owned(),
-            dstar_urcall: "CQCQCQ".to_owned(),
+            radio_type: "TH-D75A".to_owned()
+        }));
+        let initial = RadioState {
+            dstar_urcall: Some(kenwood_thd75::types::DstarCallsignEntry::new(
+                kenwood_thd75::types::DstarCallsign::new("CQCQCQ")?,
+                kenwood_thd75::types::DstarSuffix::default(),
+            )),
             ..RadioState::default()
         };
         assert!(app.update(Message::RadioUpdate(initial)));
@@ -3892,110 +3518,226 @@ mod tests {
             app.state.radio_type, "TH-D75A",
             "radio type must survive a poll that omits it"
         );
-        assert_eq!(
-            app.state.dstar_urcall, "CQCQCQ",
-            "D-STAR URCALL must survive a poll that omits it"
+        assert!(
+            app.state.dstar_urcall.is_none(),
+            "failed URCALL read preserved stale state"
         );
         assert!(app.connected, "a RadioUpdate marks the link connected");
+        Ok(())
     }
 
     /// A poll that DOES carry a value must overwrite the old one:
     /// the preservation above must not become a write-once latch.
     #[test]
-    fn radio_update_overwrites_fields_the_poll_provides() {
+    fn radio_update_overwrites_fields_the_poll_provides() -> TestResult {
         let mut app = App::with_cache_path(String::new(), None);
         let initial = RadioState {
-            dstar_urcall: "CQCQCQ".to_owned(),
+            dstar_urcall: Some(kenwood_thd75::types::DstarCallsignEntry::new(
+                kenwood_thd75::types::DstarCallsign::new("CQCQCQ")?,
+                kenwood_thd75::types::DstarSuffix::default(),
+            )),
             ..RadioState::default()
         };
         assert!(app.update(Message::RadioUpdate(initial)));
 
         let updated = RadioState {
-            dstar_urcall: "W1AW".to_owned(),
+            dstar_urcall: Some(kenwood_thd75::types::DstarCallsignEntry::new(
+                kenwood_thd75::types::DstarCallsign::new("W1AW")?,
+                kenwood_thd75::types::DstarSuffix::default(),
+            )),
             ..RadioState::default()
         };
         assert!(app.update(Message::RadioUpdate(updated)));
 
         assert_eq!(
-            app.state.dstar_urcall, "W1AW",
+            app.state
+                .dstar_urcall
+                .as_ref()
+                .map(|entry| entry.callsign.as_str()),
+            Some("W1AW"),
             "a poll that carries a URCALL must replace the cached one"
         );
+        Ok(())
     }
 
-    fn dstar_gateway_app() -> (App, UnboundedReceiver<RadioCommand>) {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    fn command_app() -> (App, Receiver<RadioCommand>) {
+        let (feedback, _feedback_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, rx) = command_channel(feedback);
         let mut app = App::with_cache_path(String::new(), None);
         app.cmd_tx = Some(tx);
         (app, rx)
     }
 
     #[test]
-    fn dstar_gateway_uses_the_validated_mcp_callsign() -> TestResult {
-        let (mut app, mut rx) = dstar_gateway_app();
-        let mut raw = vec![0u8; 500_480];
-        raw.get_mut(0x1CA8..0x1CB0)
-            .ok_or("MY-callsign field missing from test image")?
-            .copy_from_slice(b"KQ4NIT  ");
-        assert!(app.update(Message::McpReadComplete(raw)));
-
-        app.toggle_dstar_mode();
-        match rx.try_recv()? {
-            RadioCommand::EnterDstar { config } => {
-                assert_eq!(config.callsign().text()?, "KQ4NIT");
-            }
-            other => return Err(format!("expected EnterDstar, got {other:?}").into()),
-        }
+    fn dstar_controls_distinguish_queue_acceptance_from_closed_or_missing_worker() -> TestResult {
+        let (mut app, mut commands) = command_app();
+        app.main_view = MainView::Dstar;
+        app.focus = Pane::Main;
+        press(&mut app, KeyCode::Char('C'));
+        assert!(matches!(commands.try_recv()?, RadioCommand::SetCQ));
         assert_eq!(
             app.status_message.as_deref(),
-            Some("Entering D-STAR gateway mode...")
+            Some("CQ preparation: queued")
+        );
+
+        drop(commands);
+        app.dstar_reflector_input = Some("REF030 C".to_owned());
+        press(&mut app, KeyCode::Enter);
+        let rejected = app
+            .status_message
+            .as_deref()
+            .ok_or("missing rejection status")?;
+        assert!(rejected.contains("not queued"), "{rejected}");
+        assert!(rejected.contains("closed"), "{rejected}");
+        assert!(
+            !rejected.contains("key up"),
+            "unaccepted routing change invited transmission"
+        );
+
+        app.cmd_tx = None;
+        press(&mut app, KeyCode::Char('U'));
+        let unavailable = app
+            .status_message
+            .as_deref()
+            .ok_or("missing unavailable status")?;
+        assert!(unavailable.contains("not queued"), "{unavailable}");
+        assert!(unavailable.contains("unavailable"), "{unavailable}");
+        Ok(())
+    }
+
+    #[test]
+    fn full_or_rejected_setting_queue_never_commits_the_candidate() -> TestResult {
+        let (mut app, mut commands) = command_app();
+        let image =
+            MemoryImage::from_raw(vec![0; kenwood_thd75::protocol::programming::TOTAL_SIZE])?;
+        let edit = SettingsEdit::stage(&image, |writer| writer.set_key_beep(true))?
+            .ok_or("missing edit")?;
+        app.mcp = McpState::Loaded {
+            image,
+            requires_refresh: false,
+        };
+        let sender = app.cmd_tx.as_ref().ok_or("missing command sender")?.clone();
+        while sender
+            .send(RadioCommand::FreqUp(kenwood_thd75::types::Band::A))
+            .is_ok()
+        {}
+        app.queue_setting_edit(edit.clone(), "Key beep");
+        let McpState::Loaded { ref image, .. } = app.mcp else {
+            return Err("rejected queue changed MCP state".into());
+        };
+        assert!(
+            !image.settings().key_beep()?,
+            "unaccepted write changed displayed value"
+        );
+        while commands.try_recv().is_ok() {}
+        app.queue_setting_edit(edit, "Key beep");
+        assert!(
+            !app.confirmed_image()
+                .ok_or("pending write hid confirmed image")?
+                .settings()
+                .key_beep()?,
+            "pending write changed displayed snapshot"
+        );
+        let RadioCommand::ApplySetting(pending) = commands.try_recv()? else {
+            return Err("missing setting command".into());
+        };
+        assert!(app.update(Message::CommandRejected {
+            command: RadioCommand::ApplySetting(pending),
+            reason: crate::event::CommandRejection::WrongMode
+        }));
+        let McpState::Loaded {
+            ref image,
+            requires_refresh,
+        } = app.mcp
+        else {
+            return Err("worker rejection lost MCP image".into());
+        };
+        assert!(!requires_refresh);
+        assert!(
+            !image.settings().key_beep()?,
+            "worker rejection committed a candidate"
         );
         Ok(())
     }
 
     #[test]
-    fn dstar_gateway_refuses_to_fabricate_an_unconfigured_callsign() {
-        let (mut app, mut rx) = dstar_gateway_app();
-        assert!(app.update(Message::McpReadComplete(vec![0u8; 500_480])));
-
-        app.toggle_dstar_mode();
+    fn missing_observations_and_blind_image_shortcut_never_queue_writes() -> TestResult {
+        let (mut app, mut commands) = command_app();
+        for pane in [Pane::BandA, Pane::BandB] {
+            app.focus = pane;
+            for key in ['p', 't', '[', ']'] {
+                press(&mut app, KeyCode::Char(key));
+            }
+        }
+        app.main_view = MainView::SettingsCat;
+        for target in [
+            SettingRow::Bluetooth,
+            SettingRow::VoxEnabled,
+            SettingRow::AttenuatorA,
+            SettingRow::AttenuatorB,
+            SettingRow::DualBand,
+        ] {
+            app.settings_cat_index = cat_settings()
+                .iter()
+                .position(|row| *row == target)
+                .ok_or("missing CAT row")?;
+            app.toggle_setting();
+        }
+        app.main_view = MainView::Mcp;
+        press(&mut app, KeyCode::Char('w'));
+        app.main_view = MainView::Aprs;
+        app.focus = Pane::Main;
+        app.aprs_mode = AprsMode::Active;
+        press(&mut app, KeyCode::Char('b'));
         assert!(
-            rx.try_recv().is_err(),
-            "an unconfigured MY callsign must not emit EnterDstar"
+            commands.try_recv().is_err(),
+            "unavailable state or unsupported shortcut queued radio I/O"
         );
-        assert_eq!(
-            app.status_message.as_deref(),
-            Some("D-STAR MY callsign is not configured; set Menu 610 before entering gateway mode")
-        );
+        Ok(())
     }
 
     #[test]
-    fn dstar_gateway_surfaces_invalid_or_unavailable_mcp_data() -> TestResult {
-        let (mut unavailable, mut unavailable_rx) = dstar_gateway_app();
-        unavailable.toggle_dstar_mode();
-        assert!(unavailable_rx.try_recv().is_err());
+    fn aprs_display_history_and_station_rows_stay_bounded() -> TestResult {
+        let mut app = App::with_cache_path(String::new(), None);
+        for index in 0..=super::APRS_HISTORY_CAPACITY {
+            assert!(app.update(Message::AprsMessageQueued {
+                addressee: kenwood_thd75::DirectMessageAddressee::new("W1AW")?,
+                text: kenwood_thd75::MessageText::new("fixture")?,
+                message_id: kenwood_thd75::MessageId::new(&index.to_string())?,
+            }));
+        }
+        assert_eq!(app.aprs_messages.len(), 128);
         assert_eq!(
-            unavailable.status_message.as_deref(),
-            Some("D-STAR MY callsign unavailable; load MCP data before entering gateway mode")
+            app.aprs_messages
+                .first()
+                .map(|message| message.message_id.as_str()),
+            Some("1")
         );
-
-        let (mut invalid, mut invalid_rx) = dstar_gateway_app();
-        let mut raw = vec![0u8; 500_480];
-        *raw.get_mut(0x1CA1)
-            .ok_or("MY-callsign selector missing from test image")? = 6;
-        assert!(invalid.update(Message::McpReadComplete(raw)));
-        invalid.toggle_dstar_mode();
-        assert!(invalid_rx.try_recv().is_err());
-        let status = invalid
-            .status_message
-            .as_deref()
-            .ok_or("invalid MCP data must set a status message")?;
+        let now = std::time::Instant::now();
+        for index in 0..=super::APRS_STATION_CAPACITY {
+            app.aprs_stations.push(AprsStationCache {
+                callsign: format!("W{index}"),
+                latitude: None,
+                longitude: None,
+                speed_knots: None,
+                course_degrees: None,
+                symbol_table: None,
+                symbol_code: None,
+                comment: None,
+                packet_count: 1,
+                last_path: Vec::new(),
+                last_heard: now
+                    .checked_add(std::time::Duration::from_millis(u64::try_from(index)?))
+                    .ok_or("fixture clock overflow")?,
+            });
+        }
+        app.sort_aprs_stations();
+        assert_eq!(app.aprs_stations.len(), 256);
         assert!(
-            status.starts_with("D-STAR MY callsign data is invalid:"),
-            "unexpected status: {status}"
-        );
-        assert!(
-            status.contains("invalid value 6"),
-            "unexpected status: {status}"
+            !app.aprs_stations
+                .iter()
+                .any(|station| station.callsign == "W0"),
+            "oldest station was retained over a newer observation"
         );
         Ok(())
     }
@@ -4006,10 +3748,16 @@ mod tests {
     #[test]
     fn mcp_progress_does_not_downgrade_a_write_to_a_read() -> TestResult {
         let mut app = App::with_cache_path(String::new(), None);
+        let image = MemoryImage::from_raw(vec![0; 500_480])?;
+        let edit = Box::new(
+            SettingsEdit::stage(&image, |writer| writer.set_key_beep(true))?
+                .ok_or("missing edit")?,
+        );
         app.mcp = McpState::Writing {
             page: 0,
             total: 100,
-            image: MemoryImage::from_raw(vec![0; 500_480])?,
+            image,
+            edit,
         };
 
         assert!(app.update(Message::McpProgress {
@@ -4022,8 +3770,12 @@ mod tests {
             app.mcp
         );
 
-        // From Idle, progress means a read is underway.
         let mut reader = App::with_cache_path(String::new(), None);
+        reader.mcp = McpState::Reading {
+            page: 0,
+            total: 100,
+            cached: None,
+        };
         assert!(reader.update(Message::McpProgress {
             page: 3,
             total: 100,
@@ -4061,24 +3813,13 @@ mod tests {
         let aprs_status = app.status_message.as_deref().unwrap_or_default();
         assert!(aprs_status.contains("without usable CAT control"));
         assert!(!aprs_status.contains("polling resumed"));
-
-        app.connected = true;
-        assert!(app.update(Message::DstarStarted));
-        assert!(app.update(Message::DstarRecoveryFailed(
-            "transport reopen failed".into()
-        )));
-        assert_eq!(app.dstar_mode, DstarMode::Inactive);
-        assert!(!app.connected);
-        let dstar_status = app.status_message.as_deref().unwrap_or_default();
-        assert!(dstar_status.contains("without usable CAT control"));
-        assert!(!dstar_status.contains("polling resumed"));
     }
 
     #[test]
     fn parse_single_token_splits_trailing_module() -> TestResult {
         let (name, module) = parse_reflector_input("REF030C").ok_or("expected REF030C to parse")?;
-        assert_eq!(name, "REF030", "reflector name");
-        assert_eq!(module, 'C', "reflector module");
+        assert_eq!(name.to_string(), "REF030", "reflector name");
+        assert_eq!(module.as_char(), 'C', "reflector module");
         Ok(())
     }
 
@@ -4086,8 +3827,8 @@ mod tests {
     fn parse_two_token_form() -> TestResult {
         let (name, module) =
             parse_reflector_input("REF030 C").ok_or("expected `REF030 C` to parse")?;
-        assert_eq!(name, "REF030", "reflector name");
-        assert_eq!(module, 'C', "reflector module");
+        assert_eq!(name.to_string(), "REF030", "reflector name");
+        assert_eq!(module.as_char(), 'C', "reflector module");
         Ok(())
     }
 
@@ -4095,8 +3836,8 @@ mod tests {
     fn parse_uppercases_name() -> TestResult {
         let (name, module) =
             parse_reflector_input("xlx757 B").ok_or("expected `xlx757 B` to parse")?;
-        assert_eq!(name, "XLX757", "reflector name");
-        assert_eq!(module, 'B', "reflector module");
+        assert_eq!(name.to_string(), "XLX757", "reflector name");
+        assert_eq!(module.as_char(), 'B', "reflector module");
         Ok(())
     }
 
@@ -4122,9 +3863,7 @@ mod tests {
 
     #[test]
     fn parse_rejects_short_empty_and_non_ascii_without_panic() {
-        // "é" is 2 bytes: the pre-fix code byte-sliced `len - 1` and panicked
-        // mid-char. The parser must reject these instead (single-token inputs
-        // need >= 4 chars and an ASCII uppercase module letter).
+        // Reject incomplete names and non-ASCII suffixes before byte slicing.
         for input in ["", " ", "AB", "ABC", "é", "REFé"] {
             let parsed = parse_reflector_input(input);
             assert!(
@@ -4136,18 +3875,14 @@ mod tests {
 
     /// An `App` in D-STAR reflector-input mode with a command channel
     /// attached, plus the receiving end for asserting on emitted commands.
-    fn reflector_app() -> (App, UnboundedReceiver<RadioCommand>) {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut app = App::with_cache_path(String::new(), None);
-        app.cmd_tx = Some(tx);
+    fn reflector_app() -> (App, Receiver<RadioCommand>) {
+        let (mut app, rx) = command_app();
         app.dstar_reflector_input = Some(String::new());
         (app, rx)
     }
 
-    fn aprs_compose_app() -> (App, UnboundedReceiver<RadioCommand>) {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut app = App::with_cache_path(String::new(), None);
-        app.cmd_tx = Some(tx);
+    fn aprs_compose_app() -> (App, Receiver<RadioCommand>) {
+        let (mut app, rx) = command_app();
         app.aprs_compose = Some(String::new());
         app.aprs_stations.push(AprsStationCache {
             callsign: "W1AW".to_owned(),
@@ -4200,15 +3935,13 @@ mod tests {
     fn vox_delay_adjust_clamps_to_the_lib_maximum_and_reports_only_sent_values() -> TestResult {
         use kenwood_thd75::types::VoxDelay;
 
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut app = App::with_cache_path(String::new(), None);
-        app.cmd_tx = Some(tx);
+        let (mut app, mut rx) = command_app();
         app.main_view = MainView::SettingsCat;
         app.settings_cat_index = cat_settings()
             .iter()
             .position(|row| matches!(row, SettingRow::VoxDelay))
             .ok_or("VOX delay row missing from the CAT settings table")?;
-        app.state.vox_delay = VoxDelay::MS_3000;
+        app.state.vox_delay = Some(VoxDelay::MS_3000);
 
         app.adjust_setting(1);
 
@@ -4225,18 +3958,13 @@ mod tests {
         Ok(())
     }
 
-    fn app_with_gps_settings(settings: GpsSettings) -> (App, UnboundedReceiver<RadioCommand>) {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut app = App::with_cache_path(String::new(), None);
-        app.cmd_tx = Some(tx);
+    fn app_with_gps_settings(settings: GpsSettings) -> (App, Receiver<RadioCommand>) {
+        let (mut app, rx) = command_app();
         app.state.gps_settings = Some(settings);
         (app, rx)
     }
 
-    fn assert_gps_settings(
-        rx: &mut UnboundedReceiver<RadioCommand>,
-        expected: GpsSettings,
-    ) -> TestResult {
+    fn assert_gps_settings(rx: &mut Receiver<RadioCommand>, expected: GpsSettings) -> TestResult {
         match rx.try_recv()? {
             RadioCommand::SetGpsSettings(actual) => {
                 assert_eq!(actual, expected);
@@ -4248,13 +3976,21 @@ mod tests {
 
     #[test]
     fn gps_shortcuts_preserve_the_other_settings_field() -> TestResult {
-        let (mut gps_app, mut gps_rx) = app_with_gps_settings(GpsSettings::new(false, true));
+        let (mut gps_app, mut gps_rx) =
+            app_with_gps_settings(GpsSettings::new().with_pc_output(true));
         gps_app.toggle_gps();
-        assert_gps_settings(&mut gps_rx, GpsSettings::new(true, true))?;
+        assert_gps_settings(
+            &mut gps_rx,
+            GpsSettings::new().with_enabled(true).with_pc_output(true),
+        )?;
 
-        let (mut output_app, mut output_rx) = app_with_gps_settings(GpsSettings::new(true, false));
+        let (mut output_app, mut output_rx) =
+            app_with_gps_settings(GpsSettings::new().with_enabled(true));
         output_app.toggle_gps_pc_output();
-        assert_gps_settings(&mut output_rx, GpsSettings::new(true, true))
+        assert_gps_settings(
+            &mut output_rx,
+            GpsSettings::new().with_enabled(true).with_pc_output(true),
+        )
     }
 
     #[test]
@@ -4269,24 +4005,30 @@ mod tests {
             .position(|row| *row == SettingRow::GpsPcOutput)
             .ok_or("GPS PC output row missing")?;
 
-        let (mut gps_app, mut gps_rx) = app_with_gps_settings(GpsSettings::new(false, true));
+        let (mut gps_app, mut gps_rx) =
+            app_with_gps_settings(GpsSettings::new().with_pc_output(true));
         gps_app.main_view = MainView::SettingsCat;
         gps_app.settings_cat_index = gps_enabled_index;
         gps_app.toggle_setting();
-        assert_gps_settings(&mut gps_rx, GpsSettings::new(true, true))?;
+        assert_gps_settings(
+            &mut gps_rx,
+            GpsSettings::new().with_enabled(true).with_pc_output(true),
+        )?;
 
-        let (mut output_app, mut output_rx) = app_with_gps_settings(GpsSettings::new(true, false));
+        let (mut output_app, mut output_rx) =
+            app_with_gps_settings(GpsSettings::new().with_enabled(true));
         output_app.main_view = MainView::SettingsCat;
         output_app.settings_cat_index = gps_output_index;
         output_app.toggle_setting();
-        assert_gps_settings(&mut output_rx, GpsSettings::new(true, true))
+        assert_gps_settings(
+            &mut output_rx,
+            GpsSettings::new().with_enabled(true).with_pc_output(true),
+        )
     }
 
     #[test]
     fn gps_toggles_refuse_when_current_settings_are_unavailable() -> TestResult {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut app = App::with_cache_path(String::new(), None);
-        app.cmd_tx = Some(tx);
+        let (mut app, mut rx) = command_app();
 
         app.toggle_gps();
         assert!(
@@ -4326,9 +4068,7 @@ mod tests {
 
     #[test]
     fn band_panes_do_not_offer_arbitrary_frequency_entry() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut app = App::with_cache_path(String::new(), None);
-        app.cmd_tx = Some(tx);
+        let (mut app, mut rx) = command_app();
 
         for pane in [Pane::BandA, Pane::BandB] {
             app.focus = pane;
@@ -4347,9 +4087,7 @@ mod tests {
 
     #[test]
     fn aprs_mode_refuses_to_invent_a_station_identity() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut app = App::with_cache_path(String::new(), None);
-        app.cmd_tx = Some(tx);
+        let (mut app, mut rx) = command_app();
 
         app.toggle_aprs_mode();
 
@@ -4365,9 +4103,7 @@ mod tests {
 
     #[test]
     fn aprs_mode_uses_the_live_radio_callsign() -> TestResult {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut app = App::with_cache_path(String::new(), None);
-        app.cmd_tx = Some(tx);
+        let (mut app, mut rx) = command_app();
         app.state.aprs_callsign = Some(kenwood_thd75::types::AprsCallsign::new("KQ4NIT-9")?);
         app.target_band = kenwood_thd75::types::Band::B;
 
@@ -4380,7 +4116,7 @@ mod tests {
                 assert_eq!(config.data_band(), TncDataBand::B);
                 assert_eq!(
                     app.status_message.as_deref(),
-                    Some("Entering APRS mode on the selected Band B...")
+                    Some("APRS start on Band B: queued")
                 );
                 Ok(())
             }
@@ -4395,15 +4131,15 @@ mod tests {
     }
 
     fn assert_prepare_link(
-        rx: &mut UnboundedReceiver<RadioCommand>,
+        rx: &mut Receiver<RadioCommand>,
         expected_name: &str,
         expected_module: char,
     ) -> TestResult {
         let cmd = rx.try_recv()?;
         match cmd {
             RadioCommand::PrepareReflectorLink { name, module } => {
-                assert_eq!(name, expected_name, "reflector name");
-                assert_eq!(module, expected_module, "reflector module");
+                assert_eq!(name.to_string(), expected_name, "reflector name");
+                assert_eq!(module.as_char(), expected_module, "reflector module");
                 Ok(())
             }
             other => Err(format!("expected PrepareReflectorLink, got {other:?}").into()),

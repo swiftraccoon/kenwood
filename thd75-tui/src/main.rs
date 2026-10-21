@@ -1,220 +1,301 @@
-//! Ratatui dashboard for the Kenwood TH-D75 transceiver.
-//!
-//! Built on top of [`kenwood_thd75`]. Displays live VFO state, S-meter,
-//! squelch, and channel memories pulled from the radio over USB CDC or
-//! Bluetooth SPP, plus APRS, D-STAR reflector, GPS, and FM-radio panels.
-//! Edits to channel memory and radio settings round-trip back to the radio.
-//!
-//! Run with `cargo run -p thd75-tui` for auto-discovery, or pass
-//! `--port /dev/cu.TH-D75` for a paired Bluetooth radio.
+#![doc = include_str!("../README.md")]
 
-mod app;
-mod event;
-mod radio_task;
-mod ui;
+use std::io::{self, BufRead, Write};
+use std::num::NonZeroU32;
 
-use std::io::{self, Write};
-use std::time::Duration;
-
-use app::App;
 use clap::Parser;
-use crossterm::execute;
-use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-};
 use kenwood_thd75::LinkDiagnosis;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
-/// Terminal UI for the Kenwood TH-D75 transceiver.
+use crate::app::App;
+
+mod app;
+mod cache;
+mod event;
+mod radio_task;
+mod settings_edit;
+mod terminal;
+mod ui;
+
+/// Maximum complete guidance line retained before retry refusal.
+const GUIDANCE_INPUT_CAPACITY: u64 = 1024;
+
+/// Terminal dashboard for the Kenwood TH-D75 transceiver.
 #[derive(Parser, Debug)]
 #[command(version, about)]
 struct Cli {
-    /// Serial port path (default: auto-discover USB, then Bluetooth).
+    /// Serial port path; omission discovers one USB port, then native Bluetooth.
     #[arg(short, long)]
     port: Option<String>,
-
-    /// Baud rate for CAT commands.
-    #[arg(short, long, default_value_t = 115_200)]
-    baud: u32,
-
-    /// If the radio is found in Reflector Terminal Mode, guide an exit
-    /// (prompt for the Menu 650 change) and reconnect, instead of just
-    /// reporting it and quitting.
+    /// Nonzero serial CAT baud rate.
+    #[arg(short, long, default_value = "115200")]
+    baud: NonZeroU32,
+    /// Offer a retry after a diagnosed Terminal-mode connection failure.
     #[arg(long)]
     exit_terminal_mode: bool,
 }
 
-/// What [`run_app`] did before returning control to `main`.
+#[derive(Debug)]
 enum RunOutcome {
-    /// The dashboard ran and the operator quit.
     Quit,
-    /// The radio connection was never established. Carries the rendered
-    /// failure message and, when available, the link diagnosis.
-    ConnectFailed(radio_task::ConnectFailure),
+    ConnectFailed(Box<radio_task::ConnectFailure>),
 }
 
-/// Set up file logging when `RUST_LOG` is present. A read-only cwd
-/// must not abort the TUI just because `RUST_LOG` was set: run
-/// without file logging and say so.
+/// Independent UI, keyboard, radio and terminal cleanup outcomes.
+#[derive(Debug, Default)]
+struct RunFailure {
+    operation: Option<Box<dyn std::error::Error + Send + Sync>>,
+    keyboard: Option<event::KeyboardPanicked>,
+    radio: Option<radio_task::WorkerCompletion>,
+    join: Option<tokio::task::JoinError>,
+    terminal: Vec<terminal::TerminalError>,
+}
+impl RunFailure {
+    fn is_empty(&self) -> bool {
+        self.operation.is_none()
+            && self.keyboard.is_none()
+            && self.radio.is_none()
+            && self.join.is_none()
+            && self.terminal.is_empty()
+    }
+}
+impl std::fmt::Display for RunFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(error) = &self.operation {
+            writeln!(formatter, "Dashboard failed: {error}")?;
+        }
+        if let Some(error) = &self.keyboard {
+            writeln!(formatter, "{error}")?;
+        }
+        if let Some(error) = &self.radio {
+            writeln!(formatter, "{error}")?;
+        }
+        if let Some(error) = &self.join {
+            writeln!(formatter, "Radio task failed: {error}")?;
+        }
+        for error in &self.terminal {
+            writeln!(formatter, "{error}")?;
+        }
+        Ok(())
+    }
+}
+impl std::error::Error for RunFailure {}
+
 fn init_logging() {
-    if std::env::var("RUST_LOG").is_ok() {
+    if std::env::var_os("RUST_LOG").is_some() {
         match std::fs::File::create("thd75-tui.log") {
-            Ok(log_file) => {
-                tracing_subscriber::fmt()
+            Ok(file) => {
+                if let Err(error) = tracing_subscriber::fmt()
                     .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-                    .with_writer(log_file)
+                    .with_writer(file)
                     .with_ansi(false)
-                    .init();
+                    .try_init()
+                {
+                    eprintln!("Logging unavailable: {error}");
+                }
             }
-            Err(err) => {
-                eprintln!("warning: cannot create thd75-tui.log ({err}); logging disabled");
-            }
+            Err(error) => eprintln!("Cannot create thd75-tui.log: {error}; logging disabled"),
         }
     }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
-
     init_logging();
-
-    let original_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |panic_info| {
-        let _cleanup = disable_raw_mode();
-        let _cleanup = execute!(io::stdout(), LeaveAlternateScreen);
-        original_hook(panic_info);
-    }));
-
-    // Connection-attempt loop. The body brings up the dashboard once; it
-    // repeats only when `--exit-terminal-mode` is set and the radio is
-    // found in Reflector Terminal Mode, after the operator has been
-    // guided through the Menu 650 change.
-    'retry: loop {
-        // Open the initial transport before terminal setup so connection
-        // errors can be rendered cleanly. Native macOS Bluetooth runs in its
-        // own helper process and does not use this thread's CFRunLoop.
-        let transport = radio_task::discover_and_open_transport(cli.port.as_deref(), cli.baud);
-
-        // Terminal setup on main thread before spawning
-        enable_raw_mode()?;
-        let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen)?;
-        let backend = CrosstermBackend::new(stdout);
-        let mut terminal = Terminal::new(backend)?;
-
-        let (done_tx, done_rx) = std::sync::mpsc::channel::<Result<RunOutcome, String>>();
-
-        let _thread = std::thread::spawn(move || {
-            let rt = match tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(rt) => rt,
-                Err(err) => {
-                    // Restore the terminal before reporting through the
-                    // completion channel watched by the main thread.
-                    let _cleanup = disable_raw_mode();
-                    let _cleanup = execute!(terminal.backend_mut(), LeaveAlternateScreen);
-                    let _cleanup = terminal.show_cursor();
-                    let _send = done_tx.send(Err(format!("failed to build tokio runtime: {err}")));
-                    return;
-                }
-            };
-
-            let result = rt.block_on(async {
-                run_app(&mut terminal, transport)
-                    .await
-                    .map_err(|e| e.to_string())
-            });
-
-            let _cleanup = disable_raw_mode();
-            let _cleanup = execute!(terminal.backend_mut(), LeaveAlternateScreen);
-            let _cleanup = terminal.show_cursor();
-
-            let _send = done_tx.send(result);
-        });
-
-        let outcome = done_rx.recv().unwrap_or_else(|error| {
-            Err(format!("radio UI worker exited without a result: {error}"))
-        });
-
-        match outcome {
-            Ok(RunOutcome::Quit) => break 'retry,
-            Ok(RunOutcome::ConnectFailed(failure)) => {
-                // The teardown above already restored the terminal, so the
-                // guidance and prompt below print to a plain screen.
-                if cli.exit_terminal_mode && failure.diagnosis == Some(LinkDiagnosis::MmdvmMode) {
-                    guide_terminal_mode_exit(&failure.message);
-                    continue 'retry;
-                }
-                eprintln!("{}", failure.message);
-                break 'retry;
-            }
-            Err(e) => {
-                eprintln!("Error: {e}");
-                break 'retry;
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// Print the Reflector Terminal Mode guidance, then block until the
-/// operator confirms they have changed Menu 650.
-///
-/// Used only under `--exit-terminal-mode`: the caller retries the
-/// connection once this returns. A short delay covers the radio's
-/// reboot after the menu change (USB re-enumerates).
-fn guide_terminal_mode_exit(message: &str) {
-    println!("\n{message}\n");
-    print!("Set Menu 650 to Off on the radio, then press Enter to retry (Ctrl-C to quit)... ");
-    let _flush = io::stdout().flush();
-    let mut line = String::new();
-    let _bytes = io::stdin().read_line(&mut line);
-    println!("Reconnecting...");
-    std::thread::sleep(Duration::from_secs(4));
-}
-
-async fn run_app(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    transport: Result<(String, kenwood_thd75::transport::EitherTransport), String>,
-) -> Result<RunOutcome, Box<dyn std::error::Error>> {
-    let mut events = event::EventHandler::new();
-    let tx = events.sender();
-    let cmd_rx = events.take_command_receiver();
-
-    let (path, transport) = match transport {
-        Ok(found) => found,
-        Err(e) => {
-            return Ok(RunOutcome::ConnectFailed(
-                radio_task::ConnectFailure::generic(format!("Could not find the radio: {e}")),
-            ));
-        }
-    };
-
-    let port_display = match radio_task::spawn_with_transport(path, transport, tx, cmd_rx).await {
-        Ok(p) => p,
-        Err(failure) => return Ok(RunOutcome::ConnectFailed(failure)),
-    };
-
-    let mut app = App::new(port_display);
-    app.connected = true;
-    app.cmd_tx = Some(events.command_sender());
-
-    let _ = terminal.draw(|frame| ui::render(&app, frame))?;
-
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let mut retry = None;
     loop {
-        let msg = events.next().await;
-        let needs_render = app.update(msg);
-        if app.should_quit {
-            break;
-        }
-        if needs_render {
-            let _ = terminal.draw(|frame| ui::render(&app, frame))?;
+        match runtime.block_on(run_app(&cli, retry.take()))? {
+            RunOutcome::Quit => return Ok(()),
+            RunOutcome::ConnectFailed(mut failure) => {
+                if cli.exit_terminal_mode
+                    && failure.diagnosis == Some(LinkDiagnosis::MmdvmMode)
+                    && failure.release.is_none()
+                {
+                    if guide_terminal_mode_exit(
+                        &failure.message,
+                        &mut io::stdin().lock(),
+                        &mut io::stdout(),
+                    )? {
+                        retry = failure.take_retry_endpoint();
+                        if retry.is_some() {
+                            continue;
+                        }
+                    }
+                } else {
+                    eprintln!("{failure}");
+                }
+                return Err(failure);
+            }
         }
     }
+}
 
-    Ok(RunOutcome::Quit)
+/// Retry only after a complete input line; EOF and input/output failures stop guidance.
+fn guide_terminal_mode_exit(
+    message: &str,
+    input: &mut impl BufRead,
+    output: &mut impl Write,
+) -> io::Result<bool> {
+    writeln!(output, "{message}")?;
+    write!(
+        output,
+        "Set Menu 650 to Off, then press Enter to retry; EOF quits: "
+    )?;
+    output.flush()?;
+    let mut line = Vec::new();
+    let _bytes = io::Read::take(input, GUIDANCE_INPUT_CAPACITY + 1).read_until(b'\n', &mut line)?;
+    if u64::try_from(line.len()).map_err(io::Error::other)? > GUIDANCE_INPUT_CAPACITY {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "retry input exceeds 1024 bytes",
+        ));
+    }
+    Ok(line.last() == Some(&b'\n'))
+}
+
+fn apply_ui_message(app: &mut App, message: app::Message) -> io::Result<bool> {
+    match message {
+        app::Message::TerminalFailure(error) => Err(error),
+        message => Ok(app.update(message)),
+    }
+}
+
+async fn run_app(cli: &Cli, retry: Option<radio_task::Endpoint>) -> Result<RunOutcome, RunFailure> {
+    let request = retry.map_or_else(
+        || radio_task::ConnectionRequest::Discover {
+            port: cli.port.clone(),
+            baud: cli.baud,
+        },
+        radio_task::ConnectionRequest::Retained,
+    );
+    let baud = cli.baud;
+    let transport = tokio::task::spawn_blocking(move || request.open()).await;
+    let (path, transport) = match transport {
+        Ok(Ok(transport)) => transport,
+        Ok(Err(error)) => {
+            return Ok(RunOutcome::ConnectFailed(Box::new(
+                radio_task::ConnectFailure::generic(error),
+            )));
+        }
+        Err(error) => {
+            return Err(RunFailure {
+                operation: Some(Box::new(error)),
+                ..RunFailure::default()
+            });
+        }
+    };
+    let (mut events, commands) = event::EventHandler::new();
+    let (path, mut worker) =
+        match radio_task::spawn_with_transport(path, baud, transport, events.sender(), commands)
+            .await
+        {
+            Ok(connected) => connected,
+            Err(error) => return Ok(RunOutcome::ConnectFailed(Box::new(error))),
+        };
+    let mut failure = RunFailure::default();
+    let mut session = terminal::TerminalSession::default();
+    match session.enter() {
+        Ok(()) => {
+            let result = async {
+                let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+                events.start_input()?;
+                let mut app = App::new(path);
+                app.connected = true;
+                app.cmd_tx = Some(events.command_sender());
+                let _frame = terminal.draw(|frame| ui::render(&app, frame))?;
+                loop {
+                    let redraw = apply_ui_message(&mut app, events.next().await)?;
+                    if app.should_quit || worker.is_finished() {
+                        break;
+                    }
+                    if redraw {
+                        let _frame = terminal.draw(|frame| ui::render(&app, frame))?;
+                    }
+                }
+                Ok::<(), io::Error>(())
+            }
+            .await;
+            failure.operation = result
+                .err()
+                .map(|error| -> Box<dyn std::error::Error + Send + Sync> { Box::new(error) });
+        }
+        Err(errors) => failure.terminal = errors,
+    }
+    worker.request_stop();
+    failure.keyboard = events.shutdown().err();
+    match worker.shutdown().await {
+        Ok(completion) if !completion.is_clean() => failure.radio = Some(completion),
+        Ok(_) => {}
+        Err(error) => failure.join = Some(error),
+    }
+    failure.terminal.extend(session.restore());
+    if failure.is_empty() {
+        Ok(RunOutcome::Quit)
+    } else {
+        Err(failure)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::{Cli, apply_ui_message, guide_terminal_mode_exit};
+    #[test]
+    fn terminal_input_failure_is_a_session_error() -> Result<(), Box<dyn std::error::Error>> {
+        let mut app = crate::app::App::with_cache_path(String::new(), None);
+        let result = apply_ui_message(
+            &mut app,
+            crate::app::Message::TerminalFailure(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "keyboard detached",
+            )),
+        );
+        let Err(error) = result else {
+            return Err("terminal failure became successful quit".into());
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+        assert!(error.to_string().contains("keyboard detached"));
+        Ok(())
+    }
+    #[test]
+    fn zero_baud_and_eof_cannot_start_a_connection_retry() -> Result<(), Box<dyn std::error::Error>>
+    {
+        assert!(
+            Cli::try_parse_from(["thd75-tui", "--baud", "0"]).is_err(),
+            "zero baud passed CLI validation"
+        );
+        let mut output = Vec::new();
+        assert!(
+            !guide_terminal_mode_exit("Terminal mode", &mut std::io::Cursor::new([]), &mut output)?,
+            "EOF requested another connection"
+        );
+        assert!(guide_terminal_mode_exit(
+            "Terminal mode",
+            &mut std::io::Cursor::new(b"\n"),
+            &mut output
+        )?);
+        assert!(
+            !guide_terminal_mode_exit(
+                "Terminal mode",
+                &mut std::io::Cursor::new(b"unfinished"),
+                &mut output
+            )?,
+            "partial EOF line authorized retry"
+        );
+        assert!(
+            guide_terminal_mode_exit(
+                "Terminal mode",
+                &mut std::io::Cursor::new([b'x'; 1025]),
+                &mut output
+            )
+            .is_err(),
+            "oversized guidance input was retained"
+        );
+        Ok(())
+    }
 }

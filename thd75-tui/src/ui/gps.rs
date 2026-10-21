@@ -70,11 +70,11 @@ fn render_status(app: &App, frame: &mut Frame<'_>, area: Rect) {
     match gps_enabled {
         Some(true) => {
             lines.push(Line::from(Span::styled(
-                "  Position data requires NMEA PC output.",
+                "  This dashboard does not obtain a GPS fix.",
                 Style::default().fg(Color::DarkGray),
             )));
             lines.push(Line::from(Span::styled(
-                "  GPS fix info is not available via CAT.",
+                "  Manual position beacons remain unavailable.",
                 Style::default().fg(Color::DarkGray),
             )));
         }

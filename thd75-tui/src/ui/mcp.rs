@@ -13,10 +13,10 @@ pub(crate) fn render(app: &App, frame: &mut Frame<'_>, list_area: Rect, detail_a
 
     match &app.mcp {
         McpState::Idle => {
-            let text = " Press [r] to read memory from radio\n Press [w] to write memory to radio";
+            let text = " Press [r] to read memory from radio\n Settings changes compare the live page first";
             frame.render_widget(Paragraph::new(text).block(block), list_area);
         }
-        McpState::Reading { page, total } | McpState::Writing { page, total, .. } => {
+        McpState::Reading { page, total, .. } | McpState::Writing { page, total, .. } => {
             let label = if matches!(app.mcp, McpState::Reading { .. }) {
                 "Reading"
             } else {
@@ -46,10 +46,16 @@ pub(crate) fn render(app: &App, frame: &mut Frame<'_>, list_area: Rect, detail_a
                 frame.render_widget(gauge, gauge_area);
             }
         }
-        McpState::Loaded { modified, .. } => {
-            let status = if *modified { " (modified)" } else { "" };
+        McpState::Loaded {
+            requires_refresh, ..
+        } => {
+            let status = if *requires_refresh {
+                " (refresh required before edits)"
+            } else {
+                ""
+            };
             let text = format!(
-                " Memory loaded{status}\n\n Press [r] to re-read\n Press [w] to write to radio\n\n Switch to [c]hannels to browse"
+                " Memory loaded{status}\n\n Press [r] to re-read\n\n Switch to [c]hannels to browse\n Use [S] for guarded setting writes"
             );
             frame.render_widget(Paragraph::new(text).block(block), list_area);
         }

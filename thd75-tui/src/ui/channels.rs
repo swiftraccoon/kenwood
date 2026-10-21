@@ -6,7 +6,7 @@ use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 
 use kenwood_thd75::types::{ChannelTransmitValue, CrossToneType, ShiftDirection, ToneMode};
 
-use crate::app::{App, ChannelEditField, InputMode, McpState, Pane};
+use crate::app::{App, ChannelEditField, InputMode, Pane};
 
 pub(crate) fn render_list(app: &App, frame: &mut Frame<'_>, area: Rect) {
     let title = if let InputMode::Search(ref buf) = app.input_mode {
@@ -22,7 +22,7 @@ pub(crate) fn render_list(app: &App, frame: &mut Frame<'_>, area: Rect) {
         .borders(Borders::ALL)
         .border_style(super::border_style(app, Pane::Main));
 
-    if let McpState::Loaded { image, .. } = &app.mcp {
+    if let Some(image) = app.confirmed_image() {
         let channels = image.channels();
         let used = match app.filtered_channels() {
             Ok(used) => used,
@@ -91,8 +91,8 @@ pub(crate) fn render_detail(app: &App, frame: &mut Frame<'_>, area: Rect) {
         .borders(Borders::ALL)
         .border_style(super::border_style(app, Pane::Detail));
 
-    match &app.mcp {
-        McpState::Loaded { image, .. } => {
+    match app.confirmed_image() {
+        Some(image) => {
             let channels = image.channels();
             let used = match app.filtered_channels() {
                 Ok(used) => used,
@@ -194,7 +194,7 @@ pub(crate) fn render_detail(app: &App, frame: &mut Frame<'_>, area: Rect) {
                 lines.push(Line::from(""));
                 if app.channel_edit_mode {
                     lines.push(Line::from(Span::styled(
-                        "  ── Edit Mode ──",
+                        "  ── Channel Actions ──",
                         Style::default()
                             .fg(Color::Yellow)
                             .add_modifier(Modifier::BOLD),
@@ -238,13 +238,13 @@ pub(crate) fn render_detail(app: &App, frame: &mut Frame<'_>, area: Rect) {
 
                     lines.push(Line::from(""));
                     lines.push(Line::from(Span::styled(
-                        "  Tab=next  Enter=apply  Esc=cancel",
+                        "  Tab=next action  Enter=inspect/live mode  Esc=close",
                         Style::default().fg(Color::DarkGray),
                     )));
                 } else {
                     lines.push(Line::from(vec![Span::styled(
                         format!(
-                            "  [Enter] Tune Band {}  [e] Edit",
+                            "  [Enter] Tune Band {}  [e] Actions",
                             if app.target_band == kenwood_thd75::types::Band::B {
                                 "B"
                             } else {
@@ -259,7 +259,7 @@ pub(crate) fn render_detail(app: &App, frame: &mut Frame<'_>, area: Rect) {
             }
             frame.render_widget(Paragraph::new("  No channel selected").block(block), area);
         }
-        _ => {
+        None => {
             frame.render_widget(Paragraph::new("").block(block), area);
         }
     }

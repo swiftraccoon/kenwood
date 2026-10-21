@@ -11,7 +11,7 @@ use kenwood_thd75::types::{
     VoiceAnnounceMode,
 };
 
-use crate::app::{App, McpState, Pane, SettingRow, cat_settings, mcp_settings};
+use crate::app::{App, Pane, SettingRow, cat_settings, mcp_settings};
 
 fn bool_span(b: bool) -> (String, Color) {
     if b {
@@ -25,7 +25,27 @@ fn num_span(v: impl std::fmt::Display) -> (String, Color) {
     (format!("{v}"), Color::Yellow)
 }
 
-/// Render the CAT settings list (instant writes, no disconnect).
+fn unavailable() -> (String, Color) {
+    ("Unavailable".to_owned(), Color::DarkGray)
+}
+
+fn observed_span(value: Option<impl std::fmt::Display>) -> (String, Color) {
+    value.map_or_else(unavailable, num_span)
+}
+
+fn observed_bool(value: Option<bool>) -> (String, Color) {
+    value.map_or_else(unavailable, bool_span)
+}
+
+fn observed_value(value: Option<impl std::fmt::Display>) -> String {
+    value.map_or_else(|| "Unavailable".to_owned(), |value| value.to_string())
+}
+
+fn observed_on_off(value: Option<bool>) -> String {
+    value.map_or_else(|| "Unavailable".to_owned(), on_off)
+}
+
+/// Render the CAT settings list and latest observed values.
 pub(crate) fn render_cat(app: &App, frame: &mut Frame<'_>, list_area: Rect, detail_area: Rect) {
     let rows = cat_settings();
     render_settings_list(
@@ -35,11 +55,11 @@ pub(crate) fn render_cat(app: &App, frame: &mut Frame<'_>, list_area: Rect, deta
         detail_area,
         &rows,
         app.settings_cat_index,
-        " Settings (CAT, instant) [Enter: toggle, +/-: adjust] ",
+        " Settings (CAT) [Enter: toggle, +/-: adjust] ",
     );
 }
 
-/// Render the MCP settings list (~3s per change, brief disconnect).
+/// Render the MCP settings list with read-back-verified page updates.
 pub(crate) fn render_mcp(app: &App, frame: &mut Frame<'_>, list_area: Rect, detail_area: Rect) {
     let rows = mcp_settings();
     render_settings_list(
@@ -49,7 +69,7 @@ pub(crate) fn render_mcp(app: &App, frame: &mut Frame<'_>, list_area: Rect, deta
         detail_area,
         &rows,
         app.settings_mcp_index,
-        " Settings (MCP, ~3s per change) [Enter: toggle, +/-: adjust] ",
+        " Settings (MCP, verified updates) [Enter: toggle, +/-: adjust] ",
     );
 }
 
@@ -81,7 +101,7 @@ fn render_settings_list(
         .border_style(super::border_style(app, Pane::Detail));
 
     // Build list items: section headers interspersed with setting rows.
-    // selected_index tracks the rows slice index; we map it to the ListItem index
+    // Map the selected rows-slice index to its list-item index.
     // (which is larger due to the interleaved section headers) for ListState scrolling.
 
     // Compute the ListItem index for the currently selected row.
@@ -102,7 +122,7 @@ fn render_settings_list(
     };
 
     let list_items: Vec<ListItem<'_>> =
-        if matches!(app.mcp, McpState::Loaded { .. }) || rows.iter().any(|r| r.is_cat()) {
+        if app.confirmed_image().is_some() || rows.iter().any(|r| r.is_cat()) {
             let mut result = Vec::new();
             for (idx, &row) in rows.iter().enumerate() {
                 // Section header if this row starts a new group
@@ -173,20 +193,22 @@ fn render_settings_list(
     )));
     lines.push(kv(" Battery", &{
         use kenwood_thd75::types::BatteryLevel;
-        match s.battery_level {
-            BatteryLevel::Empty => "Empty (Red)".to_string(),
-            BatteryLevel::OneThird => "1/3 (Yellow)".to_string(),
-            BatteryLevel::TwoThirds => "2/3 (Green)".to_string(),
-            BatteryLevel::Full => "Full (Green)".to_string(),
-            BatteryLevel::Charging => "Charging".to_string(),
-            BatteryLevel::Unidentified5 => "State 5 (unqualified)".to_string(),
-        }
+        s.battery_level.map_or_else(
+            || "Unavailable".to_owned(),
+            |level| match level {
+                BatteryLevel::Empty => "Empty (Red)".to_string(),
+                BatteryLevel::OneThird => "1/3 (Yellow)".to_string(),
+                BatteryLevel::TwoThirds => "2/3 (Green)".to_string(),
+                BatteryLevel::Full => "Full (Green)".to_string(),
+                BatteryLevel::Charging => "Charging".to_string(),
+                BatteryLevel::Unidentified5 => "Unidentified state 5".to_string(),
+            },
+        )
     }));
-    lines.push(kv(" AF Gain", &format!("{}", s.af_gain)));
-    lines.push(kv(" Beep", &on_off(s.beep)));
-    lines.push(kv(" Band Mode", &s.band_mode.to_string()));
-    lines.push(kv(" Bluetooth", &on_off(s.bluetooth)));
-    lines.push(kv(" VOX", &on_off(s.vox)));
+    lines.push(kv(" AF Gain", &observed_value(s.af_gain)));
+    lines.push(kv(" Band Mode", &observed_value(s.band_mode)));
+    lines.push(kv(" Bluetooth", &observed_on_off(s.bluetooth)));
+    lines.push(kv(" VOX", &observed_on_off(s.vox)));
     lines.push(kv(
         " GPS",
         &s.gps_settings.map_or_else(
@@ -194,27 +216,11 @@ fn render_settings_list(
             |settings| on_off(settings.enabled()),
         ),
     ));
-    lines.push(kv(" Beacon", &format!("{}", s.beacon_mode)));
-    lines.push(kv(
-        " Fine Step",
-        &s.fine_step
-            .map_or_else(|| "N/A".to_string(), |fs| format!("{fs}")),
-    ));
-    lines.push(kv(
-        " Filter SSB",
-        &s.filter_width_ssb
-            .map_or_else(|| "N/A".to_string(), |w| format!("{w}")),
-    ));
-    lines.push(kv(
-        " Filter CW",
-        &s.filter_width_cw
-            .map_or_else(|| "N/A".to_string(), |w| format!("{w}")),
-    ));
-    lines.push(kv(
-        " Filter AM",
-        &s.filter_width_am
-            .map_or_else(|| "N/A".to_string(), |w| format!("{w}")),
-    ));
+    lines.push(kv(" Beacon", &observed_value(s.beacon_mode)));
+    lines.push(kv(" Fine Step", &observed_value(s.fine_step)));
+    lines.push(kv(" Filter SSB", &observed_value(s.filter_width_ssb)));
+    lines.push(kv(" Filter CW", &observed_value(s.filter_width_cw)));
+    lines.push(kv(" Filter AM", &observed_value(s.filter_width_am)));
     lines.push(Line::from(""));
 
     lines.push(Line::from(Span::styled(
@@ -223,14 +229,9 @@ fn render_settings_list(
             .fg(Color::Yellow)
             .add_modifier(Modifier::BOLD),
     )));
-    lines.push(kv(
-        " Step",
-        &s.band_a
-            .step_size
-            .map_or_else(|| "N/A".into(), |st| format!("{st}")),
-    ));
-    lines.push(kv(" Attenuator", &on_off(s.band_a.attenuator)));
-    lines.push(kv(" Squelch", &s.band_a.squelch.to_string()));
+    lines.push(kv(" Step", &observed_value(s.band_a.step_size)));
+    lines.push(kv(" Attenuator", &observed_on_off(s.band_a.attenuator)));
+    lines.push(kv(" Squelch", &observed_value(s.band_a.squelch)));
     lines.push(Line::from(""));
 
     lines.push(Line::from(Span::styled(
@@ -239,28 +240,19 @@ fn render_settings_list(
             .fg(Color::Yellow)
             .add_modifier(Modifier::BOLD),
     )));
-    lines.push(kv(
-        " Step",
-        &s.band_b
-            .step_size
-            .map_or_else(|| "N/A".into(), |st| format!("{st}")),
-    ));
-    lines.push(kv(" Attenuator", &on_off(s.band_b.attenuator)));
-    lines.push(kv(" Squelch", &s.band_b.squelch.to_string()));
+    lines.push(kv(" Step", &observed_value(s.band_b.step_size)));
+    lines.push(kv(" Attenuator", &observed_on_off(s.band_b.attenuator)));
+    lines.push(kv(" Squelch", &observed_value(s.band_b.squelch)));
     lines.push(Line::from(""));
 
     lines.push(Line::from(Span::styled(
-        " Not Available via CAT/MCP",
+        " Unavailable Controls",
         Style::default()
             .fg(Color::DarkGray)
             .add_modifier(Modifier::ITALIC),
     )));
     lines.push(Line::from(Span::styled(
-        " Recording: radio-button only",
-        Style::default().fg(Color::DarkGray),
-    )));
-    lines.push(Line::from(Span::styled(
-        " (no known MCP offset for Menu 301/302)",
+        " Change recording settings on the radio.",
         Style::default().fg(Color::DarkGray),
     )));
 
@@ -277,46 +269,14 @@ fn render_settings_list(
 fn get_row_value(app: &App, row: SettingRow) -> (String, Color) {
     match row {
         // --- RX (live CAT for squelch, MCP for filters) ---
-        SettingRow::SquelchA => num_span(app.state.band_a.squelch.as_raw()),
-        SettingRow::SquelchB => num_span(app.state.band_b.squelch.as_raw()),
-        SettingRow::StepSizeA => (
-            app.state
-                .band_a
-                .step_size
-                .map_or_else(|| "N/A".into(), |st| format!("{st}")),
-            Color::Yellow,
-        ),
-        SettingRow::StepSizeB => (
-            app.state
-                .band_b
-                .step_size
-                .map_or_else(|| "N/A".into(), |st| format!("{st}")),
-            Color::Yellow,
-        ),
-        SettingRow::FineStep => (
-            app.state
-                .fine_step
-                .map_or_else(|| "N/A".into(), |fs| format!("{fs}")),
-            Color::Yellow,
-        ),
-        SettingRow::FilterWidthSsb => (
-            app.state
-                .filter_width_ssb
-                .map_or_else(|| "N/A".into(), |w| format!("{w}")),
-            Color::Yellow,
-        ),
-        SettingRow::FilterWidthCw => (
-            app.state
-                .filter_width_cw
-                .map_or_else(|| "N/A".into(), |w| format!("{w}")),
-            Color::Yellow,
-        ),
-        SettingRow::FilterWidthAm => (
-            app.state
-                .filter_width_am
-                .map_or_else(|| "N/A".into(), |w| format!("{w}")),
-            Color::Yellow,
-        ),
+        SettingRow::SquelchA => observed_span(app.state.band_a.squelch),
+        SettingRow::SquelchB => observed_span(app.state.band_b.squelch),
+        SettingRow::StepSizeA => observed_span(app.state.band_a.step_size),
+        SettingRow::StepSizeB => observed_span(app.state.band_b.step_size),
+        SettingRow::FineStep => observed_span(app.state.fine_step),
+        SettingRow::FilterWidthSsb => observed_span(app.state.filter_width_ssb),
+        SettingRow::FilterWidthCw => observed_span(app.state.filter_width_cw),
+        SettingRow::FilterWidthAm => observed_span(app.state.filter_width_am),
         SettingRow::SsbHighCut => mcp_str(app, |s| {
             s.settings()
                 .ssb_high_cut()
@@ -363,9 +323,9 @@ fn get_row_value(app: &App, row: SettingRow) -> (String, Color) {
         }),
 
         // --- VOX (gain/delay: live CAT; rest: MCP) ---
-        SettingRow::VoxEnabled => bool_span(app.state.vox),
-        SettingRow::VoxGain => num_span(app.state.vox_gain.as_raw()),
-        SettingRow::VoxDelay => (format!("{}", app.state.vox_delay), Color::Yellow),
+        SettingRow::VoxEnabled => observed_bool(app.state.vox),
+        SettingRow::VoxGain => observed_span(app.state.vox_gain),
+        SettingRow::VoxDelay => observed_span(app.state.vox_delay),
         SettingRow::VoxTxOnBusy => mcp_bool(app, |s| s.settings().vox_tx_on_busy()),
 
         // --- CW ---
@@ -429,7 +389,7 @@ fn get_row_value(app: &App, row: SettingRow) -> (String, Color) {
                 .backlight_timer()
                 .map(|value| format!("{} s", value.as_seconds()))
         }),
-        SettingRow::DualBand => (app.state.band_mode.to_string(), Color::Yellow),
+        SettingRow::DualBand => observed_span(app.state.band_mode),
 
         // --- Audio ---
         SettingRow::EmrVolumeLevel => mcp_num(app, |s| {
@@ -500,7 +460,7 @@ fn get_row_value(app: &App, row: SettingRow) -> (String, Color) {
         }),
 
         // --- Bluetooth (Bluetooth: live CAT; BtAutoConnect: MCP) ---
-        SettingRow::Bluetooth => bool_span(app.state.bluetooth),
+        SettingRow::Bluetooth => observed_bool(app.state.bluetooth),
         SettingRow::BtAutoConnect => mcp_bool(app, |s| s.settings().bt_auto_connect()),
 
         // --- Interface ---
@@ -548,13 +508,21 @@ fn get_row_value(app: &App, row: SettingRow) -> (String, Color) {
         }),
 
         // --- CAT Radio Controls ---
-        SettingRow::PowerA => (format!("{}", app.state.band_a.power_level), Color::Yellow),
-        SettingRow::PowerB => (format!("{}", app.state.band_b.power_level), Color::Yellow),
-        SettingRow::AttenuatorA => bool_span(app.state.band_a.attenuator),
-        SettingRow::AttenuatorB => bool_span(app.state.band_b.attenuator),
-        SettingRow::OperatingModeA => (format!("{}", app.state.band_a.mode), Color::Cyan),
-        SettingRow::OperatingModeB => (format!("{}", app.state.band_b.mode), Color::Cyan),
-        SettingRow::BeaconMode => (format!("{}", app.state.beacon_mode), Color::Yellow),
+        SettingRow::PowerA => observed_span(app.state.band_a.power_level),
+        SettingRow::PowerB => observed_span(app.state.band_b.power_level),
+        SettingRow::AttenuatorA => observed_bool(app.state.band_a.attenuator),
+        SettingRow::AttenuatorB => observed_bool(app.state.band_b.attenuator),
+        SettingRow::OperatingModeA => app
+            .state
+            .band_a
+            .mode
+            .map_or_else(unavailable, |mode| (mode.to_string(), Color::Cyan)),
+        SettingRow::OperatingModeB => app
+            .state
+            .band_b
+            .mode
+            .map_or_else(unavailable, |mode| (mode.to_string(), Color::Cyan)),
+        SettingRow::BeaconMode => observed_span(app.state.beacon_mode),
         SettingRow::GpsEnabled => app.state.gps_settings.map_or_else(
             || ("Unavailable".into(), Color::DarkGray),
             |settings| bool_span(settings.enabled()),
@@ -567,14 +535,17 @@ fn get_row_value(app: &App, row: SettingRow) -> (String, Color) {
         SettingRow::ActiveBand
         | SettingRow::TuningModeA
         | SettingRow::TuningModeB
-        | SettingRow::FmRadio
         | SettingRow::PacketDataRate
         | SettingRow::AutoInfo
-        | SettingRow::DstarSlot => ("?".into(), Color::DarkGray),
-        SettingRow::AprsCallsign => app.state.aprs_callsign.as_ref().map_or_else(
-            || ("?".into(), Color::DarkGray),
-            |callsign| (callsign.to_string(), Color::Yellow),
-        ),
+        | SettingRow::DstarSlot => unavailable(),
+        SettingRow::FmRadio => observed_bool(app.fm_radio_on),
+        SettingRow::AprsCallsign => app
+            .state
+            .aprs_callsign
+            .as_ref()
+            .map_or_else(unavailable, |callsign| {
+                (callsign.to_string(), Color::Yellow)
+            }),
     }
 }
 
@@ -600,14 +571,11 @@ fn mcp_bool(
     app: &App,
     f: impl Fn(&MemoryImage) -> Result<bool, SettingsValueError>,
 ) -> (String, Color) {
-    if let McpState::Loaded { ref image, .. } = app.mcp {
-        match f(image) {
+    app.confirmed_image()
+        .map_or_else(unavailable, |image| match f(image) {
             Ok(value) => bool_span(value),
             Err(error) => (format!("Error: {error}"), Color::Red),
-        }
-    } else {
-        ("?".into(), Color::DarkGray)
-    }
+        })
 }
 
 /// Read a strict numeric value from the MCP image.
@@ -615,14 +583,11 @@ fn mcp_num(
     app: &App,
     f: impl Fn(&MemoryImage) -> Result<u8, SettingsValueError>,
 ) -> (String, Color) {
-    if let McpState::Loaded { ref image, .. } = app.mcp {
-        match f(image) {
+    app.confirmed_image()
+        .map_or_else(unavailable, |image| match f(image) {
             Ok(value) => num_span(value),
             Err(error) => (format!("Error: {error}"), Color::Red),
-        }
-    } else {
-        ("?".into(), Color::DarkGray)
-    }
+        })
 }
 
 /// Read and format a strict typed value from the MCP image.
@@ -630,14 +595,11 @@ fn mcp_str(
     app: &App,
     f: impl Fn(&MemoryImage) -> Result<String, SettingsValueError>,
 ) -> (String, Color) {
-    if let McpState::Loaded { ref image, .. } = app.mcp {
-        match f(image) {
+    app.confirmed_image()
+        .map_or_else(unavailable, |image| match f(image) {
             Ok(value) => (value, Color::Yellow),
             Err(error) => (format!("Error: {error}"), Color::Red),
-        }
-    } else {
-        ("?".into(), Color::DarkGray)
-    }
+        })
 }
 
 fn kv<'a>(label: &'a str, value: &str) -> Line<'a> {

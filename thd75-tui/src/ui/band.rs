@@ -28,13 +28,12 @@ pub(crate) fn render(app: &App, frame: &mut Frame<'_>, area: Rect, pane: Pane) {
     frame.render_widget(Paragraph::new(band_lines(band)).block(block), area);
 }
 
-/// Build the 4-line display for a band panel:
-/// 1. Frequency (bold white, MHz with 6 decimal places)
-/// 2. Mode + Power + Squelch + RX indicator (green "RX" badge when busy)
-/// 3. S-meter bar (green S0-S3, yellow S5-S7, red S9)
-/// 4. Step size + ATT indicator (red when attenuator is on)
+/// Show the latest observations, marking every missing value unavailable.
 fn band_lines(band: &BandState) -> Vec<Line<'static>> {
-    let freq = format!("{:.6} MHz", band.frequency.as_mhz());
+    let freq = band.frequency.map_or_else(
+        || "Unavailable".to_owned(),
+        |frequency| format!("{:.6} MHz", frequency.as_mhz()),
+    );
     let freq_line = Line::from(Span::styled(
         format!("  {freq}"),
         Style::default()
@@ -42,68 +41,69 @@ fn band_lines(band: &BandState) -> Vec<Line<'static>> {
             .add_modifier(Modifier::BOLD),
     ));
 
-    let busy_span = if band.busy {
-        Span::styled(" RX ", Style::default().fg(Color::Black).bg(Color::Green))
-    } else {
-        Span::raw("    ")
+    let busy_span = match band.busy {
+        Some(true) => Span::styled(" RX ", Style::default().fg(Color::Black).bg(Color::Green)),
+        Some(false) => Span::raw("Idle"),
+        None => Span::styled("RX: unavailable", Style::default().fg(Color::DarkGray)),
     };
 
     let mode_line = Line::from(vec![
         Span::styled(
-            format!("  {}  ", band.mode),
+            format!(
+                "  {}  ",
+                band.mode
+                    .map_or_else(|| "Unavailable".to_owned(), |mode| mode.to_string())
+            ),
             Style::default().fg(Color::Cyan),
         ),
         Span::styled("Pwr:", Style::default().fg(Color::DarkGray)),
         Span::styled(
-            power_label(band.power_level).to_string(),
+            band.power_level.map_or("Unavailable", power_label),
             Style::default().fg(Color::Yellow),
         ),
         Span::raw("  "),
         Span::styled("Sq:", Style::default().fg(Color::DarkGray)),
         Span::styled(
-            format!("{}", band.squelch.as_raw()),
+            band.squelch
+                .map_or_else(|| "Unavailable".to_owned(), |squelch| squelch.to_string()),
             Style::default().fg(Color::Yellow),
         ),
         Span::raw("  "),
         busy_span,
     ]);
 
-    let s_meter_line = s_meter_line(band.s_meter);
+    let s_meter_line = band.s_meter.map_or_else(
+        || {
+            Line::from(Span::styled(
+                "  S Unavailable",
+                Style::default().fg(Color::DarkGray),
+            ))
+        },
+        s_meter_line,
+    );
 
     let step_str = band
         .step_size
-        .map_or_else(|| "N/A".into(), |s| format!("{s}"));
+        .map_or_else(|| "Unavailable".into(), |s| format!("{s}"));
     let mut extra = vec![
         Span::styled("  Step:", Style::default().fg(Color::DarkGray)),
         Span::styled(step_str, Style::default().fg(Color::Yellow)),
     ];
-    if band.attenuator {
-        extra.push(Span::styled(" ATT", Style::default().fg(Color::Red)));
-    }
+    extra.push(match band.attenuator {
+        Some(true) => Span::styled(" ATT: On", Style::default().fg(Color::Red)),
+        Some(false) => Span::raw(" ATT: Off"),
+        None => Span::styled(" ATT: Unavailable", Style::default().fg(Color::DarkGray)),
+    });
     let extra_line = Line::from(extra);
 
     vec![freq_line, mode_line, s_meter_line, extra_line]
 }
 
-/// Render S-meter bar from an `SMeterReading`.
-///
-/// Uses `as_u8()` for the raw reading (0-5) to compute bar width via
-/// `s_unit()` label mapping, and `s_unit()` for the display label.
+/// Render the model's S-unit label and corresponding nine-segment bar.
 fn s_meter_line(reading: SMeterReading) -> Line<'static> {
-    let label = reading.s_unit(); // e.g. "S0", "S3", "S9"
-    // Use the raw-to-S-unit mapping for the bar width:
-    // raw 0→S0, 1→S1, 2→S3, 3→S5, 4→S7, 5→S9
-    let s_unit: u8 = match reading.as_raw() {
-        1 => 1,
-        2 => 3,
-        3 => 5,
-        4 => 7,
-        5 => 9,
-        _ => 0,
-    };
-
-    // Bar: 9 segments for S0-S9
-    let filled = s_unit.min(9) as usize;
+    let label = reading.s_unit();
+    let s_unit = reading.s_unit_value();
+    let filled = usize::from(s_unit);
     let empty = 9 - filled;
     let bar: String = "▓".repeat(filled) + &"░".repeat(empty);
 

@@ -1,17 +1,35 @@
 # thd75-tui
 
-Ratatui dashboard owning a `Radio<T>` from `thd75`.
+Terminal dashboard with one retained radio task and one joined keyboard reader.
 
-## Rules
-
-- Make `thd75` compile, test, and lint clean BEFORE touching TUI code; a TUI change built on an incomplete library API has to be redone.
-- SM and BY must never be polled directly (the firmware returns spurious Band B spikes). `radio_task` implements the AI-pushed BY-to-SM gate; keep all meter work behind it. The mnemonic rules are in `thd75/AGENTS.md`.
-- Direct frequency writes and full CAT memory-record writes are quarantined in the library: `FreqUp`/`FreqDown` step through the verified UP/DW commands and `TuneChannel` recalls memories. Do not present the memory browser as a persisted per-channel editor until every edited field has a write path with verified readback.
-- `radio_task`'s reconnect loop rediscovers the device path on purpose: USB re-enumerates with a changed suffix after MCP exit, so `Radio::reconnect` alone is insufficient there.
-- On macOS use `BluetoothTransport`, which keeps IOBluetooth and its run loop in an isolated helper process, so the TUI may open it from any thread and contains no CFRunLoop FFI. Only one process may own the RFCOMM channel: close the TUI before running a live-radio example.
-- The worker retains transient D-STAR lifecycle ownership and selects Band B separately from the shared modem config. Stop the gateway owner and restore CAT before resuming polling. This panel has no reflector network session.
-
-## Code patterns
-
-- Adding fields to `AprsClientConfig` may need `Box<AprsClientConfig>` in the `RadioCommand::EnterAprs` variant to avoid `clippy::large_enum_variant`.
-- Range clamps and variant tables must come from the library's `ALL` consts, `Display` impls, and `MIN`/`MAX` bounds, never from literals (the VoxDelay `.min(30)` bug class). Known literal clamps in `app.rs`: three squelch clamps `.min(6)` should use `SquelchLevel::MAX`, and `next_linked_volume`'s `.min(7)` needs a bound added to `LinkedVolumeLevel` first.
+- Model libraries must compile, pass their tests and be lint-clean before
+  changing this consumer.
+- Never poll SM or BY directly. Apply pushed BY through `StateMonitor` and read
+  SM only for its `BecameBusy` transition. New streams start with unavailable
+  meter/busy values.
+- Missing CAT observations stay `None`. A relative edit must refuse an
+  unavailable current value; never choose an Off, zero or first-enum fallback.
+- Keep the proven CAT serial across USB re-enumeration. Close the previous
+  connection before opening candidates; identify each candidate with read-only
+  ID/AE before AI or writes. Native Bluetooth retains the exact opened address.
+  A failed close stops replacement. Never send a recovery preamble to an
+  unproved rediscovered radio.
+- Retain and join the keyboard and radio tasks on every ordinary exit. Stop an
+  active APRS client, retain its returned radio after failure, attempt CAT
+  restoration and observe connection close before dropping the runtime.
+- Stage a typed MCP setting on a private candidate. Compare the entire expected
+  live page before writing and commit the local snapshot only after verified
+  completion. Keep the prior image and require refresh after uncertain writes.
+  Do not restore blind full-image or raw-byte write commands.
+- The Kenwood MMDVM wire profile is unsupported. Preserve the pure
+  `UnsupportedProfile` refusal before Terminal entry or modem writes; never
+  substitute a generic firmware profile. D-STAR CAT preparation remains usable.
+- Use model `ALL`, `MIN`, `MAX` and checked constructors for setting domains.
+  Unsupported stored values must remain visible or return an error, never be
+  coerced into a menu value.
+- Direct frequency and persisted per-channel editing remain unavailable while
+  their model writers are quarantined. Do not claim a prepared reflector URCALL
+  was transmitted, a queued APRS message was sent, or an unknown FM state is Off.
+- Hardware-free tests use injected terminal operations, keyboard polling,
+  scripted transports and temporary cache directories. No test may open a live
+  terminal, native Bluetooth connection or radio.

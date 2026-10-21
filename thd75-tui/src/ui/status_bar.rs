@@ -32,23 +32,18 @@ pub(crate) fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
 
     // Live toggles as compact indicators
     let s = &app.state;
-    let mut flags = Vec::new();
-    flags.push(format!("BAT:{}", s.battery_level));
-    flags.push(format!("Vol:{}", s.af_gain));
-    if s.bluetooth {
-        flags.push("BT".into());
-    }
-    if s.vox {
-        flags.push("VOX".into());
-    }
-    if s.gps_settings
-        .is_some_and(kenwood_thd75::types::GpsSettings::enabled)
-    {
-        flags.push("GPS".into());
-    }
-    if matches!(s.band_mode, kenwood_thd75::types::BandMode::Single) {
-        flags.push("1BD".into());
-    }
+    let mut flags = vec![
+        observed_label("BAT", s.battery_level),
+        observed_label("Vol", s.af_gain),
+        toggle_label("BT", s.bluetooth),
+        toggle_label("VOX", s.vox),
+        toggle_label(
+            "GPS",
+            s.gps_settings
+                .map(kenwood_thd75::types::GpsSettings::enabled),
+        ),
+        observed_label("Band", s.band_mode),
+    ];
     if app.aprs_mode == AprsMode::Active {
         flags.push("APRS".into());
     }
@@ -84,4 +79,18 @@ pub(crate) fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
     ));
 
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn toggle_label(label: &str, value: Option<bool>) -> String {
+    let status = match value {
+        Some(true) => "On",
+        Some(false) => "Off",
+        None => "Unavailable",
+    };
+    format!("{label}:{status}")
+}
+
+fn observed_label(label: &str, value: Option<impl std::fmt::Display>) -> String {
+    let status = value.map_or_else(|| "Unavailable".to_owned(), |value| value.to_string());
+    format!("{label}:{status}")
 }

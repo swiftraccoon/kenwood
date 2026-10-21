@@ -6,7 +6,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
-use crate::app::{App, AprsMessageState, AprsMode, McpState, Pane};
+use crate::app::{App, AprsMessageState, AprsMode, Pane};
 
 /// Format a duration since `then` as a human-readable "ago" string.
 fn ago(then: Instant) -> String {
@@ -138,7 +138,7 @@ fn render_live(app: &App, frame: &mut Frame<'_>, list_area: Rect, detail_area: R
     // Footer hint
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        " [j/k] Navigate  [M] Message  [b] Beacon  [a] Stop APRS",
+        " [j/k] Navigate  [M] Message  [a] Stop APRS",
         Style::default().fg(Color::DarkGray),
     )));
 
@@ -177,7 +177,7 @@ fn render_live(app: &App, frame: &mut Frame<'_>, list_area: Rect, detail_area: R
 
         // Speed / course
         if let Some(speed) = station.speed_knots {
-            let mph = f64::from(speed) * 1.15078;
+            let mph = speed * 1.15078;
             let course_str = station
                 .course_degrees
                 .map_or(String::new(), |c| format!(" heading {c}\u{00b0}"));
@@ -281,16 +281,17 @@ fn render_stored_settings(app: &App, frame: &mut Frame<'_>, list_area: Rect, det
         .borders(Borders::ALL)
         .border_style(super::border_style(app, Pane::Detail));
 
-    let McpState::Loaded { ref image, .. } = app.mcp else {
+    let Some(image) = app.confirmed_image() else {
         frame.render_widget(
             Paragraph::new(vec![
                 Line::from(" No MCP data loaded."),
                 Line::from(" Press [m] then [r] to read from radio."),
                 Line::from(""),
                 Line::from(Span::styled(
-                    " Press [a] to enter live APRS mode.",
+                    " [a] Start APRS; automatic RF ACKs enabled.",
                     Style::default().fg(Color::Cyan),
                 )),
+                Line::from(" Automatic query replies need a local position."),
             ])
             .block(block),
             list_area,
@@ -304,14 +305,8 @@ fn render_stored_settings(app: &App, frame: &mut Frame<'_>, list_area: Rect, det
     // -------------------------------------------------------------------------
     // Left pane: APRS settings fields
     // -------------------------------------------------------------------------
-    // Field-level APRS settings such as beacon interval and packet path are
-    // not displayed from this opaque MCP region because their TH-D75 offsets
-    // are not verified. See `thd75::memory::AprsAccess` for the boundary-only
-    // contract.
-    //
-    // The callsign is available independently through the verified live CS
-    // command. Until the remaining offset map lands, surface those gaps rather
-    // than displaying potentially-wrong values.
+    // Stored APRS access supplies region metadata; station identity comes
+    // independently from the live CAT CS observation.
     let my_callsign = app
         .state
         .aprs_callsign
@@ -336,9 +331,10 @@ fn render_stored_settings(app: &App, frame: &mut Frame<'_>, list_area: Rect, det
         ),
         Line::from(""),
         Line::from(Span::styled(
-            " Press [a] to enter live APRS mode.",
+            " [a] Start APRS; automatic RF ACKs enabled.",
             Style::default().fg(Color::Cyan),
         )),
+        Line::from(" Automatic query replies need a local position."),
     ];
 
     frame.render_widget(Paragraph::new(lines).block(block), list_area);
