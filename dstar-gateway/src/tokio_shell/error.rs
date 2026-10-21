@@ -3,6 +3,7 @@
 
 use dstar_gateway_core::error::Error as CoreError;
 use dstar_gateway_core::session::client::DisconnectReason;
+use std::sync::Arc;
 
 /// Errors raised by the tokio shell.
 #[derive(Debug, thiserror::Error)]
@@ -15,6 +16,18 @@ pub enum ShellError {
     /// The session task has stopped; the handle is no longer valid.
     #[error("session task closed")]
     SessionClosed,
+
+    /// The background session failed; the original typed cause is retained.
+    #[error("session failed: {0}")]
+    SessionFailed(#[source] Arc<Self>),
+
+    /// The background task panicked or was cancelled externally.
+    #[error("session task failed: {0}")]
+    Task(#[from] tokio::task::JoinError),
+
+    /// A UDP send did not complete within the two-second local send budget.
+    #[error("UDP send exceeded the two-second local deadline")]
+    SendStalled,
 
     /// The session task did not report any disconnect outcome before the
     /// shell deadline.

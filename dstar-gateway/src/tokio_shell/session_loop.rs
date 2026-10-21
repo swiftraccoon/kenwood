@@ -2,15 +2,19 @@
 
 use std::ops::ControlFlow;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use dstar_gateway_core::error::{Error as CoreError, IoOperation};
 use dstar_gateway_core::session::Driver;
-use dstar_gateway_core::session::client::{Connected, Event, Protocol, Session};
+use dstar_gateway_core::session::client::{ClientStateKind, Connected, Event, Protocol, Session};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, watch};
 
 use super::{Command, ShellError};
+
+#[cfg(test)]
+#[path = "../../tests/common/mod.rs"]
+mod test_support;
 
 /// Internal loop that drives a sans-io session over a real tokio `UdpSocket`.
 ///
@@ -31,7 +35,7 @@ use super::{Command, ShellError};
 /// voice traffic. The shell's spawn path builds the session through
 /// the typestate transitions on the main thread, then hands the
 /// promoted `Session<P, Connected>` to the loop.
-pub(crate) struct SessionLoop<P: Protocol> {
+pub(crate) struct SessionLoop<P> {
     pub(crate) session: Session<P, Connected>,
     pub(crate) socket: Arc<UdpSocket>,
     pub(crate) event_tx: mpsc::Sender<Event<P>>,
@@ -63,6 +67,7 @@ impl<P: Protocol> SessionLoop<P> {
         let mut rx_buf = [0u8; 2048];
 
         loop {
+            self.session.handle_timeout(Instant::now());
             // 1. Drain the outbox to the socket.
             self.flush_transmit().await?;
 
@@ -72,12 +77,19 @@ impl<P: Protocol> SessionLoop<P> {
                     return Ok(());
                 }
             }
+            if self.session.state_kind() == ClientStateKind::Closed {
+                return Ok(());
+            }
 
             // 3. Compute the next deadline.
             let next_wake = self.session.poll_timeout();
 
             tokio::select! {
                 biased;
+
+                () = sleep_until_or_pending(next_wake) => {
+                    self.session.handle_timeout(Instant::now());
+                }
 
                 cmd = self.command_rx.recv() => {
                     let Some(cmd) = cmd else {
@@ -87,7 +99,7 @@ impl<P: Protocol> SessionLoop<P> {
                         );
                         return Ok(());
                     };
-                    self.apply_command(cmd);
+                    self.apply_command(cmd).await?;
                 }
 
                 recv = self.socket.recv_from(&mut rx_buf) => {
@@ -132,9 +144,6 @@ impl<P: Protocol> SessionLoop<P> {
                     }
                 }
 
-                () = sleep_until_or_pending(next_wake) => {
-                    self.session.handle_timeout(Instant::now());
-                }
             }
         }
     }
@@ -171,8 +180,7 @@ impl<P: Protocol> SessionLoop<P> {
                 );
                 return Ok(ControlFlow::Break(()));
             };
-            self.apply_command(command);
-            self.flush_transmit().await?;
+            self.apply_command(command).await?;
         }
     }
 
@@ -190,7 +198,13 @@ impl<P: Protocol> SessionLoop<P> {
                 first = format_args!("{first_byte:#04x}"),
                 "UDP send_to"
             );
-            if let Err(error) = self.socket.send_to(tx.payload, tx.dst).await {
+            let result = tokio::time::timeout(
+                Duration::from_secs(2),
+                self.socket.send_to(tx.payload, tx.dst),
+            )
+            .await
+            .map_err(|_| ShellError::SendStalled)?;
+            if let Err(error) = result {
                 tracing::warn!(
                     target: "dstar_gateway::tokio_shell",
                     %error,
@@ -208,16 +222,12 @@ impl<P: Protocol> SessionLoop<P> {
 
     /// Apply a command from the handle.
     ///
-    /// Dispatches each [`Command`] variant to the corresponding
-    /// `Session<P, Connected>` method. For `SendHeader`, `SendVoice`,
-    /// and `SendEot`, the reply channel carries the encoder result
-    /// (or [`ShellError::Core`] on codec failure). For `Disconnect`,
-    /// the reply fires immediately once the UNLINK has been enqueued;
-    /// the caller then waits for [`Event::Disconnected`] via
-    /// `next_event`.
-    fn apply_command(&mut self, cmd: Command) {
+    /// Reply after the core accepts and every currently ready datagram is
+    /// handed to the UDP socket. A socket failure terminates the loop and
+    /// is retained both in the command result and task completion.
+    async fn apply_command(&mut self, cmd: Command) -> Result<(), ShellError> {
         let now = Instant::now();
-        match cmd {
+        let (result, reply) = match cmd {
             Command::SendHeader {
                 header,
                 stream_id,
@@ -227,10 +237,7 @@ impl<P: Protocol> SessionLoop<P> {
                     .session
                     .send_header(now, &header, stream_id)
                     .map_err(ShellError::Core);
-                // If the receiver was dropped the reply is lost; the
-                // caller has already given up, so there's nothing to
-                // do about it here.
-                drop(reply.send(result));
+                (result, reply)
             }
             Command::SendVoice {
                 stream_id,
@@ -242,7 +249,7 @@ impl<P: Protocol> SessionLoop<P> {
                     .session
                     .send_voice(now, stream_id, seq, &frame)
                     .map_err(ShellError::Core);
-                drop(reply.send(result));
+                (result, reply)
             }
             Command::SendEot {
                 stream_id,
@@ -253,20 +260,27 @@ impl<P: Protocol> SessionLoop<P> {
                     .session
                     .send_eot(now, stream_id, seq)
                     .map_err(ShellError::Core);
-                drop(reply.send(result));
+                (result, reply)
             }
             Command::Disconnect { reply } => {
-                // `disconnect_in_place` advances the internal state
-                // machine to `Disconnecting` without consuming the
-                // typestate handle. The reply reports command acceptance;
-                // the terminal outcome follows on the event channel.
                 let result = self
                     .session
                     .disconnect_in_place(now)
                     .map_err(ShellError::Core);
-                drop(reply.send(result));
+                (result, reply)
             }
+        };
+        if let Err(error) = result {
+            drop(reply.send(Err(error)));
+            return Ok(());
         }
+        if let Err(error) = self.flush_transmit().await {
+            let source = Arc::new(error);
+            drop(reply.send(Err(ShellError::SessionFailed(Arc::clone(&source)))));
+            return Err(ShellError::SessionFailed(source));
+        }
+        drop(reply.send(Ok(())));
+        Ok(())
     }
 }
 
@@ -279,10 +293,6 @@ async fn sleep_until_or_pending(deadline: Option<Instant>) {
 }
 
 #[cfg(test)]
-#[path = "../../tests/common/mod.rs"]
-mod test_support;
-
-#[cfg(test)]
 mod tests {
     use super::test_support::fake_reflector::FakeReflector;
     use super::*;
@@ -290,12 +300,69 @@ mod tests {
     use dstar_gateway_core::codec::dextra::{self, ClientPacket};
     use dstar_gateway_core::session::client::DExtra;
     use dstar_gateway_core::validator::NullSink;
-    use dstar_gateway_core::{Callsign, DstarHeader, Module, StreamId, Suffix, VoiceFrame};
+    use dstar_gateway_core::{
+        Callsign, DstarHeader, HeaderFlags, Module, RoutingCallsign, StreamId, Suffix, VoiceFrame,
+    };
     use std::time::Duration;
     use tokio::sync::oneshot;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
     const TEST_TIMEOUT: Duration = Duration::from_secs(2);
+
+    #[tokio::test]
+    async fn command_failure_waits_for_udp_and_join_retains_the_same_cause() -> TestResult {
+        let peer = "[::1]:30001".parse()?;
+        let now = Instant::now();
+        let mut connecting = Session::<DExtra, _>::builder()
+            .callsign(RoutingCallsign::new("W1AW")?)
+            .local_module(Module::B)
+            .reflector_module(Module::C)
+            .peer(peer)
+            .build()
+            .connect(now)?;
+        let _link = connecting.poll_transmit(now).ok_or("missing LINK")?;
+        connecting.handle_input(now, peer, b"W1AW    BCACK\0")?;
+        let connected = connecting.promote()?;
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
+        let mut client = crate::tokio_shell::AsyncSession::spawn(connected, socket);
+        let header = DstarHeader {
+            flags: HeaderFlags::NONE,
+            rpt2: Callsign::from_wire_bytes(*b"XRF030 G"),
+            rpt1: Callsign::from_wire_bytes(*b"XRF030 C"),
+            ur_call: Callsign::from_wire_bytes(*b"CQCQCQ  "),
+            my_call: Callsign::from_wire_bytes(*b"W1AW    "),
+            my_suffix: Suffix::EMPTY,
+        };
+        let result = tokio::time::timeout(
+            TEST_TIMEOUT,
+            client.send_header(header, StreamId::try_from(0x1234_u16)?),
+        )
+        .await?;
+        let Err(ShellError::SessionFailed(command_cause)) = result else {
+            return Err(
+                format!("send must observe the incompatible socket family: {result:?}").into(),
+            );
+        };
+        assert!(
+            matches!(
+                command_cause.as_ref(),
+                ShellError::Core(CoreError::Io {
+                    operation: IoOperation::UdpSend,
+                    ..
+                })
+            ),
+            "{command_cause:?}"
+        );
+        let result = tokio::time::timeout(TEST_TIMEOUT, client.join()).await?;
+        let Err(ShellError::SessionFailed(task_cause)) = result else {
+            return Err(format!("join must expose the task failure: {result:?}").into());
+        };
+        assert!(
+            Arc::ptr_eq(&command_cause, &task_cause),
+            "completion must retain the original cause"
+        );
+        Ok(())
+    }
 
     async fn voice_packets(
         fake: &FakeReflector,
@@ -329,7 +396,7 @@ mod tests {
         let peer = fake.local_addr()?;
         let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
         let connecting = Session::<DExtra, _>::builder()
-            .callsign(Callsign::from_wire_bytes(*b"W1AW    "))
+            .callsign(RoutingCallsign::new("W1AW")?)
             .local_module(Module::B)
             .reflector_module(Module::C)
             .peer(peer)
@@ -355,9 +422,7 @@ mod tests {
         // one-slot channel. No event receiver is polled until every command
         // has completed and all of its packets have reached the fake peer.
         let header = DstarHeader {
-            flag1: 0,
-            flag2: 0,
-            flag3: 0,
+            flags: HeaderFlags::NONE,
             rpt2: Callsign::from_wire_bytes(*b"XRF030 G"),
             rpt1: Callsign::from_wire_bytes(*b"XRF030 C"),
             ur_call: Callsign::from_wire_bytes(*b"CQCQCQ  "),
@@ -381,7 +446,7 @@ mod tests {
             (
                 Command::SendVoice {
                     stream_id,
-                    seq: 1,
+                    seq: dstar_gateway_core::FrameSequence::try_from(1)?,
                     frame: Box::new(frame),
                     reply: voice_reply,
                 },
@@ -390,7 +455,7 @@ mod tests {
             (
                 Command::SendEot {
                     stream_id,
-                    seq: 2,
+                    seq: dstar_gateway_core::FrameSequence::try_from(2)?,
                     reply: eot_reply,
                 },
                 eot_result,

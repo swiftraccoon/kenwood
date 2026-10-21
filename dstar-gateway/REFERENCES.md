@@ -1,11 +1,8 @@
 # External References
 
-Every wire format that `dstar-gateway` implements was derived from the
-two canonical GPL-licensed reference implementations,
-**`g4klx/ircDDBGateway`** and **`LX3JL/xlxd`**, including constants
-taken directly from them. This file pins the exact commit hashes
-consulted and lists every file/line-range reference cited in the
-dstar-gateway source tree.
+The codecs compare wire layouts and constants against
+`g4klx/ircDDBGateway` and `LX3JL/xlxd`. This file pins the consulted
+revisions and indexes selected source routines.
 
 A discrepancy between this implementation and the upstream C++
 reference is a bug here until shown otherwise; report it with the line
@@ -18,8 +15,10 @@ number inspected.
 | `g4klx/ircDDBGateway` | [`f5ab9f7c93c6f28147b84a8f9667f6cc4c027eaa`](https://github.com/g4klx/ircDDBGateway/commit/f5ab9f7c93c6f28147b84a8f9667f6cc4c027eaa) |
 | `LX3JL/xlxd` | [`bf5d0148dbdf2534af129ca3cc034c5051dcfc8d`](https://github.com/LX3JL/xlxd/commit/bf5d0148dbdf2534af129ca3cc034c5051dcfc8d) |
 
-Both are GPL-2.0. `dstar-gateway` is also licensed under GPL-2.0-or-later
-for this reason.
+The pinned ircDDBGateway `Common/ConnectData.cpp` header declares
+GPL-2.0-or-later. The pinned xlxd `src/cdextraprotocol.cpp` header declares
+GPL-3.0-or-later. Workspace policy retains this package's GPL-2.0-or-later
+declaration.
 
 ## File-level references, by reference project
 
@@ -59,8 +58,7 @@ All paths below are relative to the root of the upstream
 | `Common/DStarDefines.h` | 115-117 | Reflector port assignments (DPlus=20001, DEXTRA=30001, DCS=30051) | `dstar-gateway-core/src/codec/dplus/consts.rs:10`, `dstar-gateway-core/src/codec/dextra/consts.rs:10`, `dstar-gateway-core/src/codec/dcs/consts.rs:10`, `dstar-gateway-core/src/types/protocol_kind.rs:25` |
 | `Common/DStarDefines.h` | 122 | Magic bytes table | `dstar-gateway-core/src/codec/dplus/consts.rs:33` |
 | `Common/DStarDefines.h` | (all) | `Module` letter space ("A"–"Z") | `dstar-gateway-core/src/types/module.rs:8` |
-| `Common/DPRSHandler.cpp` | 120-260 | DPRS position decoder | `dstar-gateway-core/src/dprs/mod.rs:7` |
-| `Common/DPRSHandler.cpp` | (all) | `calcCRC` function for DPRS checksum | `dstar-gateway-core/src/dprs/crc.rs:5` |
+| `Common/APRSCollector.cpp` | `addCRCData`, `checkCRC`, `calcCRC` | CR-terminated DPRS checksum and source formatting | `dstar-gateway-core/src/dprs/` |
 | `Common/SlowDataEncoder.cpp` | (all) | Slow-data assembler reference | `dstar-gateway-core/src/slowdata/assembler.rs:78`, `dstar-gateway-core/src/slowdata/mod.rs:15` |
 
 #### DExtra (XRF/XLX port 30001)
@@ -100,10 +98,8 @@ All paths below are relative to the root of the upstream
 
 ### LX3JL/xlxd
 
-Used as the "mirror" reference: every ircDDBGateway finding is
-cross-checked against xlxd to find where the two agree (confirming the
-wire behavior) and where they diverge (where the more widely deployed
-behavior is chosen).
+Used to compare server-side wire behavior with ircDDBGateway. Where layouts
+differ, the individual codec contract identifies the selected form.
 
 | File | Lines | Use | Consumed in |
 |------|-------|-------------|------------|

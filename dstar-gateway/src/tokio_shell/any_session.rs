@@ -15,7 +15,7 @@ use dstar_gateway_core::header::DstarHeader;
 use dstar_gateway_core::session::client::{
     DExtra, DPlus, Dcs, DisconnectReason, Event, Protocol, VoiceEndReason,
 };
-use dstar_gateway_core::types::{ProtocolKind, StreamId};
+use dstar_gateway_core::types::{FrameSequence, ProtocolKind, StreamId};
 use dstar_gateway_core::validator::Diagnostic;
 use dstar_gateway_core::voice::VoiceFrame;
 use tokio::sync::watch;
@@ -114,7 +114,7 @@ impl AnyAsyncSession {
     pub async fn send_voice(
         &mut self,
         stream_id: StreamId,
-        seq: u8,
+        seq: FrameSequence,
         frame: VoiceFrame,
     ) -> Result<(), ShellError> {
         match self {
@@ -130,7 +130,11 @@ impl AnyAsyncSession {
     /// # Errors
     ///
     /// Propagates the wrapped session's [`ShellError`].
-    pub async fn send_eot(&mut self, stream_id: StreamId, seq: u8) -> Result<(), ShellError> {
+    pub async fn send_eot(
+        &mut self,
+        stream_id: StreamId,
+        seq: FrameSequence,
+    ) -> Result<(), ShellError> {
         match self {
             Self::DPlus(s) => s.send_eot(stream_id, seq).await,
             Self::DExtra(s) => s.send_eot(stream_id, seq).await,
@@ -150,6 +154,19 @@ impl AnyAsyncSession {
             Self::Dcs(s) => s.disconnect().await,
         }
     }
+
+    /// Join the background task; see [`AsyncSession::join`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the wrapped session's typed completion failure.
+    pub async fn join(&mut self) -> Result<(), ShellError> {
+        match self {
+            Self::DPlus(session) => session.join().await,
+            Self::DExtra(session) => session.join().await,
+            Self::Dcs(session) => session.join().await,
+        }
+    }
 }
 
 /// Protocol-erased mirror of [`Event<P>`], carrying identical payloads.
@@ -158,7 +175,7 @@ impl AnyAsyncSession {
 /// erasure. The header is boxed to keep the frequent [`AnyEvent::VoiceFrame`]
 /// variant small.
 #[non_exhaustive]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum AnyEvent {
     /// Session has transitioned to `Connected`.
     Connected {
@@ -236,24 +253,27 @@ impl<P: Protocol> From<Event<P>> for AnyEvent {
 
 #[cfg(test)]
 mod tests {
+    use dstar_gateway_core::RelayRouting;
     use dstar_gateway_core::header::DstarHeader;
     use dstar_gateway_core::session::client::{DExtra, Event};
-    use dstar_gateway_core::types::{Callsign, Module, StreamId, Suffix};
+    use dstar_gateway_core::types::{Callsign, Module, RoutingCallsign, StreamId, Suffix};
     use dstar_gateway_core::voice::VoiceFrame;
 
     use super::AnyEvent;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
-    fn header() -> DstarHeader {
-        DstarHeader::for_relay(
-            Callsign::from_wire_bytes(*b"W1AW    "),
-            Module::B,
-            Callsign::from_wire_bytes(*b"XRF001  "),
-            Module::C,
+    fn header() -> Result<DstarHeader, dstar_gateway_core::TypeError> {
+        Ok(DstarHeader::for_relay(
+            RelayRouting {
+                operator: RoutingCallsign::new("W1AW")?,
+                local_module: Module::B,
+                reflector: RoutingCallsign::new("XRF001")?,
+                reflector_module: Module::C,
+            },
             Callsign::from_wire_bytes(*b"W1AW    "),
             Suffix::from_wire_bytes(*b"D75 "),
-        )
+        ))
     }
 
     #[test]
@@ -261,7 +281,7 @@ mod tests {
         let sid = StreamId::new(0x1234).ok_or("non-zero id")?;
         let event = Event::<DExtra>::VoiceStart {
             stream_id: sid,
-            header: header(),
+            header: header()?,
             diagnostics: Vec::new(),
         };
 

@@ -1,23 +1,14 @@
 #![cfg(feature = "examples-network")]
-//! Capture inbound reflector traffic to a length-prefixed binary file.
+//! Record post-handshake UDP datagrams to a newly created binary file.
 //!
-//! Connects to a `DExtra` reflector, then taps the raw UDP socket to
-//! write every incoming datagram to `session.bin` for offline replay.
-//! The file format is intentionally minimal: each record is a big-
-//! endian 4-byte length followed by exactly that many bytes. The
-//! conformance harness consumes pcap rather than this format, so the
-//! output is not directly replayable: an adapter must wrap each record
-//! in link/IP/UDP and pcap framing first.
-//!
-//! The capture runs for 60 seconds and then disconnects cleanly.
-//!
-//! Gated behind the `examples-network` feature.
+//! Each record is a four-byte big-endian length followed by exact bytes.
+//! `OUTPUT` defaults to `session.bin`; existing files are refused. The capture
+//! lasts 60 seconds, then awaits unlink and background task completion.
+//! The pcap conformance harness requires a separate framing adapter.
 //!
 //! ```text
-//! DSTAR_CALLSIGN=N0CALL REFLECTOR_HOST=xrf030.example.com:30001 \
-//! OUTPUT=/tmp/session.bin \
-//!     cargo run -p dstar-gateway --example 10_record_session_to_file \
-//!     --features examples-network
+//! DSTAR_CALLSIGN=N0CALL REFLECTOR_HOST=127.0.0.1:30001 OUTPUT=session.bin \
+//! cargo run -p dstar-gateway --example 10_record_session_to_file --features examples-network
 //! ```
 
 #[cfg(feature = "insecure-plaintext-xlx-directory")]
@@ -30,16 +21,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use dstar_gateway_core::session::Driver;
-use dstar_gateway_core::session::client::{ClientStateKind, Configured, DExtra, Session};
-use dstar_gateway_core::types::{Callsign, Module};
+use dstar_gateway::tokio_shell::{AsyncSession, drive_connecting};
+use dstar_gateway_core::Driver;
+use dstar_gateway_core::session::client::{Connected, DExtra, Session};
+use dstar_gateway_core::{Module, RoutingCallsign};
 use tokio::net::UdpSocket;
-use tokio::time::timeout;
 
-// Acknowledged workspace dev-deps. This example taps the raw UDP
-// socket and drives the sans-io core directly, so the async shell
-// crate itself is acknowledged rather than used.
-use dstar_gateway as _;
 use pcap_parser as _;
 use thiserror as _;
 use trybuild as _;
@@ -47,120 +34,83 @@ use trybuild as _;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
-
-    let callsign = Callsign::try_from_str(&env::var("DSTAR_CALLSIGN")?)?;
-    let reflector_host =
-        env::var("REFLECTOR_HOST").unwrap_or_else(|_| "xrf030.example.com:30001".to_string());
-    let output: PathBuf = env::var("OUTPUT")
-        .unwrap_or_else(|_| "session.bin".to_string())
-        .into();
-
-    // Resolve + bind.
-    let peer = tokio::net::lookup_host(&reflector_host)
-        .await?
-        .next()
-        .ok_or("resolve")?;
-    let sock = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
-
-    // Open the capture file. Use a buffered writer so every small
-    // record doesn't hammer the kernel; the `drop(writer)` at the
-    // end flushes implicitly, and we also flush explicitly below.
-    let file = File::create(&output)?;
+    let callsign = RoutingCallsign::new(&env::var("DSTAR_CALLSIGN")?)?;
+    let host = env::var("REFLECTOR_HOST")?;
+    let output = PathBuf::from(env::var("OUTPUT").unwrap_or_else(|_| "session.bin".to_owned()));
+    let file = File::options().write(true).create_new(true).open(&output)?;
     let mut writer = BufWriter::new(file);
-    tracing::info!("recording into {}", output.display());
-
-    // Drive the handshake on the same socket we'll tap.
-    let session: Session<DExtra, Configured> = Session::<DExtra, Configured>::builder()
+    let peer = tokio::time::timeout(Duration::from_secs(5), tokio::net::lookup_host(host))
+        .await??
+        .next()
+        .ok_or("reflector hostname resolved to no addresses")?;
+    let bind = if peer.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    };
+    let socket = Arc::new(UdpSocket::bind(bind).await?);
+    let connecting = Session::<DExtra, _>::builder()
         .callsign(callsign)
-        .local_module(Module::try_from_char('B')?)
-        .reflector_module(Module::try_from_char('C')?)
+        .local_module(Module::B)
+        .reflector_module(Module::C)
         .peer(peer)
-        .build();
-    let now = Instant::now();
-    let mut connecting = session
-        .connect(now)
-        .map_err(|f| format!("connect: {}", f.error))?;
-    if let Some(tx) = connecting.poll_transmit(now) {
-        let _ = sock.send_to(tx.payload, tx.dst).await?;
+        .build()
+        .connect(Instant::now())?;
+    let mut connected = drive_connecting(connecting, &socket, Duration::from_secs(5)).await?;
+    let result = record(&mut connected, &socket, &mut writer).await;
+    let mut client = AsyncSession::spawn(connected, socket);
+    let shutdown = client.disconnect().await;
+    if let Err(error) = &shutdown {
+        tracing::warn!(%error, "capture unlink failed");
     }
-
-    // Recv ACK. We write the ACK to the capture too, since the file
-    // records EVERY inbound datagram, including the handshake reply.
-    let mut buf = [0u8; 2048];
-    let (n, src) = timeout(Duration::from_secs(5), sock.recv_from(&mut buf))
-        .await
-        .map_err(|_| "handshake timeout")??;
-    let slice = buf.get(..n).unwrap_or(&[]);
-    write_record(&mut writer, slice)?;
-    connecting.handle_input(Instant::now(), src, slice)?;
-    if connecting.state_kind() != ClientStateKind::Connected {
-        eprintln!("handshake did not complete");
-        return Ok(());
-    }
-
-    // After the handshake we bypass the tokio shell entirely: it
-    // owns the socket so we can't tap it. The tap is a pure
-    // recv/drive loop that forwards bytes into the sans-io core
-    // directly. This is the simplest way to tee inbound traffic.
-    let mut connected = connecting
-        .promote()
-        .map_err(|f| format!("promote: {}", f.error))?;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-    loop {
-        if tokio::time::Instant::now() >= deadline {
-            break;
-        }
-        // Drain outbound (keepalives).
-        while let Some(tx) = connected.poll_transmit(Instant::now()) {
-            let _ = sock.send_to(tx.payload, tx.dst).await?;
-        }
-        // Wait for the next inbound packet or ~250 ms.
-        let recv_fut = sock.recv_from(&mut buf);
-        match timeout(Duration::from_millis(250), recv_fut).await {
-            Ok(Ok((n, src))) => {
-                let slice = buf.get(..n).unwrap_or(&[]);
-                write_record(&mut writer, slice)?;
-                connected.handle_input(Instant::now(), src, slice)?;
-            }
-            Ok(Err(e)) => return Err(e.into()),
-            Err(_) => {
-                // Timeout: let the session advance its internal
-                // timers. No bytes to record this iteration.
-                connected.handle_timeout(Instant::now());
-            }
-        }
-        // Drain events so the session doesn't block on a full buffer.
-        while let Some(event) = connected.poll_event() {
-            tracing::debug!(?event, "event");
-        }
-    }
-
-    writer.flush()?;
-    drop(writer);
-    tracing::info!("recording complete");
-
-    // Best-effort disconnect on the sans-io session. We don't
-    // unwrap the result, because the recording is the point of this
-    // example, so even a failing disconnect should not drop the
-    // captured file on the floor.
-    if let Err(e) = connected.disconnect_in_place(Instant::now()) {
-        tracing::warn!(?e, "disconnect_in_place failed");
-    }
-    while let Some(tx) = connected.poll_transmit(Instant::now()) {
-        let _ = sock.send_to(tx.payload, tx.dst).await?;
-    }
-
+    result?;
+    shutdown?;
+    tracing::info!(path = %output.display(), "recording complete");
     Ok(())
 }
 
-/// Write one length-prefixed record: 4-byte BE length followed by
-/// `bytes`. Convert the records to link/IP/UDP packets inside a pcap
-/// container before passing them to the conformance replay harness.
+/// Record received bytes while driving due core work; blocking file writes
+/// run on this example's runtime thread and every write/flush error is returned.
+async fn record(
+    session: &mut Session<DExtra, Connected>,
+    socket: &UdpSocket,
+    writer: &mut BufWriter<File>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let mut buffer = vec![0_u8; 65_536].into_boxed_slice();
+    loop {
+        session.handle_timeout(Instant::now());
+        while let Some(transmit) = session.poll_transmit(Instant::now()) {
+            let _sent =
+                tokio::time::timeout_at(deadline, socket.send_to(transmit.payload, transmit.dst))
+                    .await??;
+        }
+        while let Some(event) = session.poll_event() {
+            tracing::debug!(?event, "capture event");
+        }
+        let wake = session.poll_timeout().map_or(deadline, |wake| {
+            tokio::time::Instant::from_std(wake).min(deadline)
+        });
+        match tokio::time::timeout_at(wake, socket.recv_from(&mut buffer)).await {
+            Ok(Ok((length, source))) => {
+                let bytes = buffer.get(..length).ok_or("invalid receive byte count")?;
+                write_record(writer, bytes)?;
+                session.handle_input(Instant::now(), source, bytes)?;
+            }
+            Ok(Err(error)) => return Err(error.into()),
+            Err(_) if tokio::time::Instant::now() >= deadline => break,
+            Err(_) => {}
+        }
+    }
+    writer.flush()?;
+    Ok(())
+}
+
+/// Write one complete length-prefixed record with fallible size conversion.
 fn write_record<W: Write>(writer: &mut W, bytes: &[u8]) -> std::io::Result<()> {
-    let len = u32::try_from(bytes.len()).map_err(|_| {
+    let length = u32::try_from(bytes.len()).map_err(|_| {
         std::io::Error::new(std::io::ErrorKind::InvalidData, "record too large for u32")
     })?;
-    writer.write_all(&len.to_be_bytes())?;
-    writer.write_all(bytes)?;
-    Ok(())
+    writer.write_all(&length.to_be_bytes())?;
+    writer.write_all(bytes)
 }

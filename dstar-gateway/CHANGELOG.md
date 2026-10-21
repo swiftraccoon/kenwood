@@ -1,179 +1,89 @@
 # Changelog
 
-All notable changes to `dstar-gateway-core`, `dstar-gateway`, and
-`dstar-gateway-server` are documented in this file.
+Changes to dstar-gateway-core, dstar-gateway and dstar-gateway-server.
+The packages are experimental and unpublished; unreleased APIs can change
+without compatibility adapters.
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
-and the project aims to adhere to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
-once it reaches 1.0. Pre-1.0 releases may include breaking changes
-in any version bump.
+## Unreleased
 
-**Status: 0.1.0 alpha, not published to crates.io.** The rewrite is
-tracked under `[Unreleased]` until it has been stress-tested against
-real reflectors and is ready for a published release.
+### Core wire and state contracts
 
-## [Unreleased]
+- Client typestate and runtime drivers share directional DPlus, DExtra and DCS
+  codecs, typed errors and supplied diagnostic sinks. Received bytes remain
+  lossless; checked text views and transmit construction are separate.
+- FrameSequence restricts transmit indices to 0..=20. RoutingCallsign reserves
+  the eighth byte for a module; RelayRouting groups route inputs.
+  HeaderFlags preserves wire bytes and distinguishes independent flags from
+  the exclusive repeater-control code.
+- DCS construction requires DcsReflector; the builder no longer substitutes
+  DCS001. Runtime SessionCore construction takes SessionConfig/ClientProtocol.
+- Module-bearing control codecs take RepeaterIdentity. ACK/NAK retain the
+  client module; ModuleSlot represents a selected or empty target.
+  Reply identity/modules/phase are correlated, and late link replies cannot
+  complete unlink. Client voice/poll input applies only while connected.
+- Equal-deadline transmits preserve FIFO; client/server protocol-marker
+  mismatches leave events queued. Public time-bearing transitions reject
+  unrepresentable timer spans before mutation.
+- ServerSessionCore checks linked identity/module, active streams and terminal
+  input. The unsupported server typestate facade is removed.
+- Host parsing uses checked names/addresses/nonzero ports and atomic typed row
+  failures. HostFile/HostList support standard collection and iteration traits.
+- DprsReport owns parsing and encoding with verified/default CRC, explicit
+  diagnostic checksum bypass, validated source/symbol/comment/position and
+  coordinate rounding carry. SlowDataTextMessage owns encoding; fixed text
+  blocks and checked borrowed views replace allocating compatibility views.
+- The README is executable rustdoc; golden/property/state/UI tests and
+  independently linted fuzz targets cover their respective contracts.
 
-### `dstar-gateway-core`
+### Client shell completion and resources
 
-#### Added
-- **Workspace foundation**: three-crate workspace, shared `types`
-  module with `Callsign`, `Module`, `ReflectorCallsign`,
-  `StreamId`, `Suffix`, `BandLetter`, `ProtocolKind`, and the
-  `DstarHeader` struct with CRC-CCITT validation.
-- **DPlus codec**: full wire-format encode/decode for the DPlus
-  (REF port 20001) protocol. Covers LINK1, LINK1_ACK, LINK2,
-  OKRW, NAK, keepalive, voice header, voice data, EOT, and the
-  TCP auth request/response parsers. Golden fixtures pinned
-  against `ircDDBGateway` and `xlxd` captures.
-- **DExtra codec**: full wire-format encode/decode for the
-  DExtra (XRF/XLX port 30001) protocol. LINK / UNLINK / ACK /
-  NAK, keepalive, voice header, voice data, EOT.
-- **DCS codec**: full wire-format encode/decode for the DCS
-  (port 30051) protocol including the 519-byte LINK packet and
-  the 100-byte voice frame layout.
-- **Typestate client session**: sans-io `Session<P, S>` with
-  compile-time-enforced state transitions
-  (`Configured → Authenticated → Connecting → Connected →
-  Disconnecting → Closed`) and a `Failed<S, E>` recovery
-  state. Includes a `Driver` trait that every state implements
-  for uniform `poll_transmit` / `handle_input` / `poll_event`
-  access.
-- **Sans-io Driver + timer wheel**: time is injected via
-  `Instant` arguments, not read from the system clock. Enables
-  deterministic property tests.
-- **Slow-data sub-codec**: encoder and decoder for the slow-data
-  blocks embedded in voice frames. Covers the scrambler and the
-  `SlowDataAssembler` finite state machine.
-- **DPRS position reports**: full DPRS `$$CRC` parser with the
-  `calcCRC` algorithm from `ircDDBGateway`.
-- **Server typestate**: `ServerSessionCore` + per-client
-  state machines mirroring the client side. DPlus, DExtra, and
-  DCS server handshakes are implemented at the core layer and the
-  `ProtocolEndpoint<P>` shell dispatches all three.
-- **State-gated typestate methods**: `handle_voice_data`
-  restricted to `ServerSession<P, Streaming>`, `handle_link2`
-  to `ServerSession<DPlus, Link1Received>`, `handle_unlink` to
-  `ServerSession<P, Linked>`. Compile-fail tests enforce each.
-- **Lenient parsing + `DiagnosticSink`**: every codec decoder
-  records structured `Diagnostic`s for recoverable wire-format
-  quirks instead of failing, via `DiagnosticSink::record`; strict
-  rejection is a pattern a caller implements in its own `record`
-  impl, not a shipped type. Unknown-length datagrams in the client
-  session dispatcher are swallowed as diagnostics so
-  reflector-emitted quirks never kill an established session.
-- **Error hierarchy**: layered `Error` / `ProtocolError` /
-  per-protocol error enums (`DPlusError`, `DExtraError`,
-  `DcsError`), each tied to specific failure modes.
+- Shared asynchronous and synchronous handshake drivers enforce one total
+  deadline around I/O and timer work; unrepresentable deadlines fail before
+  sending. Session drivers retain source-address checks.
+- Async send replies follow flushing ready datagrams to the local UDP socket.
+  Two-second send deadlines and shared typed failures expose local send
+  completion. Cancellation after enqueue can still transmit.
+- AsyncSession/AnyAsyncSession retain task completion through join.
+  Cancellation retains the task handle; the first join consumes its result.
+  Disconnect observes the terminal unlink outcome and joins completion.
+- The 32-entry command and 256-entry event FIFOs preserve ordering.
+  Commands continue under receive backpressure; callers keep consuming events
+  for input/timers to progress.
+- AuthClient Default/new share bounded DNS/connect, write, response and idle
+  windows plus a retained-byte limit. Sequential address attempts fit inside
+  one connect deadline; partial reads do not renew total response time.
+- Optional plaintext directory retrieval has a fallible constructor, configured
+  client, total deadline, body limit and typed UTF-8/host-row errors.
+- The synchronous shell exposes TX, bounded idle polling, closure status,
+  disconnect and resource extraction. Its examples use the shared handshake.
+- Examples reconstruct complete bounded DPRS lines, retain capture write errors
+  and use the checked core domains. The book includes maintained example source.
 
-### `dstar-gateway`
+### Reflector server
 
-#### Added
-- **Tokio shell**: `tokio_shell::AsyncSession<P>` wraps a
-  `Session<P, Connected>` and a `UdpSocket` in a spawned task
-  with command/event channels. `send_header`, `send_voice`,
-  `send_eot`, `disconnect`, and `next_event` surface on the
-  handle. Every session-loop exit path is instrumented with
-  tracing so the tokio task never vanishes silently.
-- **DPlus TCP auth**: `auth::AuthClient` performs the 56-byte
-  auth packet exchange over TCP and parses the host-list
-  response into a `HostList`. Uses a happy-eyeballs-style
-  fallback across the multiple round-robin A records of
-  `auth.dstargateway.org` with a short per-address timeout so
-  dead addresses don't burn the overall connect budget.
-- **`blocking` feature**: caller-driven synchronous shell using
-  `std::net::UdpSocket`; callers do not need to run a tokio runtime.
-- **`insecure-plaintext-xlx-directory` feature**: pulls `reqwest` and exposes
-  the explicitly named `InsecurePlaintextXlxDirectoryFetcher`. Its
-  `fetch_over_plaintext_http` method contacts the XLX registry's HTTP-only
-  endpoint. Responses have no confidentiality, authenticity, or integrity.
-- **Loopback integration tests**: full tokio shell +
-  `FakeReflector` UDP harness exercising connect → voice → EOT
-  → disconnect round trips for all three protocols.
-- **Conformance pcap replay**: `tests/conformance.rs` uses
-  `pcap-parser` to strip Ethernet/IPv4/UDP headers from
-  captured traffic and feeds UDP payloads through every
-  codec. The corpus itself lives outside the tree; the runner
-  is shipped and no-ops on an empty corpus.
-- **Live-reflector integration tests**: `tests/hardware.rs` contains
-  real connect/listen/disconnect bodies for all three protocols
-  plus a voice-burst TX test, triple-gated behind the
-  `hardware-tests` feature, `#[ignore]`, and an opt-in
-  `DSTAR_TEST_TX_OK=1` env var so nobody accidentally keys the
-  air on a real-world reflector.
+- Private checked configuration requires a routing identity, nonempty modules
+  and protocols, finite recipient rates and representable timing windows.
+  Named pre-bound sockets replace interchangeable positional socket arguments.
+- Endpoint markers determine protocols. Client creation, protocol transitions
+  and module indexes update atomically; public observations are owned snapshots
+  and selected voice routes rather than mutable pool handles.
+- One active protocol/peer/stream identity governs raw and cross-protocol
+  forwarding. Both paths charge the same recipient budget and bound each UDP
+  enqueue by two seconds. Successful sends reset consecutive-failure accounting.
+- DCS header conversion caches context without synthesizing a voice packet.
+  Combined DCS voice packets are forwarded once, including across superframes;
+  cross-protocol end packets retain the final sequence and set the end bit.
+- Run consumes the reflector, binds sockets before spawning, and joins every
+  endpoint after shutdown or a task failure. Typed failures retain all task
+  outcomes; custom endpoints reject concurrent UDP drivers. POLARIS signals
+  shutdown and awaits completion on Ctrl-C.
+- Published README examples, loopback forwarding checks, concurrency and
+  cancellation tests, and targeted guard mutations cover these contracts.
 
-#### Fixed
+### Migration
 
-- `AsyncSession` continues processing outbound commands and sending their
-  UDP packets when the incoming event queue is full, preserving FIFO event
-  delivery. Incoming UDP traffic and protocol timers still wait for event
-  capacity; callers must continue consuming `next_event` for receive and
-  link maintenance to progress.
-
-### `dstar-gateway-server`
-
-#### Added
-- **`Reflector` top-level type**: owns the per-protocol
-  endpoints, spawns one tokio task per enabled protocol, and
-  manages shutdown via a `tokio::sync::watch` channel.
-- **`ProtocolEndpoint<P>` run loop**: binds a pre-configured
-  `UdpSocket` and drives `ServerSessionCore` for every
-  inbound peer. All three protocol handshakes
-  (DPlus, DExtra, DCS) dispatch through dedicated
-  per-protocol `handle_inbound_*` helpers.
-- **`ReflectorConfig` + typed builder**: bind address, enabled-protocol
-  set with `enable` / `disable` helpers, max clients, keepalive cadence, TX
-  rate-limit frames per second, cross-protocol forwarding
-  flag. Missing/Provided marker typestate ensures required
-  fields are supplied at compile time.
-- **`ClientAuthorizer` trait** consulted on every inbound LINK
-  attempt, with `AllowAllAuthorizer` and `DenyAllAuthorizer`
-  as the default implementations. Rejected attempts produce
-  a protocol-appropriate NAK plus a `ServerEvent::ClientRejected`
-  event.
-- **`AccessPolicy::ReadOnly` enforcement**: voice from read-only
-  clients is dropped (not relayed, not transitioned to
-  `Streaming`) and emits a `VoiceFromReadOnlyDropped` event.
-- **`ClientPool<P>`**: thread-safe map from peer `SocketAddr`
-  to `ClientHandle<P>` with a reverse index from `Module` to
-  the set of peers linked on that module.
-- **`StreamCache` header retransmit**: the endpoint maintains a
-  per-module stream cache, records each voice frame, and
-  re-fans-out the cached voice header every 21 frames to
-  match xlxd's cadence.
-- **`fan_out_voice`** engine: broadcasts an inbound voice frame
-  to every peer on the same module except the sender. Per-peer
-  token-bucket rate limiting gates outbound frames so one slow
-  client can't stall fan-out for everyone.
-- **Unhealthy-client eviction**: `ClientPool::mark_unhealthy`
-  tracks consecutive send failures and triggers eviction after
-  `DEFAULT_UNHEALTHY_THRESHOLD` strikes, emitting a
-  `ServerEvent::ClientEvicted` event.
-- **Cross-protocol forwarding** (optional, off by default):
-  `transcode_voice` re-encodes voice events across protocol
-  boundaries. `Reflector` allocates a `tokio::sync::broadcast`
-  channel for cross-protocol events when the config flag is
-  set, and each endpoint subscribes, transcodes, and fans out
-  events from other protocols.
-
-### Test infrastructure
-
-#### Added
-- **Ten `cargo-fuzz` targets** covering parser entry points across
-  DPlus, DExtra, DCS, slow-data, DPRS, and auth.
-- **CI fuzz workflow**: a GitHub Action runs every fuzz target
-  for a capped wall-clock budget per PR touching the core
-  crate.
-- **Server-side compile-fail tests** for the typestate contract
-  (invalid `handle_voice_data` / `handle_link2` / `handle_unlink`
-  calls are rejected at compile time).
-- **`pcap-parser` dev-dep** for the conformance replay runner.
-
-### Internal migration notes
-
-The previous-generation hand-rolled `dstar-gateway` crate
-(still 0.1.0, never published) has been fully replaced in-place
-by this rewrite. `thd75-repl` was migrated to the new typestate
-API in the same rewrite pass. There is no external 0.x to
-migrate from; a `MIGRATING.md` document will be written when an
-actual 0.x is cut on crates.io.
+Workspace consumers use canonical checked core types and the new report/text
+methods directly. There are no old-signature shims. Optional directory
+construction and synchronous session construction are fallible. Callers
+requiring background completion await disconnect/join; channel closure alone
+is not a task result.

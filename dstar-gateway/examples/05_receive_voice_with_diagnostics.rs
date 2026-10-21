@@ -26,12 +26,10 @@ use std::env;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use dstar_gateway::tokio_shell::AsyncSession;
-use dstar_gateway_core::session::Driver;
-use dstar_gateway_core::session::client::{ClientStateKind, Configured, DExtra, Session};
-use dstar_gateway_core::types::{Callsign, Module};
+use dstar_gateway::tokio_shell::{AsyncSession, drive_connecting};
+use dstar_gateway_core::session::client::{Configured, DExtra, Session};
+use dstar_gateway_core::types::{Module, RoutingCallsign};
 use tokio::net::UdpSocket;
-use tokio::time::timeout;
 
 // Acknowledged workspace dev-deps.
 use pcap_parser as _;
@@ -42,22 +40,27 @@ use trybuild as _;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
-    let callsign = Callsign::try_from_str(&env::var("DSTAR_CALLSIGN")?)?;
+    let callsign = RoutingCallsign::new(&env::var("DSTAR_CALLSIGN")?)?;
     let reflector_host =
         env::var("REFLECTOR_HOST").unwrap_or_else(|_| "xrf030.example.com:30001".to_string());
-    let reflector_module_char = env::var("REFLECTOR_MODULE")
+    let reflector_module = env::var("REFLECTOR_MODULE")
         .unwrap_or_else(|_| "C".to_string())
-        .chars()
-        .next()
-        .unwrap_or('C');
-    let reflector_module = Module::try_from_char(reflector_module_char)?;
+        .parse::<Module>()?;
 
     // Resolve the reflector and bind a local ephemeral socket.
-    let peer = tokio::net::lookup_host(&reflector_host)
-        .await?
-        .next()
-        .ok_or("failed to resolve reflector host")?;
-    let sock = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
+    let peer = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::net::lookup_host(&reflector_host),
+    )
+    .await??
+    .next()
+    .ok_or("failed to resolve reflector host")?;
+    let bind = if peer.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    };
+    let sock = Arc::new(UdpSocket::bind(bind).await?);
 
     // Build and drive the Configured -> Connecting -> Connected
     // handshake. `DExtra` has no auth step, so this is a single
@@ -69,25 +72,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .peer(peer)
         .build();
 
-    let now = Instant::now();
-    let mut connecting = session
-        .connect(now)
-        .map_err(|f| format!("connect: {}", f.error))?;
-
-    if let Some(tx) = connecting.poll_transmit(now) {
-        let _ = sock.send_to(tx.payload, tx.dst).await?;
-    }
-    let mut buf = [0u8; 64];
-    let (n, src) = timeout(Duration::from_secs(5), sock.recv_from(&mut buf))
-        .await?
-        .map_err(|e| format!("recv ACK: {e}"))?;
-    let slice = buf.get(..n).unwrap_or(&[]);
-    connecting.handle_input(Instant::now(), src, slice)?;
-
-    if connecting.state_kind() != ClientStateKind::Connected {
-        eprintln!("handshake did not complete");
-        return Ok(());
-    }
+    let connecting = session.connect(Instant::now())?;
+    let mut connected = drive_connecting(connecting, &sock, Duration::from_secs(5)).await?;
 
     // Drain any diagnostics from the handshake phase BEFORE handing
     // the session off to the async shell. Once `AsyncSession::spawn`
@@ -95,16 +81,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // from this task, so diagnostics would require a different API
     // (a shell-side `diagnostics()` accessor, which isn't part of
     // this example's scope).
-    for diag in connecting.diagnostics() {
+    for diag in connected.diagnostics() {
         tracing::warn!(?diag, "handshake diagnostic");
     }
 
-    let mut async_session = AsyncSession::spawn(
-        connecting
-            .promote()
-            .map_err(|f| format!("promote: {}", f.error))?,
-        Arc::clone(&sock),
-    );
+    let mut async_session = AsyncSession::spawn(connected, Arc::clone(&sock));
 
     // Listen for 30 seconds of traffic. `Event::VoiceStart` is the
     // interesting one: it carries the decoded header AND the

@@ -16,10 +16,6 @@ use dstar_gateway_core::session::client::{
 };
 use tokio::net::UdpSocket;
 
-/// Receive-poll granularity: how often the core gets a timer tick while no
-/// datagram arrives, so keepalives and retransmits still fire.
-const POLL_TICK: Duration = Duration::from_millis(100);
-
 /// Why a reflector connect handshake did not reach `Connected`.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -32,17 +28,21 @@ pub enum ConnectError {
     #[error("timed out after {0:?} waiting for reflector acknowledgement")]
     TimedOut(Duration),
 
+    /// The requested total deadline exceeds the platform's Instant range.
+    #[error("handshake deadline {0:?} cannot be represented")]
+    DeadlineOverflow(Duration),
+
     /// Socket I/O failed during the handshake.
     #[error("handshake I/O failed")]
     Io(#[from] std::io::Error),
 
     /// An inbound datagram could not be decoded.
     #[error("handshake decode failed: {0}")]
-    Protocol(dstar_gateway_core::error::Error),
+    Protocol(#[source] dstar_gateway_core::error::Error),
 
     /// The state machine reported `Connected` but promotion failed.
     #[error("promotion to Connected failed: {0}")]
-    Promote(dstar_gateway_core::error::Error),
+    Promote(#[source] dstar_gateway_core::error::Error),
 }
 
 /// Drive a `Connecting` session to `Connected` over `socket`.
@@ -53,34 +53,48 @@ pub enum ConnectError {
 /// # Errors
 ///
 /// [`ConnectError::Rejected`] when the state machine closes,
-/// [`ConnectError::TimedOut`] at the deadline, and the I/O, decode, or
-/// promotion failures otherwise.
+/// [`ConnectError::TimedOut`] at the total deadline,
+/// [`ConnectError::DeadlineOverflow`] before I/O for an unrepresentable span,
+/// and typed I/O, protocol or promotion failures otherwise.
+///
+/// # Cancellation
+///
+/// The function owns the session; cancellation drops it. Datagrams already
+/// sent may have reached the peer, and the caller retains the socket.
 pub async fn drive_connecting<P: Protocol>(
     mut session: Session<P, Connecting>,
     socket: &UdpSocket,
     deadline: Duration,
 ) -> Result<Session<P, Connected>, ConnectError> {
-    let cutoff = Instant::now() + deadline;
+    let cutoff = tokio::time::Instant::now()
+        .checked_add(deadline)
+        .ok_or(ConnectError::DeadlineOverflow(deadline))?;
     let mut buf = [0_u8; 2048];
 
     loop {
+        let now = Instant::now();
+        session.handle_timeout(now);
         match session.state_kind() {
             ClientStateKind::Connected => break,
             ClientStateKind::Closed => return Err(ConnectError::Rejected),
             _ => {}
         }
 
-        if Instant::now() >= cutoff {
+        if tokio::time::Instant::now() >= cutoff {
             return Err(ConnectError::TimedOut(deadline));
         }
 
         // Drain any outbound packets the core wants on the wire.
         while let Some(tx) = session.poll_transmit(Instant::now()) {
-            let _sent = socket.send_to(tx.payload, tx.dst).await?;
+            let _sent = tokio::time::timeout_at(cutoff, socket.send_to(tx.payload, tx.dst))
+                .await
+                .map_err(|_| ConnectError::TimedOut(deadline))??;
         }
 
-        // Wait for an inbound datagram, or give the core a timer tick.
-        match tokio::time::timeout(POLL_TICK, socket.recv_from(&mut buf)).await {
+        let wake = session.poll_timeout().map_or(cutoff, |wake| {
+            tokio::time::Instant::from_std(wake).min(cutoff)
+        });
+        match tokio::time::timeout_at(wake, socket.recv_from(&mut buf)).await {
             Ok(Ok((n, src))) => {
                 let Some(bytes) = buf.get(..n) else {
                     continue;
@@ -90,7 +104,7 @@ pub async fn drive_connecting<P: Protocol>(
                     .map_err(ConnectError::Protocol)?;
             }
             Ok(Err(error)) => return Err(ConnectError::Io(error)),
-            Err(_elapsed) => session.handle_timeout(Instant::now()),
+            Err(_elapsed) => {}
         }
     }
 

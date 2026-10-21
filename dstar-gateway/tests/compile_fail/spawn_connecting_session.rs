@@ -14,26 +14,27 @@ use std::time::Instant;
 
 use dstar_gateway::tokio_shell::AsyncSession;
 use dstar_gateway_core::session::client::{Configured, DExtra, Session};
-use dstar_gateway_core::types::{Callsign, Module};
+use dstar_gateway_core::types::{Module, RoutingCallsign};
 use tokio::net::UdpSocket;
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let session: Session<DExtra, Configured> = Session::<DExtra, Configured>::builder()
-        .callsign(Callsign::try_from_str("W1AW").unwrap())
-        .local_module(Module::try_from_char('B').unwrap())
-        .reflector_module(Module::try_from_char('C').unwrap())
-        .peer("127.0.0.1:30001".parse().unwrap())
+        .callsign(RoutingCallsign::new("W1AW")?)
+        .local_module(Module::B)
+        .reflector_module(Module::C)
+        .peer("127.0.0.1:30001".parse()?)
         .build();
 
     // Transition to `Connecting`; the LINK packet is now in the
     // outbox but the handshake hasn't completed.
-    let connecting = session.connect(Instant::now()).unwrap();
+    let connecting = session.connect(Instant::now())?;
 
-    let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
 
     // ERROR: `AsyncSession::spawn` only accepts `Session<P, Connected>`,
     // not `Session<P, Connecting>`. The type mismatch is rejected at
     // call site by the `S` parameter substitution.
     let _ = AsyncSession::spawn(connecting, socket);
+    Ok(())
 }

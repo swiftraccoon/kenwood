@@ -27,7 +27,7 @@
 //!   tokio remains an unconditional dependency of this async crate.
 //! - `insecure-plaintext-xlx-directory`: pulls `reqwest` and exposes
 //!   `insecure_plaintext_xlx_directory` for an explicit fetch from the XLX
-//!   registry's HTTP-only endpoint. The response has no transport
+//!   registry's selected plaintext HTTP endpoint. The response has no transport
 //!   confidentiality, authenticity, or integrity. Disabled by default.
 //!
 //! # Core re-exports
@@ -35,15 +35,6 @@
 //! The core types are re-exported from `dstar-gateway-core` for
 //! consumer convenience, so downstream crates don't need a separate
 //! `dstar-gateway-core` dependency for the common types.
-
-pub mod auth;
-pub mod tokio_shell;
-
-#[cfg(feature = "blocking")]
-pub mod blocking_shell;
-
-#[cfg(feature = "insecure-plaintext-xlx-directory")]
-pub mod insecure_plaintext_xlx_directory;
 
 // Re-export the core's leaf types so simple consumers need only this
 // crate. The typestate session machinery (`Session`, `Driver`, the
@@ -61,3 +52,10 @@ use pcap_parser as _;
 use tracing_subscriber as _;
 #[cfg(test)]
 use trybuild as _;
+
+pub mod auth;
+#[cfg(feature = "blocking")]
+pub mod blocking_shell;
+#[cfg(feature = "insecure-plaintext-xlx-directory")]
+pub mod insecure_plaintext_xlx_directory;
+pub mod tokio_shell;

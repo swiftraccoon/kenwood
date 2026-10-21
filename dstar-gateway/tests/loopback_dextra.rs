@@ -10,17 +10,18 @@
 #[cfg(feature = "insecure-plaintext-xlx-directory")]
 use reqwest as _;
 
-mod common;
-
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use common::fake_reflector::FakeReflector;
 use dstar_gateway::tokio_shell::{AsyncSession, ShellError};
+use dstar_gateway_core::HeaderFlags;
 use dstar_gateway_core::header::DstarHeader;
 use dstar_gateway_core::session::Driver;
 use dstar_gateway_core::session::client::{ClientStateKind, Configured, DExtra, Event, Session};
-use dstar_gateway_core::types::{Callsign, Module, StreamId, Suffix};
+use dstar_gateway_core::types::{
+    Callsign, FrameSequence, Module, RoutingCallsign, StreamId, Suffix,
+};
 use dstar_gateway_core::voice::VoiceFrame;
 use tokio::net::UdpSocket;
 use tokio::time::timeout;
@@ -30,6 +31,8 @@ use thiserror as _;
 use tracing as _;
 use tracing_subscriber as _;
 use trybuild as _;
+
+mod common;
 
 #[tokio::test]
 async fn dextra_connect_via_loopback_and_send_voice() -> Result<(), Box<dyn std::error::Error>> {
@@ -42,7 +45,7 @@ async fn dextra_connect_via_loopback_and_send_voice() -> Result<(), Box<dyn std:
 
     // 3. Build a `Session<DExtra, Configured>`.
     let session: Session<DExtra, Configured> = Session::<DExtra, Configured>::builder()
-        .callsign(Callsign::from_wire_bytes(*b"W1AW    "))
+        .callsign(RoutingCallsign::new("W1AW")?)
         .local_module(Module::B)
         .reflector_module(Module::C)
         .peer(reflector_addr)
@@ -77,9 +80,7 @@ async fn dextra_connect_via_loopback_and_send_voice() -> Result<(), Box<dyn std:
 
     // 6. Send a voice header + 5 voice data frames + EOT.
     let header = DstarHeader {
-        flag1: 0,
-        flag2: 0,
-        flag3: 0,
+        flags: HeaderFlags::NONE,
         rpt2: Callsign::from_wire_bytes(*b"XRF030 G"),
         rpt1: Callsign::from_wire_bytes(*b"XRF030 C"),
         ur_call: Callsign::from_wire_bytes(*b"CQCQCQ  "),
@@ -91,9 +92,13 @@ async fn dextra_connect_via_loopback_and_send_voice() -> Result<(), Box<dyn std:
 
     let frame = VoiceFrame::silence();
     for seq in 0u8..5 {
-        async_session.send_voice(sid, seq, frame).await?;
+        async_session
+            .send_voice(sid, FrameSequence::try_from(seq)?, frame)
+            .await?;
     }
-    async_session.send_eot(sid, 5).await?;
+    async_session
+        .send_eot(sid, FrameSequence::try_from(5)?)
+        .await?;
 
     // 7. Give the reflector task a moment to receive everything.
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -129,7 +134,7 @@ async fn dextra_connect_via_loopback_and_send_voice() -> Result<(), Box<dyn std:
         "DExtra fake does not acknowledge UNLINK: {disconnect_result:?}"
     );
 
-    // 10. Dropping the completed handle terminates the session task.
+    // Disconnect has joined the completed session task.
     drop(async_session);
 
     Ok(())
@@ -145,7 +150,7 @@ async fn dextra_async_session_observes_connected_event() -> Result<(), Box<dyn s
     let client_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
 
     let session: Session<DExtra, Configured> = Session::<DExtra, Configured>::builder()
-        .callsign(Callsign::from_wire_bytes(*b"W1AW    "))
+        .callsign(RoutingCallsign::new("W1AW")?)
         .local_module(Module::B)
         .reflector_module(Module::C)
         .peer(fake.local_addr()?)
@@ -185,7 +190,7 @@ async fn activity_watch_updates_on_inbound_datagram() -> Result<(), Box<dyn std:
     let reflector_addr = fake.local_addr()?;
     let client_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
     let session: Session<DExtra, Configured> = Session::<DExtra, Configured>::builder()
-        .callsign(Callsign::from_wire_bytes(*b"W1AW    "))
+        .callsign(RoutingCallsign::new("W1AW")?)
         .local_module(Module::B)
         .reflector_module(Module::C)
         .peer(reflector_addr)

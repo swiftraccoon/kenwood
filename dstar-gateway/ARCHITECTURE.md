@@ -1,230 +1,109 @@
-# dstar-gateway Architecture
+# D-STAR stack architecture
 
-This document gives a 5000-foot view of how `dstar-gateway` is laid
-out. It is aimed at developers who want to understand the codebase
-well enough to contribute or to embed the library in their own
-application. The per-protocol wire-format details live in
-[REFERENCES.md](REFERENCES.md) and the per-release change log lives
-in [CHANGELOG.md](CHANGELOG.md).
+The stack separates wire/state logic from network I/O. Protocol comparisons
+use the public revisions in [REFERENCES](REFERENCES.md); behavior changes are
+recorded in [CHANGELOG](CHANGELOG.md).
 
-## 1. The three-crate split
+| Crate | Responsibility |
+| --- | --- |
+| dstar-gateway-core | Directional codecs, checked transmit values, lossless receive fields, client/server state machines, slow data and DPRS. Uses std, opens no socket and reads no clock. |
+| dstar-gateway | Tokio and synchronous client drivers, TCP authentication and optional HTTP directory retrieval. Owns network I/O and obtains time. |
+| dstar-gateway-server | Protocol endpoints, authorization, client pools, stream caches, recipient budgets and reflector task coordination. |
 
-dstar-gateway is shipped as **three** crates so that consumers can
-depend on exactly the layer they need and so that each crate can
-enforce its own dependency boundary.
+## Core state and wire boundaries
 
-```
-+------------------------------+  +------------------------------+
-|    dstar-gateway-server      |  |       dstar-gateway          |
-| Reflector + ClientPool       |  | AsyncSession + AuthClient    |
-+---------------+--------------+  +--------------+---------------+
-                \                            /
-                 +------------+-------------+
-                 |   dstar-gateway-core      |
-                 | codecs + session machines |
-                 +---------------------------+
-```
+`Session<P, S>` constrains client operations through sealed protocol and
+state markers. Consuming transitions return `Failed<S, E>` with the session
+and typed error. Driver input, timeout and in-place disconnect can change
+runtime state later; every send checks that runtime state.
 
-- **`dstar-gateway-core`** has zero I/O dependencies. No tokio, no
-  sockets, no filesystem access. It is a pure `&[u8] <-> types`
-  library. You can compile it for `no_std`-adjacent embedded targets
-  (desktop `std` is still required for collections but not for I/O)
-  or for WebAssembly without reaching for a custom runtime shim.
-- **`dstar-gateway`** is the tokio shell. It pulls in `tokio`, owns
-  the `UdpSocket`, and spawns the session driver loop. It is the
-  right dependency for the common case: an async application talking
-  to a reflector.
-- **`dstar-gateway-server`** is the multi-client reflector server. It
-  depends directly on `dstar-gateway-core` (not the client shell) and
-  layers a `ClientPool`, a `Reflector`, and a fan-out engine on top.
+`SessionCore` accepts named `SessionConfig` and `ClientProtocol` values.
+DCS configuration contains a required target identity. Transmit indices use
+`FrameSequence`; routing prefixes reserve the eighth callsign byte for a
+module. `RepeaterIdentity` carries the local prefix and module in control
+packets. Receive arrays, header flags and sequence bytes retain unknown values.
 
-The motivation for keeping the core sans-io is testability:
-**every wire-format bug can be reproduced by hand in a unit test**
-without booking a UDP port, spinning up a tokio runtime, or
-introducing test flakiness. See ADR 0001.
+`ServerSessionCore` checks per-peer transitions at runtime. It retains linked
+identity/module, admits an active stream and rejects unrelated stream endings.
+Client and server share the directional codecs rather than a server typestate
+facade.
 
-## 2. Sans-io core + typestate client session
+Ready transmits and events are caller-drained queues. Equal transmit release
+times preserve FIFO. Public time-bearing mutations reject unrepresentable
+timer spans before changing state; timeout at the clock limit closes once.
+The core's unbounded queues require the embedding driver to keep draining.
 
-Inside `dstar-gateway-core` the code is structured around two
-abstractions that compose:
+## Client drivers and completion
 
-### 2.1 The codec (`codec/`)
+`drive_connecting` owns the asynchronous handshake pump. One absolute
+deadline bounds sends, receives and timer work. Timers are processed before
+receive, including under continuous input. Cancellation drops the consumed
+session while the caller retains the socket.
 
-The codec module contains three submodules (`dplus`, `dextra`, and
-`dcs`), each of which exports pure functions: encoders like
-`encode_voice_header`, `encode_voice_data`, and `encode_voice_eot`,
-decoders like `decode_server_to_client` and
-`decode_client_to_server`, plus DPlus's `parse_auth_response`.
-The decoders take `&[u8]` slices and a `&mut dyn DiagnosticSink`
-and return `Result` values carrying the decoded packet or a
-protocol error. They
-are completely independent of any runtime. Golden fixtures in
-`dstar-gateway-core/tests/golden/{dplus,dextra,dcs}/` pin every byte of
-every wire format against bytes captured from `ircDDBGateway` and `xlxd`,
-and are exercised by the `codec_{dplus,dextra,dcs}_golden` test runners.
+`AsyncSession` retains the spawned task handle, command/event channels and
+a peer-activity watch receiver. A send reply follows core acceptance and
+flushing every ready datagram to the local socket. Each UDP send has a
+two-second local budget. Cancellation after enqueue can still transmit;
+local completion does not establish peer receipt.
 
-### 2.2 The typestate `Session<P, S>` (`session/client/`)
+Commands have 32 FIFO slots; events have 256. A full event queue still permits
+outbound commands and UDP sends. Input and protocol timers wait for event
+capacity, so callers must keep consuming events. Foreign source datagrams do
+not update peer activity.
 
-The `Session<P, S>` type parameterizes over the **protocol** `P`
-(`DPlus`, `DExtra`, `Dcs`) and the **state** `S` (`Configured`,
-`Authenticated`, `Connecting`, `Connected`, `Disconnecting`, or
-`Closed`). A state machine built this way
-makes invalid state transitions a compile error: you cannot call
-`send_voice` on a `Session<DExtra, Configured>` because only
-`Session<DExtra, Connected>` has that method.
+Normal terminal state exits the task. `join` drains pending events and
+returns the task result once; a cancelled wait retains the task for another
+call. `disconnect` waits for UNLINK acknowledgement or its protocol timeout,
+then joins completion. Dropping a handle closes its channels without awaiting
+graceful unlink.
 
-Fallible consuming transitions return `Failed<S, E>`, a wrapper that
-preserves the last valid session and the error so the caller can retry
-or give up. See ADR 0002.
+The `blocking` feature has a separate synchronous I/O pump and the same
+checked core. Its socket is configured for blocking mode; per-call receive
+waits total at most 100 ms, with separate two-second send timeouts.
+Polling returns queued events before reading. None means idle or closed;
+`is_closed` distinguishes them. Explicit TX, disconnect and `into_parts`
+cover the caller-driven resource lifecycle.
 
-### 2.3 The server typestate (`session/server/`)
+## Authentication, directory and errors
 
-The same approach is applied to the server side: a
-`ServerSessionCore` lives in the core crate and drives per-client
-state machines. This is what the reflector server consumes. See ADR
-0003 for why client and server share the codec.
+`AuthClient` owns one transient TCP stream. DNS and all sequential address
+attempts share the configured connect deadline; writing has an independent
+budget. Reading has a fixed total deadline, an idle deadline and a retained
+byte limit. Builder settings and Default/new share one documented policy.
+Cancellation closes the stream; resolver work already started by the OS may
+finish afterward.
 
-## 3. Symmetric client and server
+Optional directory retrieval uses a configured client, total deadline and
+retained body limit, then checked UTF-8/host parsing. The selected plaintext
+HTTP endpoint provides no authenticated address provenance.
 
-Historically, D-STAR reflector libraries have been asymmetric:
-ircDDBGateway implements only the client half, xlxd implements only
-the server half. `dstar-gateway` reuses the same codec and the same
-state machines on both sides. The benefit is that a bug fix in the
-codec immediately benefits both the client and the server, and that
-the fuzz corpus for the wire formats exercises both the encoder and
-the decoder on every target.
+Core errors retain protocol/state/type causes and include a tagged
+`std::io::Error` variant for I/O drivers; they contain no Tokio types.
+Shell errors retain core causes, task join failures, local send deadlines and
+terminal disconnect outcomes. A shared typed cause allows the failed command
+and task completion to report the same UDP failure. Authentication and directory
+errors retain their underlying I/O/parser/HTTP causes with explicit resource
+and deadline variants.
 
-This symmetry is the reason ADR 0003 exists: it is worth the extra
-design friction to get codec reuse, because the codec is where the
-correctness risk lives.
+## Diagnostics and validation
 
-## 4. The error hierarchy
+Decoders distinguish fatal framing errors from the recoverable conditions
+they diagnose. `DiagnosticSink` receives those implemented observations;
+raw receive bytes and checked text views remain available to callers.
+Recording a diagnostic does not itself reject a parsed packet. A caller can
+collect observations and reject the returned value according to its policy.
 
-Errors are layered, not flattened. Each crate owns its error types,
-and higher layers wrap lower-layer errors with context:
+Validation includes unit tests, independently specified golden bytes,
+encoder/decoder properties, compile-fail state checks, loopback I/O tests,
+doctests and mutation proofs of load-bearing guards. Ten standalone fuzz
+targets cover decode/parser boundaries; selected targets additionally assert
+round trips or scrambling invariants. Stable compilation and nightly fuzz
+execution are separate checks.
 
-- `dstar-gateway-core::Error`: codec, validator, and state-machine
-  errors. No variant ever holds a tokio type or an `io::Error`.
-- `dstar-gateway::ShellError`: wraps the core error (`Core`), channel
-  or task closure (`SessionClosed`), and the three disconnect outcomes
-  `DisconnectStalled`, `DisconnectUnacknowledged` and
-  `DisconnectedBeforeUnlink`.
-- `dstar-gateway::AuthError` covers the TCP-auth-specific cases: `Io` (tagged
-  with the connect/write/read operation), `Timeout` (tagged with the
-  phase), and `Parse`, which wraps a `DPlusError` from the auth
-  response parser.
-- `dstar-gateway-server::ShellError`: wraps the core error (`Core`)
-  plus `Protocol(String)` (framing and unexpected-variant failures, which
-  also carry the endpoint-task-aborted case) and `Io`.
+Live-reflector tests require their feature and ignored-test selection. Voice
+TX additionally checks `DSTAR_TEST_TX_OK=1`. Protocol and loopback checks
+establish no radio hardware behavior.
 
-Every error type implements `std::error::Error` and `Debug`. Tests cover
-representative formatting and conversion paths; consumers should match
-typed variants rather than treating display strings as a stable API.
-
-## 5. Lenient parsing + structured diagnostics
-
-Every codec decoder takes a `&mut dyn DiagnosticSink`. When the
-codec encounters a field that is malformed but recoverable (e.g. a
-trailing byte after a well-formed packet, a reserved bit set, a
-UTF-8 suffix that isn't canonical) it calls `sink.record(diagnostic)`
-(where `Diagnostic` is an enum variant) rather than returning an
-error. `DiagnosticSink::record` returns `()`, so a decoder never
-fails on a recoverable quirk.
-
-This has three consequences:
-- Real-world captures from ircDDBGateway-era reflectors parse
-  cleanly, even though some of them have quirks that a strict
-  parser would reject.
-- Consumers get structured observability: the shipped `TracingSink`
-  forwards every recorded diagnostic to `tracing`, so each
-  nonstandard byte becomes a structured log event.
-- Strict rejection is not a shipped type but a pattern a caller can
-  implement inside its own `record` impl: record the diagnostic,
-  then treat any recorded diagnostic as a hard failure in the
-  caller's own downstream logic. The crate ships `NullSink`,
-  `VecSink`, and `TracingSink`; anything stricter is a custom impl.
-
-See ADR 0004.
-
-## 6. The tokio shell model
-
-`dstar-gateway::tokio_shell::AsyncSession<P>` is the user-facing
-handle. Internally it owns three channels: a command channel, an
-event channel, and a peer-activity `watch` channel (`activity_rx`)
-that surfaces link-health timing. It also spawns a `SessionLoop` task
-that owns the `UdpSocket` and the `Session<P, Connected>`.
-
-The driver loop is a `select!` that reads from the socket, advances
-the state machine, drains the outbox back to the socket, and pumps
-events into the event channel. It is intentionally small so the
-complexity budget stays in the core crate.
-
-`AuthClient` is a separate async helper that
-owns a transient TCP connection. It has no relationship to the UDP
-session; call it to obtain a host list, attach that list with
-`Session::authenticate`, and then discard the client.
-
-## 7. The reflector server
-
-`dstar-gateway-server::Reflector` owns a `ProtocolEndpoint<P>` per
-enabled protocol. An endpoint owns:
-- a `ClientPool<P>`: a hash map from peer `SocketAddr` to
-  `ServerSessionCore` wrapped in a `ClientHandle<P>`, with a
-  reverse index from `Module` to `HashSet<SocketAddr>`
-- a `UdpSocket`
-- a shutdown `watch::Receiver<bool>`
-
-The run loop is a `select!` over `socket.recv_from` and
-`shutdown.changed`. Each received datagram is routed via the pool,
-the per-peer core is driven, any emitted events are turned into
-`ForwardHint`s, and the raw bytes are re-broadcast to every other
-peer on the same module by `fan_out_voice`.
-
-All three protocols are wired at the shell level. The `Reflector`
-constructs and spawns one `ProtocolEndpoint<P>` per enabled
-protocol, and each inbound datagram is dispatched by protocol
-through a dedicated `handle_inbound_dextra` / `handle_inbound_dplus`
-/ `handle_inbound_dcs` helper. `ReflectorConfig::enabled_protocols`
-defaults to all three, so a default-configured server accepts
-DExtra, DPlus, and DCS clients simultaneously.
-
-## 8. Testing strategy
-
-dstar-gateway maintains an 8-tier test pyramid:
-
-1. **Unit tests** next to the code. Each codec function, each
-   typestate transition, each client pool operation has its own unit
-   test.
-2. **Property tests** (`proptest`) for encoder/decoder pairs:
-   generate random input, round-trip, and assert the documented invariant.
-3. **Golden fixtures**: raw bytes captured from ircDDBGateway and
-   xlxd, committed to the tree, parsed by every codec test.
-4. **Loopback integration tests**: full tokio shell +
-   `FakeReflector` over a real loopback UDP socket. One per
-   protocol covers connect / voice / disconnect round-trips.
-5. **Compile-fail tests** (`trybuild`): snapshots of rustc errors
-   that verify the typestate actually prevents invalid transitions.
-6. **Fuzz targets**: ten `cargo-fuzz` harnesses covering parser
-   entry points and exercised by the fuzz workflow.
-7. **Conformance pcap replay**: a `pcap-parser` harness that
-   feeds captured UDP traffic through every codec. The corpus
-   itself is external; the runner is in-tree.
-8. **Live-reflector integration**: ignored tests that connect to
-   real reflectors, plus an explicitly opted-in short voice burst. Gated
-   behind the `hardware-tests` feature + `#[ignore]` + an opt-in
-   `DSTAR_TEST_TX_OK` env var so nobody accidentally keys the air.
-
-The workspace contains thousands of unit, property, integration, and
-compile-fail cases. Full runtime varies by host and feature matrix.
-
-## Further reading
-
-- [`REFERENCES.md`](REFERENCES.md): every reference to
-  ircDDBGateway or xlxd, pinned to a commit hash.
-- [`adr/`](adr/): architectural decision records. Read
-  `0001-sans-io.md` and `0002-typestate.md` first if you want to
-  understand *why* the core is shaped the way it is.
-- [`book/`](book/): mdBook source for a longer narrative version of
-  the above. It currently covers the introduction and Getting Started;
-  the remaining chapters are unwritten. Build it locally with
-  `mdbook serve book`.
+The [book](book/) introduces client use, and the
+[ADRs](adr/) record architectural decisions. Full-tree checks follow the
+workspace [contributor workflow](../CONTRIBUTING.md).

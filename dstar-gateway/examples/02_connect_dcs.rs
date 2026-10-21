@@ -14,8 +14,8 @@
 //! DCS is the simplest of the three client protocols: one
 //! round-trip (519-byte LINK out, 14-byte ACK in) and no TCP auth
 //! step. Voice frames are 100 bytes each and embed the D-STAR
-//! header, so `send_header` caches the header internally and
-//! `send_voice` pulls it back out on every frame.
+//! header. `send_header` caches it and sends an initial sync frame;
+//! `send_voice` includes it in every subsequent frame.
 
 #[cfg(feature = "insecure-plaintext-xlx-directory")]
 use reqwest as _;
@@ -23,12 +23,10 @@ use reqwest as _;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use dstar_gateway::tokio_shell::AsyncSession;
-use dstar_gateway_core::session::Driver;
-use dstar_gateway_core::session::client::{ClientStateKind, Configured, Dcs, Session};
-use dstar_gateway_core::types::{Callsign, Module};
+use dstar_gateway::tokio_shell::{AsyncSession, drive_connecting};
+use dstar_gateway_core::session::client::{Configured, Dcs, Session};
+use dstar_gateway_core::types::{DcsReflector, Module, RoutingCallsign};
 use tokio::net::UdpSocket;
-use tokio::time::timeout;
 
 // Examples are a separate compilation unit, so acknowledge workspace
 // dev-deps we don't reference directly so the strict
@@ -44,41 +42,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let sock = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
 
-    // NOTE: `.reflector_callsign()` is omitted below, so the DCS
-    // builder defaults the reflector callsign to `DCS001`. That is
-    // correct only for reflector DCS001; set it explicitly to reach
-    // any other DCS reflector, since the callsign goes into the DCS
-    // LINK/UNLINK/POLL wire packets.
     let session: Session<Dcs, Configured> = Session::<Dcs, Configured>::builder()
-        .callsign(Callsign::try_from_str("W1AW")?)
+        .callsign(RoutingCallsign::new("W1AW")?)
+        .dcs_reflector(DcsReflector::new("DCS001")?)
         .local_module(Module::try_from_char('B')?)
         .reflector_module(Module::try_from_char('C')?)
         .peer("127.0.0.1:30051".parse()?)
         .build();
 
-    let now = Instant::now();
-    let mut connecting = session.connect(now)?;
-
-    let Some(tx) = connecting.poll_transmit(now) else {
-        return Err("no LINK enqueued".into());
-    };
-    let _ = sock.send_to(tx.payload, tx.dst).await?;
-
-    let mut buf = [0u8; 2048];
-    let Ok(recv) = timeout(Duration::from_secs(5), sock.recv_from(&mut buf)).await else {
-        eprintln!("timeout waiting for reflector reply; is 127.0.0.1:30051 listening?");
-        return Ok(());
-    };
-    let (n, peer) = recv?;
-    let slice = buf.get(..n).unwrap_or(&[]);
-    connecting.handle_input(Instant::now(), peer, slice)?;
-
-    if connecting.state_kind() != ClientStateKind::Connected {
-        eprintln!("handshake did not complete");
-        return Ok(());
-    }
-
-    let connected = connecting.promote()?;
+    let connecting = session.connect(Instant::now())?;
+    let connected = drive_connecting(connecting, &sock, Duration::from_secs(5)).await?;
     let mut async_session = AsyncSession::spawn(connected, Arc::clone(&sock));
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);

@@ -1,169 +1,141 @@
 # dstar-gateway
 
-[![CI](https://img.shields.io/github/actions/workflow/status/swiftraccoon/kenwood/ubuntu.yml?label=CI)](https://github.com/swiftraccoon/kenwood/actions)
-[![Docs](https://img.shields.io/badge/docs-github.io-blue)](https://swiftraccoon.github.io/kenwood/dstar_gateway/)
-[![License: GPL-2.0-or-later](https://img.shields.io/badge/License-GPL%20v2%2B-blue.svg)](https://www.gnu.org/licenses/old-licenses/gpl-2.0.html)
+Tokio and synchronous drivers for the sans-io
+[`dstar-gateway-core`](https://github.com/swiftraccoon/kenwood/tree/main/dstar-gateway-core)
+client. The client supports `DPlus`, `DExtra` and DCS reflector sessions,
+TCP authentication and an optional untrusted HTTP directory client.
+[`dstar-gateway-server`](https://github.com/swiftraccoon/kenwood/tree/main/dstar-gateway-server)
+provides the separate multi-client reflector.
 
-Async Rust D-STAR reflector gateway library. Implements the **DPlus**,
-**DExtra**, and **DCS** reflector protocols with a full **typestate
-session machine**, a **sans-io core**, **lenient parsing with
-structured diagnostics**, and **symmetric client + server** scope.
+These unpublished APIs may change. Wire comparisons use the pinned public
+sources in
+[REFERENCES](https://github.com/swiftraccoon/kenwood/blob/main/dstar-gateway/REFERENCES.md);
+model crates specify radio firmware/interface behavior separately.
 
-## Status
+## Connect, receive and disconnect
 
-**Version 0.1.0 alpha, unpublished.** The rewrite is feature-complete
-on both the client side (`DPlus` + `DExtra` + DCS) and the reflector
-server, which supports all three protocols (`DExtra`, `DPlus`, and
-DCS) with every protocol enabled by default. It has not yet been
-stress-tested against real reflectors for an extended period.
-Cross-protocol forwarding, per-client rate limiting, and the
-`StreamCache` header retransmit are all wired; cross-protocol
-forwarding is off by default.
-
-This crate lives in the [kenwood monorepo](https://github.com/swiftraccoon/kenwood)
-and is not yet published to crates.io. Consume it via a path or
-git dependency until the first published release lands. See
-[CHANGELOG.md](https://github.com/swiftraccoon/kenwood/blob/main/dstar-gateway/CHANGELOG.md)
-for the work-in-progress feature list.
-
-## The three crates
-
-| Crate | What it does |
-|-------|--------------|
-| [`dstar-gateway-core`](https://github.com/swiftraccoon/kenwood/tree/main/dstar-gateway-core) | Sans-io codec + typestate `Session<P, S>` state machines. No tokio, no I/O. |
-| [`dstar-gateway`](https://github.com/swiftraccoon/kenwood/tree/main/dstar-gateway) (this crate) | Tokio `AsyncSession<P>` shell, `DPlus` TCP `AuthClient`, optional explicitly insecure plaintext-HTTP XLX directory fetcher. |
-| [`dstar-gateway-server`](https://github.com/swiftraccoon/kenwood/tree/main/dstar-gateway-server) | Multi-client `Reflector` server. Supports `DExtra`, `DPlus`, and DCS, all enabled by default. |
-
-## Quickstart
-
-Connect to a `DExtra` reflector, listen for 10 seconds, then disconnect
-cleanly.
+This network example expects a local `DExtra` reflector:
 
 ```rust,no_run
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-
-use dstar_gateway::tokio_shell::AsyncSession;
-use dstar_gateway_core::session::Driver;
-use dstar_gateway_core::session::client::{
-    ClientStateKind, Configured, DExtra, Session,
-};
-use dstar_gateway_core::types::{Callsign, Module};
+use dstar_gateway::tokio_shell::{AsyncSession, drive_connecting};
+use dstar_gateway_core::{DExtra, Module, RoutingCallsign, Session};
 use tokio::net::UdpSocket;
-use tokio::time::timeout;
 
-# async fn example() -> Result<(), Box<dyn std::error::Error>> {
-// 1. Bind a local UDP socket.
-let sock = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
-
-// 2. Build a Configured session.
-let session: Session<DExtra, Configured> = Session::<DExtra, Configured>::builder()
-    .callsign(Callsign::try_from_str("W1AW")?)
-    .local_module(Module::try_from_char('B')?)
-    .reflector_module(Module::try_from_char('C')?)
+# async fn run() -> Result<(), Box<dyn std::error::Error>> {
+let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
+let connecting = Session::<DExtra, _>::builder()
+    .callsign(RoutingCallsign::new("W1AW")?)
+    .local_module(Module::B)
+    .reflector_module(Module::C)
     .peer("127.0.0.1:30001".parse()?)
-    .build();
-
-// 3. Drive the handshake manually on the test thread.
-let mut connecting = session.connect(Instant::now())?;
-let tx = connecting
-    .poll_transmit(Instant::now())
-    .ok_or("LINK not ready")?;
-sock.send_to(tx.payload, tx.dst).await?;
-
-let mut buf = [0u8; 64];
-let (n, peer) = timeout(Duration::from_secs(5), sock.recv_from(&mut buf))
-    .await??;
-connecting.handle_input(
-    Instant::now(),
-    peer,
-    buf.get(..n).ok_or("receive length exceeded buffer")?,
-)?;
-assert_eq!(connecting.state_kind(), ClientStateKind::Connected);
-let connected = connecting.promote()?;
-
-// 4. Hand off to the tokio shell and listen for 10 seconds.
-let mut session = AsyncSession::spawn(connected, Arc::clone(&sock));
-let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    .build()
+    .connect(Instant::now())?;
+let connected = drive_connecting(connecting, &socket, Duration::from_secs(5)).await?;
+let mut client = AsyncSession::spawn(connected, socket);
+let stop = tokio::time::sleep(Duration::from_secs(10));
+tokio::pin!(stop);
 loop {
     tokio::select! {
-        _ = tokio::time::sleep_until(deadline) => break,
-        ev = session.next_event() => {
-            match ev {
-                Some(e) => println!("{e:?}"),
-                None => break,
-            }
+        () = &mut stop => break,
+        event = client.next_event() => match event {
+            Some(event) => println!("{event:?}"),
+            None => break,
         }
     }
 }
-
-// 5. Graceful disconnect.
-session.disconnect().await?;
+client.disconnect().await?;
 # Ok(()) }
 ```
 
-For `DPlus`, fetch a host list with `AuthClient::authenticate`, build the
-configured session, and call `Session::authenticate` before `connect`;
-`DCS` uses the same shape as `DExtra`.
+`drive_connecting` bounds UDP sends, receives and timer work by one total
+deadline; an unrepresentable duration fails before sending. Cancellation drops
+the consumed session; already sent datagrams may have reached the peer.
+The caller retains the socket. DNS and authentication precede that handshake
+and have their own configured limits.
+
+For `DPlus`, call `AuthClient::authenticate`, then attach the resulting host
+list through the configured session's `authenticate` method before linking.
+For DCS, additionally supply
+`.dcs_reflector(DcsReflector::new("DCS030")?)`; its target identity is required.
+The checked
+[core workflow](https://swiftraccoon.github.io/kenwood/dstar_gateway_core/)
+describes headers, frame indices and protocol state failures.
+
+## Completion and queue ownership
+
+`send_header`, `send_voice` and `send_eot` succeed after every currently
+ready datagram has been handed to the local UDP socket. This is local send
+completion, not remote acknowledgement. Each UDP send has a two-second local
+deadline. Cancelling before enqueue sends no command; after enqueue, the
+task may still transmit. Errors retain the underlying typed cause.
+
+`next_event` returns None after the task exits and its queued events drain.
+`join` drains remaining events and returns the task result once. Cancelling
+a join retains its task handle for another wait. Repeated calls after the
+result was consumed return success.
+
+`disconnect` sends UNLINK, consumes queued events and awaits the core's
+terminal outcome and task completion. The peer has two seconds within a
+five-second shell deadline. No acknowledgement returns
+`ShellError::DisconnectUnacknowledged`; channel/task/I/O failures remain typed.
+`disconnect_reason` retains an observed terminal reason. Dropping a handle
+closes its channels and requests local task exit; explicit disconnect/join is
+the completion boundary.
+
+Commands use a 32-entry FIFO and events a 256-entry FIFO. Event capacity
+represents roughly five seconds at 50 voice frames/s, shared with control
+events. Commands and their socket writes continue while the event queue is
+full. Receive and protocol timers pause until callers consume events.
+`AnyAsyncSession`/`AnyEvent` expose the same operations without a protocol
+type parameter.
+
+## Authentication and directory limits
+
+`AuthClient::new` and Default share ten seconds for DNS plus all TCP
+connection attempts, ten seconds for writing, five seconds total response
+time, a five-second idle limit, and at most two MiB retained response data.
+The address attempts are sequential, each capped at three seconds inside the
+shared connect budget. Builder methods configure these local resource limits.
+Continuous partial data never renews the total response deadline. Cancelling
+closes its TCP stream; an OS DNS lookup already started by Tokio may finish
+after cancellation.
+
+The `insecure-plaintext-xlx-directory` feature exposes
+`InsecurePlaintextXlxDirectoryFetcher`. Its chosen endpoint uses plaintext
+HTTP; returned addresses have no authenticated provenance. Its fallible
+constructor disables redirects, defaults to ten seconds and two MiB, and
+accepts a caller-configured HTTP client and limits. Invalid recognized host
+rows reject the response with typed line errors.
+
+## Synchronous use and examples
+
+The `blocking` feature provides
+`blocking_shell::drive_connecting` and `BlockingSession` without a running
+Tokio runtime. Construction configures the owned socket for blocking I/O.
+Send, event polling, disconnect and `into_parts` cover its complete lifecycle.
+None from `run_until_event` means idle or closed; inspect `is_closed` and
+keep polling while linked. Receive waits total at most 100 ms per call,
+subject to OS scheduling/resolution; sends have separate two-second timeouts.
+
+The
+[examples](https://github.com/swiftraccoon/kenwood/tree/main/dstar-gateway/examples)
+provide protocol-specific connection, TX, diagnostics, bounded DPRS
+reconstruction, reconnection, controlled bridging, synchronous driving and
+raw capture recipes. External-service examples require `examples-network`;
+local loopback examples compile by default. `hardware-tests` compiles ignored
+live-reflector tests. Ordinary tests use loopback fixtures; external
+reflector/RF cases remain gated.
 
 See the
-[`dstar-gateway/examples/`](https://github.com/swiftraccoon/kenwood/tree/main/dstar-gateway/examples)
-directory for standalone runnable versions of each.
-
-`AsyncSession` delivers incoming events through a bounded FIFO queue.
-Outbound commands and their UDP writes continue when that queue fills.
-Continue consuming `next_event` to make room for incoming traffic and
-protocol timer processing; those remain paused while the queue is full.
-
-## Features
-
-| Feature | State | Notes |
-|---------|-------|-------|
-| `DPlus` client (REF, TCP auth) | Implemented | `AuthClient` + `Session<DPlus, _>` |
-| `DExtra` client (XRF, XLX) | Implemented | `Session<DExtra, _>` |
-| `DCS` client | Implemented | `Session<Dcs, _>`; header caching handled by core |
-| `DExtra` reflector server | Implemented | `dstar-gateway-server::Reflector`, on by default |
-| `DPlus` reflector server | Implemented | `handle_inbound_dplus` endpoint, on by default |
-| `DCS` reflector server | Implemented | `handle_inbound_dcs` endpoint, on by default |
-| `blocking` feature | Optional | CLI-friendly variant of `AsyncSession` |
-| `insecure-plaintext-xlx-directory` feature | Optional | Pulls `reqwest`; explicitly opts into the XLX registry's unauthenticated plaintext-HTTP endpoint |
-| Slow-data sub-codec | Implemented | Short messages embedded in voice frames |
-| DPRS position reports | Implemented | Decodes `$$CRC`-prefixed slow-data strings |
-| Lenient parsing | Implemented | Structured `Diagnostic` via `DiagnosticSink` trait |
-| Property tests + fuzz | Testing | 10 fuzz targets plus property and loopback tests |
-
-## Feature flags
-
-```toml
-[dependencies]
-dstar-gateway = { path = "../dstar-gateway", features = ["insecure-plaintext-xlx-directory"] }
-```
-
-- `blocking`: compile a caller-driven synchronous shell backed by
-  `std::net::UdpSocket`. Callers do not run a Tokio runtime, although
-  Tokio remains an unconditional dependency of this async client crate.
-- `insecure-plaintext-xlx-directory`: pulls `reqwest` and exposes
-  `insecure_plaintext_xlx_directory::InsecurePlaintextXlxDirectoryFetcher`.
-  Calling `fetch_over_plaintext_http` contacts
-  `http://xlxapi.rlx.lu/api.php?do=GetReflectorHostname`. The server has no
-  working HTTPS endpoint, so the response has no confidentiality,
-  authenticity, or integrity and returned addresses must be treated as
-  untrusted network input.
-- `examples-network`: compile examples that contact live network services.
-- `hardware-tests`: compile ignored live-reflector integration tests.
-  These last two flags are for examples/tests rather than downstream APIs.
-
-## Documentation
-
-- [API reference](https://swiftraccoon.github.io/kenwood/dstar_gateway/)
-- [`book/`](https://github.com/swiftraccoon/kenwood/tree/main/dstar-gateway/book): mdBook source; currently covers the introduction and Getting Started. Build with `mdbook serve book`
-- [ARCHITECTURE.md](https://github.com/swiftraccoon/kenwood/blob/main/dstar-gateway/ARCHITECTURE.md): design overview
-- [REFERENCES.md](https://github.com/swiftraccoon/kenwood/blob/main/dstar-gateway/REFERENCES.md): line-numbered references into
-  `ircDDBGateway` and `xlxd`
-- [CHANGELOG.md](https://github.com/swiftraccoon/kenwood/blob/main/dstar-gateway/CHANGELOG.md): per-release notes
-- [`adr/`](https://github.com/swiftraccoon/kenwood/tree/main/dstar-gateway/adr): architectural decision records
+[book](https://github.com/swiftraccoon/kenwood/tree/main/dstar-gateway/book),
+[architecture](https://github.com/swiftraccoon/kenwood/blob/main/dstar-gateway/ARCHITECTURE.md),
+[changelog](https://github.com/swiftraccoon/kenwood/blob/main/dstar-gateway/CHANGELOG.md)
+and
+[contributor workflow](https://github.com/swiftraccoon/kenwood/blob/main/CONTRIBUTING.md).
 
 ## License
 
-GPL-2.0-or-later, matching the upstream `g4klx/ircDDBGateway` and
-`LX3JL/xlxd` reference implementations.
+GPL-2.0-or-later. Upstream source-header license declarations are recorded
+separately in REFERENCES.

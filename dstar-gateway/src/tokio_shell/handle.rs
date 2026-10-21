@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use dstar_gateway_core::header::DstarHeader;
 use dstar_gateway_core::session::client::{Connected, DisconnectReason, Event, Protocol, Session};
-use dstar_gateway_core::types::StreamId;
+use dstar_gateway_core::types::{FrameSequence, StreamId};
 use dstar_gateway_core::voice::VoiceFrame;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, watch};
@@ -27,8 +27,8 @@ const COMMAND_CHANNEL_CAPACITY: usize = 32;
 /// Events are produced by the loop and consumed by the user via
 /// `next_event`. A deeper buffer here lets the loop keep running
 /// while the consumer is processing the previous batch. 256 frames
-/// is enough to cover a full 5-second stream of voice data (rough
-/// upper bound of ≈100 frames) plus some headroom.
+/// holds about five seconds at 50 voice frames per second, with control
+/// events sharing that capacity.
 const EVENT_CHANNEL_CAPACITY: usize = 256;
 
 /// Upper bound for delivering a disconnect command and observing the
@@ -56,7 +56,7 @@ const DISCONNECT_COMPLETION_TIMEOUT: Duration = Duration::from_secs(5);
 /// the consumer's side; the reflector eventually times the link out
 /// via inactivity.
 #[derive(Debug)]
-pub struct AsyncSession<P: Protocol> {
+pub struct AsyncSession<P> {
     pub(crate) command_tx: mpsc::Sender<Command>,
     pub(crate) event_rx: mpsc::Receiver<Event<P>>,
     /// Instant of the most recent datagram from the peer, published
@@ -68,6 +68,8 @@ pub struct AsyncSession<P: Protocol> {
     pub(crate) disconnect_requested: bool,
     /// Terminal outcome already observed through `next_event`.
     pub(crate) disconnect_reason: Option<DisconnectReason>,
+    /// Retained until joined, including across cancellation of `join`.
+    pub(crate) completion: Option<tokio::task::JoinHandle<Result<(), ShellError>>>,
     pub(crate) _protocol: PhantomData<P>,
 }
 
@@ -79,9 +81,17 @@ impl<P: Protocol> AsyncSession<P> {
     /// (typically via `Session::<P, Connecting>::promote` after
     /// observing [`Event::Connected`] from the handshake). The
     /// `socket` must be bound (typically via `UdpSocket::bind`).
+    /// The caller must not concurrently receive from that shared socket;
+    /// another reader can consume replies intended for this session.
     ///
     /// The loop runs until the handle is dropped, the consumer's
     /// command channel closes, or a fatal I/O error occurs.
+    /// [`Self::join`] returns its typed completion result.
+    ///
+    /// # Panics
+    ///
+    /// Panics when no Tokio runtime is current. The runtime must enable
+    /// I/O and time; unavailable facilities can instead fail the spawned task.
     ///
     /// # Example
     ///
@@ -116,12 +126,7 @@ impl<P: Protocol> AsyncSession<P> {
             activity_tx,
         };
 
-        drop(tokio::spawn(async move {
-            // Loop errors bubble up as `Err`; the consumer sees
-            // `SessionClosed` via the event channel closing when the
-            // task exits.
-            drop(inner_loop.run().await);
-        }));
+        let completion = tokio::spawn(inner_loop.run());
 
         Self {
             command_tx,
@@ -129,6 +134,7 @@ impl<P: Protocol> AsyncSession<P> {
             activity_rx,
             disconnect_requested: false,
             disconnect_reason: None,
+            completion: Some(completion),
             _protocol: PhantomData,
         }
     }
@@ -164,21 +170,64 @@ impl<P: Protocol> AsyncSession<P> {
         event
     }
 
+    /// Join the session task and return its typed result once.
+    ///
+    /// This drains queued events while waiting, retaining a terminal disconnect
+    /// reason. Call after disconnect or event-channel closure; a healthy linked
+    /// session continues running. After the result is consumed, repeated calls
+    /// return `Ok(())`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the task's socket/protocol failure or [`ShellError::Task`] if
+    /// it panicked or was externally cancelled.
+    ///
+    /// # Cancellation
+    ///
+    /// Cancelling this wait retains the task handle for a later call.
+    pub async fn join(&mut self) -> Result<(), ShellError> {
+        let Some(task) = self.completion.as_mut() else {
+            return Ok(());
+        };
+        let mut events_open = true;
+        let result = loop {
+            tokio::select! {
+                result = &mut *task => break result.map_err(ShellError::Task),
+                event = self.event_rx.recv(), if events_open => {
+                    match event {
+                        Some(Event::Disconnected { reason }) => self.disconnect_reason = Some(reason),
+                        Some(_) => {}
+                        None => events_open = false,
+                    }
+                }
+            }
+        };
+        self.completion = None;
+        result?
+    }
+
+    /// Terminal core disconnect reason, if already observed.
+    #[must_use]
+    pub const fn disconnect_reason(&self) -> Option<DisconnectReason> {
+        self.disconnect_reason
+    }
+
     /// Send a voice header and start a new outbound voice stream.
     ///
     /// # Errors
     ///
     /// - [`ShellError::SessionClosed`] if the session task has exited
-    /// - [`ShellError::Core`] if the encoder rejects the header
+    /// - [`ShellError::Core`] if the core rejects the operation
+    /// - [`ShellError::SessionFailed`] if UDP transmission fails
+    ///
+    /// Success means every ready datagram was handed to the local UDP socket;
+    /// it is not a remote acknowledgement.
     ///
     /// # Cancellation safety
     ///
-    /// This method is cancel-safe. The method enqueues a [`Command`]
-    /// on the command channel and awaits a oneshot reply. If the future
-    /// is dropped before the enqueue completes no command is sent; if
-    /// it is dropped after the enqueue the session task still executes
-    /// the command and the (now-orphaned) oneshot reply is simply
-    /// discarded. Either way the session state remains consistent.
+    /// Cancellation before enqueue sends no command. After enqueue, the task
+    /// completes the operation and may transmit even if the reply future is
+    /// dropped. Call `join` after task termination to inspect its result.
     pub async fn send_header(
         &mut self,
         header: DstarHeader,
@@ -205,15 +254,11 @@ impl<P: Protocol> AsyncSession<P> {
     ///
     /// # Cancellation safety
     ///
-    /// This method is cancel-safe under the same rules as
-    /// [`Self::send_header`]. Dropping the future either before the
-    /// command is enqueued or after it has been dispatched leaves the
-    /// session in a coherent state; orphaning the oneshot reply is
-    /// harmless.
+    /// Enqueue, UDP completion and cancellation follow [`Self::send_header`].
     pub async fn send_voice(
         &mut self,
         stream_id: StreamId,
-        seq: u8,
+        seq: FrameSequence,
         frame: VoiceFrame,
     ) -> Result<(), ShellError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -238,9 +283,12 @@ impl<P: Protocol> AsyncSession<P> {
     ///
     /// # Cancellation safety
     ///
-    /// This method is cancel-safe under the same rules as
-    /// [`Self::send_header`].
-    pub async fn send_eot(&mut self, stream_id: StreamId, seq: u8) -> Result<(), ShellError> {
+    /// Enqueue, UDP completion and cancellation follow [`Self::send_header`].
+    pub async fn send_eot(
+        &mut self,
+        stream_id: StreamId,
+        seq: FrameSequence,
+    ) -> Result<(), ShellError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.command_tx
             .send(Command::SendEot {
@@ -282,15 +330,19 @@ impl<P: Protocol> AsyncSession<P> {
     pub async fn disconnect(&mut self) -> Result<(), ShellError> {
         let deadline = tokio::time::Instant::now() + DISCONNECT_COMPLETION_TIMEOUT;
         if let Some(reason) = self.disconnect_reason {
+            self.join_before(deadline).await?;
             return disconnect_result(reason);
         }
 
-        // Free existing event-channel capacity before asking the loop to
-        // process a command. This is the common shutdown case after a caller
-        // has temporarily stopped polling a busy reflector.
-        while let Ok(event) = self.event_rx.try_recv() {
+        // Free one queue's capacity before dispatch. Events arriving during
+        // the drain must not postpone the disconnect command indefinitely.
+        for _ in 0..EVENT_CHANNEL_CAPACITY {
+            let Ok(event) = self.event_rx.try_recv() else {
+                break;
+            };
             if let Event::Disconnected { reason } = event {
                 self.disconnect_reason = Some(reason);
+                self.join_before(deadline).await?;
                 return disconnect_result(reason);
             }
         }
@@ -299,13 +351,16 @@ impl<P: Protocol> AsyncSession<P> {
             None
         } else {
             let (reply, receiver) = tokio::sync::oneshot::channel();
-            tokio::time::timeout_at(
+            let sent = tokio::time::timeout_at(
                 deadline,
                 self.command_tx.send(Command::Disconnect { reply }),
             )
             .await
-            .map_err(|_| ShellError::DisconnectStalled)?
-            .map_err(|_| ShellError::SessionClosed)?;
+            .map_err(|_| ShellError::DisconnectStalled)?;
+            if sent.is_err() {
+                self.join_before(deadline).await?;
+                return Err(ShellError::SessionClosed);
+            }
             self.disconnect_requested = true;
             Some(receiver)
         };
@@ -330,8 +385,8 @@ impl<P: Protocol> AsyncSession<P> {
                             match reply.map_err(|_| ShellError::SessionClosed)? {
                                 Ok(()) => command_reply = None,
                                 Err(error) => {
-                                    // The core did not enter Disconnecting, so
-                                    // a later call may make a fresh request.
+                                    // State rejection can be retried; a task
+                                    // failure is joined before returning.
                                     self.disconnect_requested = false;
                                     return Err(error);
                                 }
@@ -350,10 +405,29 @@ impl<P: Protocol> AsyncSession<P> {
             }
         };
 
-        let reason = tokio::time::timeout_at(deadline, completion)
+        let outcome = tokio::time::timeout_at(deadline, completion)
             .await
-            .map_err(|_| ShellError::DisconnectStalled)??;
+            .map_err(|_| ShellError::DisconnectStalled)?;
+        let reason = match outcome {
+            Ok(reason) => reason,
+            Err(error) => {
+                if matches!(
+                    &error,
+                    ShellError::SessionClosed | ShellError::SessionFailed(_)
+                ) {
+                    self.join_before(deadline).await?;
+                }
+                return Err(error);
+            }
+        };
+        self.join_before(deadline).await?;
         disconnect_result(reason)
+    }
+
+    async fn join_before(&mut self, deadline: tokio::time::Instant) -> Result<(), ShellError> {
+        tokio::time::timeout_at(deadline, self.join())
+            .await
+            .map_err(|_| ShellError::DisconnectStalled)?
     }
 }
 
@@ -362,14 +436,6 @@ const fn disconnect_result(reason: DisconnectReason) -> Result<(), ShellError> {
         DisconnectReason::UnlinkAcked => Ok(()),
         DisconnectReason::DisconnectTimeout => Err(ShellError::DisconnectUnacknowledged),
         reason => Err(ShellError::DisconnectedBeforeUnlink { reason }),
-    }
-}
-
-impl<P: Protocol> Drop for AsyncSession<P> {
-    fn drop(&mut self) {
-        // Dropping command_tx closes the channel, which signals
-        // the session task to exit on its next loop iteration.
-        // No explicit shutdown needed.
     }
 }
 
@@ -391,6 +457,7 @@ mod tests {
             activity_rx,
             disconnect_requested: false,
             disconnect_reason: None,
+            completion: None,
             _protocol: PhantomData,
         }
     }
@@ -405,6 +472,34 @@ mod tests {
         Event::Disconnected {
             reason: DisconnectReason::UnlinkAcked,
         }
+    }
+
+    #[tokio::test]
+    async fn cancelled_join_retains_the_running_task_and_its_failure() -> TestResult {
+        let (command_tx, _command_rx) = mpsc::channel(1);
+        let (_event_tx, event_rx) = mpsc::channel(1);
+        let mut session = test_session(command_tx, event_rx);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        session.completion = Some(tokio::spawn(async move {
+            let _sent = started_tx.send(());
+            let _released = release_rx.await;
+            Err(ShellError::SendStalled)
+        }));
+        let mut first = Box::pin(session.join());
+        tokio::select! {
+            result = first.as_mut() => return Err(format!("join completed before release: {result:?}").into()),
+            started = started_rx => started?,
+        }
+        drop(first);
+        let _sent = release_tx.send(());
+        let result = session.join().await;
+        assert!(matches!(result, Err(ShellError::SendStalled)), "{result:?}");
+        assert!(
+            session.completion.is_none(),
+            "completed result is consumed once"
+        );
+        Ok(())
     }
 
     #[tokio::test]
@@ -429,6 +524,67 @@ mod tests {
         let mut session = test_session(command_tx, event_rx);
         tokio::time::timeout(Duration::from_secs(1), session.disconnect()).await??;
         loop_task.await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn disconnect_dispatches_before_draining_events_beyond_one_queue_capacity() -> TestResult
+    {
+        let (command_tx, mut command_rx) = mpsc::channel(1);
+        // The extra event represents a producer replenishing the queue while
+        // the initial capacity is drained. Its terminal reason remains visible.
+        let (event_tx, event_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY + 1);
+        for _ in 0..EVENT_CHANNEL_CAPACITY {
+            event_tx.send(poll_echo()).await?;
+        }
+        event_tx.send(disconnected()).await?;
+
+        let mut session = test_session(command_tx, event_rx);
+        session.disconnect().await?;
+        assert!(
+            matches!(command_rx.try_recv(), Ok(Command::Disconnect { .. })),
+            "events beyond the initial queue capacity must not delay command dispatch"
+        );
+        assert_eq!(
+            session.disconnect_reason(),
+            Some(DisconnectReason::UnlinkAcked),
+            "the terminal event after the initial drain must remain observable"
+        );
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn disconnect_deadline_includes_join_after_the_terminal_event() -> TestResult {
+        let (command_tx, mut command_rx) = mpsc::channel(1);
+        let (event_tx, event_rx) = mpsc::channel(1);
+        let mut session = test_session(command_tx, event_rx);
+        session.completion = Some(tokio::spawn(async move {
+            let Some(Command::Disconnect { reply }) = command_rx.recv().await else {
+                return Err(ShellError::SessionClosed);
+            };
+            drop(reply.send(Ok(())));
+            event_tx
+                .send(disconnected())
+                .await
+                .map_err(|_| ShellError::SessionClosed)?;
+            std::future::pending::<Result<(), ShellError>>().await
+        }));
+
+        let result = tokio::time::timeout(
+            DISCONNECT_COMPLETION_TIMEOUT + Duration::from_secs(1),
+            session.disconnect(),
+        )
+        .await?;
+        assert!(
+            matches!(result, Err(ShellError::DisconnectStalled)),
+            "joining the task must share the disconnect deadline: {result:?}"
+        );
+        let task = session
+            .completion
+            .take()
+            .ok_or("timed-out join lost its task")?;
+        task.abort();
+        assert!(task.await.is_err(), "aborted task must be joined");
         Ok(())
     }
 

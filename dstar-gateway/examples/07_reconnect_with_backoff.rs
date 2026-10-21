@@ -5,8 +5,8 @@
 //! wait on each failure (1 s, 2 s, 4 s, 8 s, ..., capped at 60 s).
 //! After a successful connect the session runs for 30 seconds, then
 //! disconnects cleanly and starts the cycle over. Intended to
-//! illustrate one recovery strategy: flatten each transition error,
-//! discard that attempt, and rebuild a fresh session. Applications
+//! illustrate one recovery strategy: report each failed attempt
+//! and rebuild a fresh session. Applications
 //! that need the original state can instead retain the `Failed<S, E>`
 //! value returned by typestate transitions.
 //!
@@ -25,14 +25,10 @@ use std::env;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use dstar_gateway::tokio_shell::AsyncSession;
-use dstar_gateway_core::session::Driver;
-use dstar_gateway_core::session::client::{
-    ClientStateKind, Configured, Connected, DExtra, Session,
-};
-use dstar_gateway_core::types::{Callsign, Module};
+use dstar_gateway::tokio_shell::{AsyncSession, drive_connecting};
+use dstar_gateway_core::session::client::{Configured, DExtra, Session};
+use dstar_gateway_core::types::{Module, RoutingCallsign};
 use tokio::net::UdpSocket;
-use tokio::time::timeout;
 
 // Acknowledged workspace dev-deps.
 use pcap_parser as _;
@@ -54,7 +50,7 @@ const MAX_BACKOFF: Duration = Duration::from_secs(60);
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
-    let callsign = Callsign::try_from_str(&env::var("DSTAR_CALLSIGN")?)?;
+    let callsign = RoutingCallsign::new(&env::var("DSTAR_CALLSIGN")?)?;
     let reflector_host =
         env::var("REFLECTOR_HOST").unwrap_or_else(|_| "xrf030.example.com:30001".to_string());
 
@@ -81,8 +77,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
 
-                // Queue a graceful disconnect. The shell sends UNLINK;
-                // this call does not wait for the reflector's ACK.
+                // Wait for the terminal unlink outcome and task completion.
                 if let Err(e) = async_session.disconnect().await {
                     tracing::warn!(?e, "disconnect failed");
                 }
@@ -100,14 +95,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// success, a boxed error on any failure (resolve, bind, handshake,
 /// typestate promote).
 async fn connect_once(
-    callsign: Callsign,
+    callsign: RoutingCallsign,
     reflector_host: &str,
 ) -> Result<AsyncSession<DExtra>, Box<dyn std::error::Error>> {
-    let peer = tokio::net::lookup_host(reflector_host)
-        .await?
-        .next()
-        .ok_or("resolve failed")?;
-    let sock = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
+    let peer = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::net::lookup_host(reflector_host),
+    )
+    .await??
+    .next()
+    .ok_or("resolve failed")?;
+    let bind = if peer.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    };
+    let sock = Arc::new(UdpSocket::bind(bind).await?);
 
     let session: Session<DExtra, Configured> = Session::<DExtra, Configured>::builder()
         .callsign(callsign)
@@ -116,31 +119,7 @@ async fn connect_once(
         .peer(peer)
         .build();
 
-    // `Failed<Session, Error>` lets the caller retry with the
-    // original session; for this example we just rebuild from
-    // scratch on failure, so we flatten `Failed` into the boxed
-    // error string.
-    let now = Instant::now();
-    let mut connecting = session
-        .connect(now)
-        .map_err(|f| format!("connect: {}", f.error))?;
-
-    if let Some(tx) = connecting.poll_transmit(now) {
-        let _ = sock.send_to(tx.payload, tx.dst).await?;
-    }
-    let mut buf = [0u8; 64];
-    let (n, src) = timeout(Duration::from_secs(5), sock.recv_from(&mut buf))
-        .await
-        .map_err(|_| "handshake timeout")??;
-    let slice = buf.get(..n).unwrap_or(&[]);
-    connecting.handle_input(Instant::now(), src, slice)?;
-
-    if connecting.state_kind() != ClientStateKind::Connected {
-        return Err("handshake did not complete".into());
-    }
-
-    let connected: Session<DExtra, Connected> = connecting
-        .promote()
-        .map_err(|f| format!("promote: {}", f.error))?;
+    let connecting = session.connect(Instant::now())?;
+    let connected = drive_connecting(connecting, &sock, Duration::from_secs(5)).await?;
     Ok(AsyncSession::spawn(connected, sock))
 }

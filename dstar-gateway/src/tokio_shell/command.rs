@@ -2,7 +2,7 @@
 //! and the spawned `SessionLoop` task.
 
 use dstar_gateway_core::header::DstarHeader;
-use dstar_gateway_core::types::StreamId;
+use dstar_gateway_core::types::{FrameSequence, StreamId};
 use dstar_gateway_core::voice::VoiceFrame;
 
 use super::ShellError;
@@ -10,7 +10,7 @@ use super::ShellError;
 /// Commands sent from a user-facing [`super::AsyncSession`] handle
 /// to the spawned tokio task that drives the sans-io core.
 #[derive(Debug)]
-pub enum Command {
+pub(crate) enum Command {
     /// Send a voice header and start a new outbound stream.
     SendHeader {
         /// The header to transmit.
@@ -25,8 +25,8 @@ pub enum Command {
     SendVoice {
         /// Stream id.
         stream_id: StreamId,
-        /// Frame seq (0..21 cycle).
-        seq: u8,
+        /// Validated index within one 21-frame superframe.
+        seq: FrameSequence,
         /// 9 AMBE bytes + 3 slow data bytes.
         frame: Box<VoiceFrame>,
         /// Reply channel.
@@ -38,7 +38,7 @@ pub enum Command {
         /// Stream id.
         stream_id: StreamId,
         /// Final seq.
-        seq: u8,
+        seq: FrameSequence,
         /// Reply channel.
         reply: tokio::sync::oneshot::Sender<Result<(), ShellError>>,
     },
@@ -71,7 +71,7 @@ mod tests {
         let (tx, _rx) = tokio::sync::oneshot::channel();
         let cmd = Command::SendEot {
             stream_id: sid(0x1234),
-            seq: 5,
+            seq: FrameSequence::ZERO,
             reply: tx,
         };
         assert!(matches!(cmd, Command::SendEot { .. }));

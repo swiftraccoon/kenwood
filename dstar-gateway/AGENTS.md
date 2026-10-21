@@ -19,11 +19,11 @@ This crate owns the workspace's only mdBook (`book/`); `lint.sh` builds it with
 - Client `handle_*_input` methods swallow decoder errors as `tracing::debug` diagnostics and **never** propagate them with `?`.
 - A `handle_input` error in the session loop kills the entire session, so the fix always belongs at the decode boundary, not in the loop.
 - Log greps: `mio::poll: deregistering` after a VoiceEnd means the session loop died; `session loop exited` shows clean versus error exit; `rejected datagram` is lenient decode dropping an unrecognized packet, which is normal for reflectors.
-- The DPlus auth host resolves to several addresses and not all of them answer, so `AuthClient` tries each with a 3 s per-address timeout (happy eyeballs).
+- `AuthClient` gives DNS and all sequential address attempts one configured connect deadline. Each address has at most 3 s within that budget; this is not RFC 8305 Happy Eyeballs.
 
 ## Features and testing
 
-- `insecure-plaintext-xlx-directory` is an explicit reqwest opt-in to the XLX registry's plaintext-HTTP-only endpoint; responses have no authenticity or integrity. `hardware-tests` and `examples-network` gate live-network code, and `blocking` adds the sync shell.
+- `insecure-plaintext-xlx-directory` is a reqwest opt-in to the selected plaintext HTTP directory URL; responses have no authenticated provenance. `hardware-tests` and `examples-network` gate live-network code, and `blocking` adds the sync shell.
 - `tests/conformance.rs` is `#[ignore]`d and replays pcaps. The corpus under `tests/conformance/corpus/<proto>/` is deliberately not committed; drop local `.pcap` files there and run with `--ignored`.
 - Compile-fail expectations re-bless with `TRYBUILD=overwrite cargo test -p dstar-gateway --test trybuild_compile_fail`. Fuzz targets live in the core crate.
 - Examples `04` through `10` carry `required-features` (`examples-network`, plus `blocking` for the blocking CLI), which is why a plain `cargo build --examples` silently skips most of them.

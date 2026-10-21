@@ -31,16 +31,13 @@ use std::env;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use dstar_gateway::tokio_shell::AsyncSession;
+use dstar_gateway::tokio_shell::{AsyncSession, drive_connecting};
+use dstar_gateway_core::RelayRouting;
 use dstar_gateway_core::header::DstarHeader;
-use dstar_gateway_core::session::Driver;
-use dstar_gateway_core::session::client::{
-    ClientStateKind, Configured, Connected, DExtra, Event, Session,
-};
-use dstar_gateway_core::types::{Callsign, Module, StreamId};
+use dstar_gateway_core::session::client::{Configured, DExtra, Event, Session};
+use dstar_gateway_core::types::{FrameSequence, Module, RoutingCallsign, StreamId};
 use dstar_gateway_core::voice::VoiceFrame;
 use tokio::net::UdpSocket;
-use tokio::time::timeout;
 
 // Acknowledged workspace dev-deps.
 use pcap_parser as _;
@@ -58,16 +55,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let callsign = Callsign::try_from_str(&env::var("DSTAR_CALLSIGN")?)?;
+    let callsign = RoutingCallsign::new(&env::var("DSTAR_CALLSIGN")?)?;
     let reflector_a =
         env::var("REFLECTOR_A").unwrap_or_else(|_| "xrf030.example.com:30001".to_string());
     let reflector_b =
         env::var("REFLECTOR_B").unwrap_or_else(|_| "xrf040.example.com:30001".to_string());
     let reflector_callsigns = (
-        Callsign::try_from_str(
+        RoutingCallsign::new(
             &env::var("REFLECTOR_A_CALLSIGN").unwrap_or_else(|_| "XRF030".to_string()),
         )?,
-        Callsign::try_from_str(
+        RoutingCallsign::new(
             &env::var("REFLECTOR_B_CALLSIGN").unwrap_or_else(|_| "XRF040".to_string()),
         )?,
     );
@@ -77,18 +74,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // bridge would retry the failed side while keeping the other
     // side open.
     let (session_a, session_b) = tokio::try_join!(
-        connect(callsign, &reflector_a, 'C'),
-        connect(callsign, &reflector_b, 'C'),
+        connect(callsign, &reflector_a, Module::C),
+        connect(callsign, &reflector_b, Module::C),
     )?;
     let mut async_a = session_a;
     let mut async_b = session_b;
-    let route_to_a = RelayRoute {
+    let route_to_a = RelayRouting {
         operator: callsign,
         local_module: Module::B,
         reflector: reflector_callsigns.0,
         reflector_module: Module::C,
     };
-    let route_to_b = RelayRoute {
+    let route_to_b = RelayRouting {
         operator: callsign,
         local_module: Module::B,
         reflector: reflector_callsigns.1,
@@ -105,50 +102,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut tx_stream_a_to_b: Option<StreamId> = None;
     let mut tx_stream_b_to_a: Option<StreamId> = None;
 
-    loop {
-        tokio::select! {
-            ev = async_a.next_event() => {
-                let Some(event) = ev else {
-                    tracing::warn!("A stream closed");
-                    break;
-                };
-                forward(
-                    &event,
-                    &mut async_b,
-                    &mut tx_stream_a_to_b,
-                    route_to_b,
-                )
-                .await?;
-            }
-            ev = async_b.next_event() => {
-                let Some(event) = ev else {
-                    tracing::warn!("B stream closed");
-                    break;
-                };
-                forward(
-                    &event,
-                    &mut async_a,
-                    &mut tx_stream_b_to_a,
-                    route_to_a,
-                )
-                .await?;
+    let forwarding = async {
+        loop {
+            tokio::select! {
+                ev = async_a.next_event() => {
+                    let Some(event) = ev else {
+                        tracing::warn!("A stream closed");
+                        break;
+                    };
+                    forward(
+                        &event,
+                        &mut async_b,
+                        &mut tx_stream_a_to_b,
+                        route_to_b,
+                    )
+                    .await?;
+                }
+                ev = async_b.next_event() => {
+                    let Some(event) = ev else {
+                        tracing::warn!("B stream closed");
+                        break;
+                    };
+                    forward(
+                        &event,
+                        &mut async_a,
+                        &mut tx_stream_b_to_a,
+                        route_to_a,
+                    )
+                    .await?;
+                }
             }
         }
+        Ok::<(), Box<dyn std::error::Error>>(())
     }
-
-    // Clean shutdown, ignoring errors because either side may
-    // already be dead.
-    drop(async_a.disconnect().await);
-    drop(async_b.disconnect().await);
+    .await;
+    let (left, right) = tokio::join!(async_a.disconnect(), async_b.disconnect());
+    for result in [&left, &right] {
+        if let Err(error) = result {
+            tracing::warn!(%error, "bridge unlink failed");
+        }
+    }
+    forwarding?;
+    left?;
+    right?;
     Ok(())
-}
-
-#[derive(Clone, Copy)]
-struct RelayRoute {
-    operator: Callsign,
-    local_module: Module,
-    reflector: Callsign,
-    reflector_module: Module,
 }
 
 /// Forward one event from the RX side to the TX side, rewriting the
@@ -157,23 +154,14 @@ async fn forward(
     event: &Event<DExtra>,
     tx: &mut AsyncSession<DExtra>,
     tx_stream: &mut Option<StreamId>,
-    route: RelayRoute,
+    route: RelayRouting,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match event {
         Event::VoiceStart {
             stream_id, header, ..
         } => {
-            let mut outbound_header = DstarHeader::for_relay(
-                route.operator,
-                route.local_module,
-                route.reflector,
-                route.reflector_module,
-                header.my_call,
-                header.my_suffix,
-            );
-            outbound_header.flag1 = header.flag1;
-            outbound_header.flag2 = header.flag2;
-            outbound_header.flag3 = header.flag3;
+            let outbound_header = DstarHeader::for_relay(route, header.my_call, header.my_suffix)
+                .with_flags(header.flags);
             *tx_stream = Some(*stream_id);
             tx.send_header(outbound_header, *stream_id).await?;
         }
@@ -183,10 +171,15 @@ async fn forward(
             frame,
         } => {
             if tx_stream.is_some_and(|active| active == *stream_id) {
-                // Forward the frame verbatim. `VoiceFrame` is `Copy` so
-                // this is a bitwise move, no alloc.
+                let Some(index) = FrameSequence::new(*seq) else {
+                    tracing::warn!(
+                        sequence = seq,
+                        "dropping a received frame with an invalid transmit index"
+                    );
+                    return Ok(());
+                };
                 let outgoing: VoiceFrame = *frame;
-                tx.send_voice(*stream_id, *seq, outgoing).await?;
+                tx.send_voice(*stream_id, index, outgoing).await?;
             }
         }
         Event::VoiceEnd { stream_id, .. } => {
@@ -194,7 +187,7 @@ async fn forward(
             // TX side. Seq on EOT is advisory: MMDVMHost uses 0 in
             // the common case, which the core codec accepts.
             if *tx_stream == Some(*stream_id) {
-                tx.send_eot(*stream_id, 0).await?;
+                tx.send_eot(*stream_id, FrameSequence::ZERO).await?;
                 *tx_stream = None;
             }
         }
@@ -205,41 +198,32 @@ async fn forward(
 
 /// Spawn one `AsyncSession<DExtra>` to the named reflector.
 async fn connect(
-    callsign: Callsign,
+    callsign: RoutingCallsign,
     reflector_host: &str,
-    module_char: char,
+    module: Module,
 ) -> Result<AsyncSession<DExtra>, Box<dyn std::error::Error>> {
-    let peer = tokio::net::lookup_host(reflector_host)
-        .await?
-        .next()
-        .ok_or("resolve")?;
-    let sock = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
+    let peer = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::net::lookup_host(reflector_host),
+    )
+    .await??
+    .next()
+    .ok_or("resolve")?;
+    let bind = if peer.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    };
+    let sock = Arc::new(UdpSocket::bind(bind).await?);
 
     let session: Session<DExtra, Configured> = Session::<DExtra, Configured>::builder()
         .callsign(callsign)
         .local_module(Module::try_from_char('B')?)
-        .reflector_module(Module::try_from_char(module_char)?)
+        .reflector_module(module)
         .peer(peer)
         .build();
 
-    let now = Instant::now();
-    let mut connecting = session
-        .connect(now)
-        .map_err(|f| format!("connect: {}", f.error))?;
-    if let Some(tx) = connecting.poll_transmit(now) {
-        let _ = sock.send_to(tx.payload, tx.dst).await?;
-    }
-    let mut buf = [0u8; 64];
-    let (n, src) = timeout(Duration::from_secs(5), sock.recv_from(&mut buf))
-        .await
-        .map_err(|_| "handshake timeout")??;
-    let slice = buf.get(..n).unwrap_or(&[]);
-    connecting.handle_input(Instant::now(), src, slice)?;
-    if connecting.state_kind() != ClientStateKind::Connected {
-        return Err("handshake did not complete".into());
-    }
-    let connected: Session<DExtra, Connected> = connecting
-        .promote()
-        .map_err(|f| format!("promote: {}", f.error))?;
+    let connecting = session.connect(Instant::now())?;
+    let connected = drive_connecting(connecting, &sock, Duration::from_secs(5)).await?;
     Ok(AsyncSession::spawn(connected, sock))
 }

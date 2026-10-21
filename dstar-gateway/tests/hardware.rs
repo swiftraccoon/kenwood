@@ -18,11 +18,13 @@
 //!   reflector (default: `XLX307`). The tests append `:30001`.
 //! - `DSTAR_TEST_REFLECTOR_DCS`: host name of a `DCS` reflector
 //!   (default: `DCS001`). The tests append `:30051`.
+//! - `DSTAR_TEST_REFLECTOR_DCS_CALLSIGN`: DCS target identity carried on the
+//!   wire (default: `DCS001`), independently of its DNS hostname.
 //! - `DSTAR_TEST_REFLECTOR_CALLSIGN`: routing callsign used by the
 //!   voice TX header (default: `REF030`). Keep this separate from the
 //!   DNS hostname in `DSTAR_TEST_REFLECTOR_DPLUS`.
 //! - `DSTAR_TEST_CALLSIGN`: user callsign to authenticate with
-//!   (default: `TEST    `). Must be a valid amateur radio callsign when
+//!   (default: `TEST`). Must be a valid amateur radio callsign when
 //!   running the TX test against a real reflector.
 //! - `DSTAR_TEST_TX_OK`: must be set to `1` to enable the voice-burst
 //!   TX test. Unset by default so accidentally running `--ignored`
@@ -46,12 +48,15 @@ use std::time::{Duration, Instant};
 
 use dstar_gateway::auth::AuthClient;
 use dstar_gateway::tokio_shell::AsyncSession;
+use dstar_gateway_core::RelayRouting;
 use dstar_gateway_core::header::DstarHeader;
 use dstar_gateway_core::session::Driver;
 use dstar_gateway_core::session::client::{
     Authenticated, ClientStateKind, Configured, Connecting, DExtra, DPlus, Dcs, Session,
 };
-use dstar_gateway_core::types::{Callsign, Module, StreamId, Suffix};
+use dstar_gateway_core::types::{
+    DcsReflector, FrameSequence, Module, RoutingCallsign, StreamId, Suffix,
+};
 use dstar_gateway_core::voice::VoiceFrame;
 use pcap_parser as _;
 use thiserror as _;
@@ -66,11 +71,10 @@ const DEFAULT_REFLECTOR_DPLUS: &str = "REF030";
 const DEFAULT_REFLECTOR_DEXTRA: &str = "XLX307";
 const DEFAULT_REFLECTOR_DCS: &str = "DCS001";
 
-/// Default callsign used when `DSTAR_TEST_CALLSIGN` is unset. Must stay
-/// eight characters wide (space-padded) to match the `Callsign` invariant.
-const DEFAULT_TEST_CALLSIGN: &str = "TEST    ";
+/// Default station prefix used when `DSTAR_TEST_CALLSIGN` is unset.
+const DEFAULT_TEST_CALLSIGN: &str = "TEST";
 
-/// Port numbers for the three protocols (fixed by the D-STAR spec).
+/// Default UDP ports used by the pinned reflector implementations.
 const DPLUS_PORT: u16 = 20001;
 const DEXTRA_PORT: u16 = 30001;
 const DCS_PORT: u16 = 30051;
@@ -83,20 +87,20 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const LISTEN_DURATION: Duration = Duration::from_secs(5);
 
 /// Final disconnect deadline.
-const DISCONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+const DISCONNECT_TIMEOUT: Duration = Duration::from_secs(7);
 
 /// Pull the station callsign from the env or fall back to a default.
-fn test_callsign() -> Result<Callsign, Box<dyn std::error::Error>> {
+fn test_callsign() -> Result<RoutingCallsign, Box<dyn std::error::Error>> {
     let raw =
         std::env::var("DSTAR_TEST_CALLSIGN").unwrap_or_else(|_| DEFAULT_TEST_CALLSIGN.to_string());
-    Ok(Callsign::try_from_str(&raw)?)
+    Ok(RoutingCallsign::new(&raw)?)
 }
 
 /// Resolve `"<host>:<port>"` to a `SocketAddr`. Fails the test on DNS
 /// error or empty result.
 async fn resolve_peer(host: &str, port: u16) -> Result<SocketAddr, Box<dyn std::error::Error>> {
     let target = format!("{host}:{port}");
-    let mut addrs = lookup_host(&target).await?;
+    let mut addrs = timeout(HANDSHAKE_TIMEOUT, lookup_host((host, port))).await??;
     addrs
         .next()
         .ok_or_else(|| format!("reflector host {target} resolved to zero addresses").into())
@@ -108,14 +112,16 @@ async fn resolve_peer(host: &str, port: u16) -> Result<SocketAddr, Box<dyn std::
 fn build_header(
     reflector_callsign: &str,
     reflector_module: char,
-    my_call: Callsign,
+    my_call: RoutingCallsign,
 ) -> Result<DstarHeader, Box<dyn std::error::Error>> {
     Ok(DstarHeader::for_relay(
-        my_call,
-        Module::B,
-        Callsign::try_from_str(reflector_callsign)?,
-        Module::try_from_char(reflector_module)?,
-        my_call,
+        RelayRouting {
+            operator: my_call,
+            local_module: Module::B,
+            reflector: RoutingCallsign::new(reflector_callsign)?,
+            reflector_module: Module::try_from_char(reflector_module)?,
+        },
+        my_call.callsign(),
         Suffix::EMPTY,
     ))
 }
@@ -221,7 +227,7 @@ async fn dplus_connect_listen_disconnect_against_real_ref030()
     let peer = resolve_peer(&reflector, DPLUS_PORT).await?;
 
     // Pull the host list over TCP before touching UDP.
-    let hosts = AuthClient::new().authenticate(callsign).await?;
+    let hosts = AuthClient::new().authenticate(callsign.callsign()).await?;
 
     let client_sock = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
 
@@ -304,6 +310,10 @@ async fn dcs_connect_listen_disconnect_against_real_dcs001()
 
     let session: Session<Dcs, Configured> = Session::<Dcs, Configured>::builder()
         .callsign(callsign)
+        .dcs_reflector(DcsReflector::new(
+            &std::env::var("DSTAR_TEST_REFLECTOR_DCS_CALLSIGN")
+                .unwrap_or_else(|_| DEFAULT_REFLECTOR_DCS.to_owned()),
+        )?)
         .local_module(Module::B)
         .reflector_module(Module::C)
         .peer(peer)
@@ -349,7 +359,7 @@ async fn dplus_voice_burst_to_real_reflector() -> Result<(), Box<dyn std::error:
     let callsign = test_callsign()?;
     let peer = resolve_peer(&reflector, DPLUS_PORT).await?;
 
-    let hosts = AuthClient::new().authenticate(callsign).await?;
+    let hosts = AuthClient::new().authenticate(callsign.callsign()).await?;
 
     let client_sock = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
 
@@ -381,9 +391,13 @@ async fn dplus_voice_burst_to_real_reflector() -> Result<(), Box<dyn std::error:
 
     let frame = VoiceFrame::silence();
     for seq in 0u8..3 {
-        async_session.send_voice(sid, seq, frame).await?;
+        async_session
+            .send_voice(sid, FrameSequence::try_from(seq)?, frame)
+            .await?;
     }
-    async_session.send_eot(sid, 3).await?;
+    async_session
+        .send_eot(sid, FrameSequence::try_from(3)?)
+        .await?;
 
     // Let the last packets hit the wire.
     tokio::time::sleep(Duration::from_millis(100)).await;

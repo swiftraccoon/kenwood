@@ -5,7 +5,7 @@
 //! or `DCS` to drive a full connect / voice / disconnect cycle
 //! against a `dstar_gateway_core::Session<P, _>`.
 //!
-//! Unlike the legacy harness, the loopback helper records **every**
+//! The loopback helper records every
 //! datagram in a single `Vec<Vec<u8>>` so tests can assert on the
 //! exact wire shape produced by the new tokio shell's `SessionLoop`.
 //!
@@ -62,6 +62,9 @@ impl FakeReflector {
                     // first 10 bytes of the request and append the
                     // "ACK" tag at [10..13] followed by NUL at [13].
                     11 => {
+                        if buf.get(9) == Some(&b' ') {
+                            continue;
+                        }
                         let mut ack = [0u8; 14];
                         if let Some(prefix) = buf.get(..10)
                             && let Some(dst) = ack.get_mut(..10)
@@ -224,8 +227,7 @@ impl FakeReflector {
                             drop(sock_clone.send_to(slice, src).await);
                         }
                     }
-                    // 19-byte UNLINK → reply with an ACK-shaped reply
-                    // so the session closes immediately.
+                    // DCS UNLINK receives a NAK with a space target module.
                     19 => {
                         let mut reply = [0u8; 14];
                         if let Some(prefix) = buf.get(..10)
@@ -233,17 +235,8 @@ impl FakeReflector {
                         {
                             dst.copy_from_slice(prefix);
                         }
-                        // For UNLINK the `client_module` is at [8] and
-                        // [9] is `b' '`. The core's reply parser needs
-                        // a *valid* reflector module at [9], so
-                        // overwrite [9] with [8] before shipping.
-                        if let Some(src_b) = buf.get(8).copied()
-                            && let Some(dst) = reply.get_mut(9)
-                        {
-                            *dst = src_b;
-                        }
                         if let Some(dst) = reply.get_mut(10..13) {
-                            dst.copy_from_slice(b"ACK");
+                            dst.copy_from_slice(b"NAK");
                         }
                         if let Some(nul) = reply.get_mut(13) {
                             *nul = 0x00;

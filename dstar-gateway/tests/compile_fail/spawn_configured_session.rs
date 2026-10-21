@@ -13,23 +13,24 @@ use std::sync::Arc;
 
 use dstar_gateway::tokio_shell::AsyncSession;
 use dstar_gateway_core::session::client::{Configured, DExtra, Session};
-use dstar_gateway_core::types::{Callsign, Module};
+use dstar_gateway_core::types::{Module, RoutingCallsign};
 use tokio::net::UdpSocket;
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let session: Session<DExtra, Configured> = Session::<DExtra, Configured>::builder()
-        .callsign(Callsign::try_from_str("W1AW").unwrap())
-        .local_module(Module::try_from_char('B').unwrap())
-        .reflector_module(Module::try_from_char('C').unwrap())
-        .peer("127.0.0.1:30001".parse().unwrap())
+        .callsign(RoutingCallsign::new("W1AW")?)
+        .local_module(Module::B)
+        .reflector_module(Module::C)
+        .peer("127.0.0.1:30001".parse()?)
         .build();
 
-    let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
 
     // ERROR: `AsyncSession::spawn` is implemented only for
     // `Session<P, Connected>`. Passing a `Session<_, Configured>`
     // fails to satisfy the `where`-clause on the `Session` type
     // parameter, which manifests as a type-mismatch error from rustc.
     let _ = AsyncSession::spawn(session, socket);
+    Ok(())
 }

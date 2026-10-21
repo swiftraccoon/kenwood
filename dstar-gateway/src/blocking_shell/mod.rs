@@ -1,6 +1,6 @@
 //! Synchronous (non-tokio) shell driving the sans-io core.
 //!
-//! Same typestate API as [`super::tokio_shell`], but uses
+//! The typed client API uses
 //! `std::net::UdpSocket` with read timeouts instead of tokio channels.
 //!
 //! Useful for CLI scripts, test fixtures, and documentation examples
@@ -12,6 +12,8 @@
 //! state machine forward one step at a time. No spawned thread, no
 //! channels.
 
-mod session;
-
+pub use connect::drive_connecting;
 pub use session::BlockingSession;
+
+mod connect;
+mod session;

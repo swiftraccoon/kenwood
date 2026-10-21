@@ -25,15 +25,12 @@
 use reqwest as _;
 
 use std::env;
-use std::net::UdpSocket;
+use std::net::{ToSocketAddrs as _, UdpSocket};
 use std::time::{Duration, Instant};
 
-use dstar_gateway::blocking_shell::BlockingSession;
-use dstar_gateway_core::session::Driver;
-use dstar_gateway_core::session::client::{
-    ClientStateKind, Configured, Connected, DExtra, Session,
-};
-use dstar_gateway_core::types::{Callsign, Module};
+use dstar_gateway::blocking_shell::{BlockingSession, drive_connecting};
+use dstar_gateway_core::session::client::{Configured, DExtra, Session};
+use dstar_gateway_core::types::{Module, RoutingCallsign};
 
 // Acknowledged workspace dev-deps. This example is deliberately
 // not running tokio, so the async runtime and `tracing` facade are
@@ -47,13 +44,13 @@ use trybuild as _;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
-    let callsign = Callsign::try_from_str(&env::var("DSTAR_CALLSIGN")?)?;
+    let callsign = RoutingCallsign::new(&env::var("DSTAR_CALLSIGN")?)?;
     let reflector_host =
         env::var("REFLECTOR_HOST").unwrap_or_else(|_| "xrf030.example.com:30001".to_string());
 
     // 1. Resolve + bind a std UdpSocket. No tokio.
     let peer = reflector_host
-        .to_socket_addrs_std()?
+        .to_socket_addrs()?
         .next()
         .ok_or("resolve failed")?;
     let sock = UdpSocket::bind("0.0.0.0:0")?;
@@ -68,34 +65,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .peer(peer)
         .build();
 
-    let now = Instant::now();
-    let mut connecting = session
-        .connect(now)
-        .map_err(|f| format!("connect: {}", f.error))?;
-
-    // Send LINK.
-    if let Some(tx) = connecting.poll_transmit(now) {
-        let _ = sock.send_to(tx.payload, tx.dst)?;
-    }
-
-    // Recv ACK.
-    let mut buf = [0u8; 64];
-    let (n, src) = sock.recv_from(&mut buf)?;
-    let slice = buf.get(..n).unwrap_or(&[]);
-    connecting.handle_input(Instant::now(), src, slice)?;
-    if connecting.state_kind() != ClientStateKind::Connected {
-        eprintln!("handshake did not complete");
-        return Ok(());
-    }
-
-    let connected: Session<DExtra, Connected> = connecting
-        .promote()
-        .map_err(|f| format!("promote: {}", f.error))?;
+    let connecting = session.connect(Instant::now())?;
+    let connected = drive_connecting(connecting, &sock, Duration::from_secs(5))?;
 
     // 3. Hand off to the blocking shell. The shell owns the socket
     //    from here on and drives the driver loop one step per
     //    `run_until_event` call.
-    let mut shell = BlockingSession::new(connected, sock);
+    let mut shell = BlockingSession::new(connected, sock)?;
 
     // 4. Print events for 30 seconds, one step at a time. A real
     //    CLI would install a SIGINT handler here and break out of
@@ -103,23 +79,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     //    the shell's internal 100 ms idle wait already throttles
     //    CPU, so we simply loop back to the next call.
     let deadline = Instant::now() + Duration::from_secs(30);
-    while Instant::now() < deadline {
+    while Instant::now() < deadline && !shell.is_closed() {
         if let Some(event) = shell.run_until_event()? {
             println!("event: {event:?}");
         }
     }
+    shell.disconnect()?;
     Ok(())
-}
-
-/// Little helper so the example doesn't need to pull in `ToSocketAddrs`
-/// via a trait import at the top of the file.
-trait HostResolve {
-    fn to_socket_addrs_std(&self) -> std::io::Result<std::vec::IntoIter<std::net::SocketAddr>>;
-}
-
-impl HostResolve for String {
-    fn to_socket_addrs_std(&self) -> std::io::Result<std::vec::IntoIter<std::net::SocketAddr>> {
-        use std::net::ToSocketAddrs;
-        self.as_str().to_socket_addrs()
-    }
 }

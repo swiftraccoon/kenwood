@@ -1,113 +1,56 @@
-# What is D-STAR?
+# Reflector protocol boundaries
 
-**D-STAR** (Digital Smart Technologies for Amateur Radio) is a
-digital voice and data protocol for amateur radio, developed by
-the Japan Amateur Radio League (JARL) in the early 2000s and
-adopted most prominently by ICOM in their commercial radios. It
-competes in roughly the same ecological niche as DMR and Yaesu
-System Fusion: a radio-over-IP overlay that lets hams on opposite
-sides of the world talk to each other by way of the Internet.
-
-This book assumes some familiarity with amateur radio basics but
-nothing specific to D-STAR. This chapter is a quick primer for
-software engineers who came to the library via "someone asked me
-to write a D-STAR client".
-
-## The layer cake
-
-A D-STAR QSO (conversation) between two operators in different
-countries goes through several layers:
-
-```text
-[Operator A's radio]
-        |
-        v
-[Operator A's local hotspot / repeater]   <-- MMDVM / ThumbDV / DVMega
-        |
-        v
-[Reflector gateway]                       <-- ircDDBGateway, dstar-gateway
-        |
-        v  (DPlus / DExtra / DCS over UDP)
-[Reflector server]                        <-- xlxd, ref_reflector
-        |
-        v  (fan-out)
-[Other reflector gateways on the same module]
-        |
-        v
-[Other operators' hotspots / repeaters]
-        |
-        v
-[Other operators' radios]
-```
-
-`dstar-gateway` implements the **reflector gateway** layer and,
-optionally, the **reflector server** layer. The radio-to-hotspot
-leg is handled by a different family of protocols (MMDVM /
-USRP / `thd75` CAT) and is out of scope for this library.
+This stack implements the DPlus, DExtra and DCS network protocols between a
+gateway client and reflector server. Radio-to-modem control belongs to the
+separate model and modem libraries.
 
 ## Reflectors and modules
 
-A **reflector** is a server that sits on the Internet and
-broadcasts voice traffic to a group of connected clients. Each
-reflector hosts up to 26 **modules**, named A through Z. A client
-links to exactly one module at a time; clients on the same module
-hear each other. Clients on different modules of the same
-reflector do not.
+A reflector groups linked clients by module. This stack represents module
+selectors as A through Z; each reflector configures which selectors it serves.
+A configured module's availability is a server policy, not a radio limit.
 
-Reflector naming follows a convention:
-- `REFxxx` names refer to **DPlus** reflectors (e.g. REF030,
-  REF001, REF077). Port 20001.
-- `XRFxxx` names refer to **DExtra** reflectors (e.g. XRF757,
-  XRF223). Port 30001.
-- `XLXxxx` names refer to **XLX** reflectors, which speak a
-  superset of the DExtra protocol (e.g. XLX307). Port 30001.
-- `DCSxxx` names refer to **DCS** reflectors (e.g. DCS001,
-  DCS002). Port 30051.
+| Protocol | Conventional directory prefix | Default UDP port |
+| --- | --- | --- |
+| DPlus | REF | 20001 |
+| DExtra | XRF; XLX directories also expose DExtra endpoints | 30001 |
+| DCS | DCS | 30051 |
 
-From the gateway's perspective, DExtra and XLX are the same wire
-format; XLX just has more features. DPlus is different enough to
-need a separate codec but shares the voice-frame structure. DCS
-is different again and has a notably larger (100-byte) voice
-frame.
+These are the pinned reference implementations' defaults. A client uses its
+configured address and port. Selecting an XLX entry does not imply that every
+protocol revision or server extension is implemented.
 
-## What does "linking" mean?
+## Linking and completion
 
-When a client "links" to a reflector, it sends a **LINK** packet
-to the reflector's well-known port. The reflector either
-acknowledges the link (ACK/OKRW) or rejects it (NAK/BUSY). Once
-linked, the client and reflector exchange **keepalive** packets
-at a protocol-specific cadence (1 second for DPlus, 10 seconds for
-DExtra, 5 seconds for DCS) and the client sends voice frames
-whenever the local operator keys up.
+DPlus attaches a TCP-authenticated host list before its two-round UDP
+handshake. DExtra and DCS use one-round UDP handshakes. DCS carries the target
+reflector identity in LINK, POLL and UNLINK, so its builder requires that value.
+The core correlates replies with the applicable identity, modules and phase.
 
-Disconnection happens by sending an **UNLINK** packet and
-optionally waiting for the reflector's ACK. Most real-world
-clients don't wait: they send UNLINK and drop the socket.
-`AsyncSession::disconnect` queues UNLINK and returns when the session
-loop acknowledges the request. Callers that need the protocol outcome
-continue reading until `Event::Disconnected`; dropping the handle just
-severs the local connection.
+While linked, the client exchanges protocol-specific keepalives and receives
+voice events. UNLINK acknowledgement differs by protocol/revision. The
+revision-zero DExtra request used here can close without a reply; a client
+waiting for acknowledgement then reports its protocol timeout.
 
-## Voice, headers, and streams
+AsyncSession::disconnect waits for the terminal outcome and task completion.
+Dropping the handle requests local exit without a remote acknowledgement.
+The caller keeps consuming events while linked so receive/timer work can
+progress through the bounded event queue.
 
-A **voice transmission** in D-STAR has three parts:
-1. A **header** (56 or 58 bytes depending on the protocol),
-   sent once at the start, containing the callsign, the
-   destination (usually `CQCQCQ`), and the routing info.
-2. A series of **voice frames**, each carrying 20 ms of AMBE-
-   encoded audio plus a sync pattern and optional slow-data.
-   DExtra frames are 27 bytes, DPlus frames 29 bytes; DCS frames
-   are 100 bytes including an embedded copy of the header.
-3. An **end-of-transmission** marker, which is a voice frame
-   with a special `End` byte set.
+## Voice and slow data
 
-A transmission is identified by a **stream id**: a non-zero
-16-bit integer chosen by the sender. Every frame in the same
-transmission carries the same stream id; overlapping
-transmissions on the same reflector are distinguished by their
-distinct stream ids. `dstar-gateway` enforces non-zero stream
-ids via the `StreamId` newtype.
+A voice frame carries nine AMBE bytes and three slow-data bytes for a
+20-ms interval, or 50 frames/s. DExtra sends a 56-byte voice header and
+27-byte data/EOT packets. DPlus uses 58-byte headers, 29-byte data and
+32-byte EOT packets. DCS embeds the header in each 100-byte voice packet.
 
-This is the protocol that `dstar-gateway` implements. The rest
-of this book shows how to drive it from Rust without becoming an
-expert in the underlying bits.
+A nonzero 16-bit StreamId identifies a transmission. Transmit indices use
+FrameSequence values 0 through 20; the codec adds termination separately.
+Receive events retain the complete sequence byte, including unknown bits.
+Slow-data blocks span paired voice frames, and DPRS sentences span multiple
+GPS blocks. The bounded listener example waits for CR and verifies the checksum.
+
+Source routines and exact revisions are listed in
+[REFERENCES](https://github.com/swiftraccoon/kenwood/blob/main/dstar-gateway/REFERENCES.md),
+including ircDDBGateway Common/DStarDefines.h, ConnectData.cpp and
+AMBEData.cpp, and xlxd cdextraprotocol.cpp/cdcsprotocol.cpp.
