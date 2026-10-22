@@ -12,16 +12,74 @@
 
 use realfft::num_complex::Complex;
 
+use super::stage::{FundamentalBin, Spectrum, StageError, StageField};
+
 /// Maximum number of harmonic amplitudes (matches IMBE/AMBE L).
 pub const MAX_HARMONICS: usize = 56;
 
 /// Per-frame spectral amplitudes.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SpectralAmplitudes {
     /// Linear magnitudes per harmonic. Only `num_harmonics` are valid.
-    pub magnitudes: [f32; MAX_HARMONICS],
+    pub(crate) magnitudes: [f32; MAX_HARMONICS],
     /// Number of harmonics actually computed for this frame.
-    pub num_harmonics: usize,
+    pub(crate) num_harmonics: usize,
+}
+
+impl SpectralAmplitudes {
+    /// Validate nonnegative finite magnitudes, active count and zero padding.
+    ///
+    /// Squared magnitudes must sum to a finite f32 value, matching the
+    /// quantizer's energy-weighting arithmetic.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StageError`] for an oversized count, invalid magnitude,
+    /// nonzero inactive entry or unrepresentable total power.
+    pub fn new(magnitudes: [f32; MAX_HARMONICS], num_harmonics: usize) -> Result<Self, StageError> {
+        if num_harmonics > MAX_HARMONICS {
+            return Err(StageError::Count {
+                field: StageField::Magnitudes,
+                actual: num_harmonics,
+                maximum: MAX_HARMONICS,
+            });
+        }
+        for (index, &value) in magnitudes.iter().enumerate() {
+            if !value.is_finite() || value < 0.0 {
+                return Err(StageError::Value {
+                    field: StageField::Magnitudes,
+                    index,
+                    value,
+                });
+            }
+            if index >= num_harmonics && value != 0.0 {
+                return Err(StageError::Padding {
+                    field: StageField::Magnitudes,
+                    index,
+                });
+            }
+        }
+        let power: f32 = magnitudes.iter().map(|value| value * value).sum();
+        if !power.is_finite() {
+            return Err(StageError::ArithmeticRange {
+                field: StageField::Magnitudes,
+            });
+        }
+        Ok(Self {
+            magnitudes,
+            num_harmonics,
+        })
+    }
+    /// Borrow all magnitudes, including zero padding.
+    #[must_use]
+    pub const fn magnitudes(&self) -> &[f32; MAX_HARMONICS] {
+        &self.magnitudes
+    }
+    /// Return the number of active harmonics.
+    #[must_use]
+    pub const fn num_harmonics(self) -> usize {
+        self.num_harmonics
+    }
 }
 
 /// Extract harmonic amplitudes from the FFT half-spectrum.
@@ -43,7 +101,19 @@ pub struct SpectralAmplitudes {
 ///
 /// L is limited by both the FFT size and the AMBE codec:
 /// `L = min(floor((N − 1) / f0_bin), MAX_HARMONICS)`.
-#[must_use]
+///
+/// # Errors
+///
+/// Returns [`StageError::ArithmeticRange`] if integrated magnitudes cannot
+/// retain finite total power. Inputs remain unchanged.
+pub fn extract_spectral_amplitudes(
+    spectrum: &Spectrum,
+    fundamental: FundamentalBin,
+) -> Result<SpectralAmplitudes, StageError> {
+    let output = extract_spectral_amplitudes_kernel(spectrum.bins(), fundamental.get());
+    SpectralAmplitudes::new(output.magnitudes, output.num_harmonics)
+}
+
 #[expect(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
@@ -53,7 +123,10 @@ pub struct SpectralAmplitudes {
               spectrum-relative fundamental frequency. All bin-index casts between usize \
               and f32 fit well within f32 mantissa and stay non-negative by construction."
 )]
-pub fn extract_spectral_amplitudes(fft_out: &[Complex<f32>], f0_bin: f32) -> SpectralAmplitudes {
+pub(crate) fn extract_spectral_amplitudes_kernel(
+    fft_out: &[Complex<f32>],
+    f0_bin: f32,
+) -> SpectralAmplitudes {
     let mut magnitudes = [0.0_f32; MAX_HARMONICS];
     if f0_bin < 0.5 {
         return SpectralAmplitudes {
@@ -88,7 +161,7 @@ pub fn extract_spectral_amplitudes(fft_out: &[Complex<f32>], f0_bin: f32) -> Spe
 
 #[cfg(test)]
 mod tests {
-    use super::extract_spectral_amplitudes;
+    use super::extract_spectral_amplitudes_kernel as extract_spectral_amplitudes;
     use realfft::num_complex::Complex;
 
     #[test]

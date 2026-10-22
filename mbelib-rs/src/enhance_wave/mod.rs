@@ -366,7 +366,7 @@ impl WaveEnhancer {
             return pcm.to_vec();
         }
         let x: Vec<f32> = pcm.iter().map(|&s| f32::from(s) / 32_768.0).collect();
-        let y = self.process_f32(&x);
+        let y = self.process_f32_inner(&x);
         y.iter()
             .map(|&v| {
                 #[expect(
@@ -381,8 +381,16 @@ impl WaveEnhancer {
 
     /// Float-domain processing (unit-scale samples). The parity test
     /// drives this directly against the training checkpoint's output.
+    ///
+    /// Allocates padded samples, complete spectra/network intermediates and the
+    /// returned vector proportional to clip length. Checked input construction
+    /// rejects nonfinite/out-of-range samples before processing begins.
     #[must_use]
-    pub fn process_f32(&self, samples: &[f32]) -> Vec<f32> {
+    pub fn process_f32(&self, samples: crate::PcmSamples<'_>) -> Vec<f32> {
+        self.process_f32_inner(samples.as_slice())
+    }
+
+    fn process_f32_inner(&self, samples: &[f32]) -> Vec<f32> {
         let padded = Self::reflect_pad(samples);
         let frames = (padded.len() - N_FFT) / HOP + 1;
         let spec = self.stft(&padded, frames);

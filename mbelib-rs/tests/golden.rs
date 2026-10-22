@@ -53,7 +53,9 @@ fn known_good_frames_decode_fec_clean_with_pinned_b_vectors() {
         mbelib_rs::FrameKind::Voice,
         "AMBE_SILENCE is a comfort-noise voice frame"
     );
-    let (b, _f0, harmonics, _d) = mbelib_rs::decode_trace(&AMBE_SILENCE);
+    let inspected = mbelib_rs::decode_trace(&AMBE_SILENCE);
+    let b = inspected.parameters();
+    let harmonics = inspected.harmonics();
     assert_eq!(
         b,
         [124, 0, 4, 165, 41, 10, 7, 7, 10],
@@ -71,7 +73,9 @@ fn known_good_frames_decode_fec_clean_with_pinned_b_vectors() {
         mbelib_rs::FrameKind::Tone,
         "TONE_FRAME must classify as a tone frame"
     );
-    let (b, _f0, harmonics, _d) = mbelib_rs::decode_trace(&TONE_FRAME);
+    let inspected = mbelib_rs::decode_trace(&TONE_FRAME);
+    let b = inspected.parameters();
+    let harmonics = inspected.harmonics();
     assert_eq!(
         b,
         [126, 0, 11, 349, 0, 0, 0, 0, 0],
@@ -423,7 +427,7 @@ fn dvsi_tone_frame_synthesizes_the_tone() {
 /// corrections), so a missing reset shows up as delta-gain carryover.
 #[test]
 fn tone_frame_fully_resets_the_parameter_track() -> Result<(), Box<dyn std::error::Error>> {
-    let clean_b = mbelib_rs::decode_trace(&AMBE_SILENCE).0;
+    let clean_b = mbelib_rs::decode_trace(&AMBE_SILENCE).parameters();
     let mut distinct = None;
     for bit_index in 0..72u32 {
         let mut frame = AMBE_SILENCE;
@@ -432,7 +436,7 @@ fn tone_frame_fully_resets_the_parameter_track() -> Result<(), Box<dyn std::erro
             *b ^= 1u8 << (bit_index % 8);
         }
         if mbelib_rs::frame_fec(&frame).total_errors == 0
-            && mbelib_rs::decode_trace(&frame).0 != clean_b
+            && mbelib_rs::decode_trace(&frame).parameters() != clean_b
         {
             distinct = Some(frame);
             break;
@@ -445,7 +449,7 @@ fn tone_frame_fully_resets_the_parameter_track() -> Result<(), Box<dyn std::erro
     let _d2 = seasoned.extract(&distinct);
     let tone = seasoned.extract(&TONE_FRAME);
     assert_eq!(
-        tone.kind,
+        tone.kind(),
         mbelib_rs::FrameKind::Tone,
         "TONE_FRAME classifies as tone"
     );
@@ -482,11 +486,11 @@ fn random_frame_sequences_keep_parameters_finite_and_synthesis_alive() {
                 extractor.extract(frame)
             };
             prop_assert!(
-                params.f0_hz.is_finite(),
+                params.f0_hz().is_finite(),
                 "f0 must stay finite over any frame sequence"
             );
             prop_assert!(
-                params.amplitudes.iter().all(|a| a.is_finite()),
+                params.amplitudes().iter().all(|a| a.is_finite()),
                 "spectral amplitudes must stay finite over any frame sequence"
             );
         }

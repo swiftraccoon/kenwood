@@ -36,9 +36,10 @@ use proptest as _;
 use wide as _;
 
 use mbelib_rs::{
-    EncoderBuffers, FftPlan, PitchTracker, VuvState, analyze_frame, detect_vuv_and_sa,
+    EncoderBuffers, FftPlan, FundamentalBin, PcmFrame, PitchMetric, PitchTracker, VuvState,
+    analyze_frame, detect_vuv_and_sa,
 };
-use realfft::num_complex::Complex;
+use realfft as _;
 use std::io::{BufRead, BufReader, Read};
 
 #[derive(Debug, Clone, Default)]
@@ -117,7 +118,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut bufs = EncoderBuffers::new();
     let mut plan = FftPlan::new();
-    let mut fft_out: Vec<Complex<f32>> = vec![Complex::new(0.0, 0.0); 129];
     let mut pitch_tracker = PitchTracker::new();
     let mut vuv_state = VuvState::new();
 
@@ -134,18 +134,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         let mut samples = [0.0_f32; 160];
         samples.copy_from_slice(frame);
-        analyze_frame(&samples, &mut bufs, &mut plan, &mut fft_out);
-        let pitch = pitch_tracker.estimate(bufs.pitch_est_buf());
-        let f0_bin = 256.0 / pitch.period_samples;
-        let e_p = (1.0 - pitch.confidence).clamp(0.0, 1.0);
-        let (vuv, amps) = detect_vuv_and_sa(&fft_out, f0_bin, &mut vuv_state, e_p);
-        let our_l = amps.num_harmonics;
+        let fft_out = analyze_frame(&PcmFrame::new(samples)?, &mut bufs, &mut plan);
+        let pitch = pitch_tracker.estimate(bufs.pitch_est_buf())?;
+        let f0_bin = FundamentalBin::new(256.0 / pitch.period_samples())?;
+        let e_p = PitchMetric::new((1.0 - pitch.confidence()).clamp(0.0, 1.0))?;
+        let (vuv, amps) = detect_vuv_and_sa(&fft_out, f0_bin, &mut vuv_state, e_p)?;
+        let our_l = amps.num_harmonics();
 
         let Some(op25_f) = op25.get(frame_idx) else {
             break;
         };
         let op25_period = f32::from(op25_f.ref_pitch_q88) / 256.0;
-        let period_diff = pitch.period_samples - op25_period;
+        let period_diff = pitch.period_samples() - op25_period;
         let l_diff = our_l as i32 - op25_f.num_harms as i32;
         pitch_period_diffs.push(period_diff);
         l_diffs.push(l_diff);
@@ -157,7 +157,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 op25_f.num_harms,
                 op25_period,
                 our_l,
-                pitch.period_samples,
+                pitch.period_samples(),
                 period_diff,
                 l_diff
             );
@@ -167,8 +167,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if frame_idx < 5 {
             let mut our_voiced_per_harm: Vec<bool> = Vec::new();
             for i in 0..our_l {
-                let band = (i / 3).min(vuv.num_bands.saturating_sub(1));
-                our_voiced_per_harm.push(vuv.voiced.get(band).copied().unwrap_or(false));
+                let band = (i / 3).min(vuv.num_bands().saturating_sub(1));
+                our_voiced_per_harm.push(vuv.voiced().get(band).copied().unwrap_or(false));
             }
             let op25_voiced: Vec<bool> = op25_f.v_uv_dsn.iter().copied().take(our_l).collect();
             let matches = our_voiced_per_harm

@@ -20,15 +20,7 @@
 //! The coefficient layout in [`crate::encode::kenwood::biquads`] is
 //! `[b0, b1, b2, a1, a2]` with the standard DSP convention
 //! (`H(z) = B(z) / (1 + a1·z⁻¹ + a2·z⁻²)`, feedback terms
-//! SUBTRACTED from the new output). Despite the header comment in
-//! the `rust_integration/` crate calling the tail "-a1, -a2", the
-//! actual stored values are canonical: stability analysis of the
-//! 345 Hz HPF row 0
-//! (`[0.98168, −1.96336, 0.98168, −1.96302, 0.96370]`) shows the
-//! pole pair at `z = 0.982 ± 0.019i` only when the last two values
-//! are treated as `a1, a2` directly (difference-equation subtracts
-//! them). Treating them as "pre-negated" puts a pole at `z ≈ −2.37`
-//! which explodes on the first DC input.
+//! subtracted from the new output).
 
 /// Per-stream delay-line state for one biquad section.
 #[derive(Debug, Clone, Copy, Default)]
@@ -58,8 +50,8 @@ impl Biquad2State {
 /// output per the standard DF-I convention. `state` carries the
 /// four-tap delay line across calls.
 ///
-/// `input` and `output` may alias; the reads from `input[i]` happen
-/// before the write to `output[i]`, so `sigout == sigin` is safe.
+/// Processes the shorter slice length. Any remaining output elements stay
+/// unchanged, and the state advances only for samples actually processed.
 #[inline]
 pub(crate) fn biquad_df1_section(
     coeffs: &[f32; 5],

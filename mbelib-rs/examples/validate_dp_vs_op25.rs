@@ -17,8 +17,10 @@
 use proptest as _;
 use wide as _;
 
-use mbelib_rs::{EncoderBuffers, FftPlan, PitchTracker, analyze_frame, compute_e_p};
-use realfft::num_complex::Complex;
+use mbelib_rs::{
+    EncoderBuffers, FftPlan, PcmFrame, PitchErrors, PitchTracker, analyze_frame, compute_e_p,
+};
+use realfft as _;
 use std::io::{BufRead, BufReader, Read};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -60,8 +62,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut bufs = EncoderBuffers::new();
     let mut plan = FftPlan::new();
-    let mut fft_out = vec![Complex::new(0.0, 0.0); 129];
-    let mut ring: Vec<[f32; 203]> = Vec::with_capacity(3);
+    let mut ring: Vec<PitchErrors> = Vec::with_capacity(3);
     let mut single = PitchTracker::new();
     let mut dp = PitchTracker::new();
 
@@ -74,18 +75,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         let mut samples = [0.0_f32; 160];
         samples.copy_from_slice(frame);
-        analyze_frame(&samples, &mut bufs, &mut plan, &mut fft_out);
-        let e_p = compute_e_p(bufs.pitch_est_buf());
+        let _spectrum = analyze_frame(&PcmFrame::new(samples)?, &mut bufs, &mut plan);
+        let e_p = compute_e_p(bufs.pitch_est_buf())?;
 
         // Single-frame on same buf.
-        let s_est = single.estimate(bufs.pitch_est_buf());
-        single_periods.push(s_est.period_samples);
+        let s_est = single.estimate(bufs.pitch_est_buf())?;
+        single_periods.push(s_est.period_samples());
 
         // DP: buffer 3 e_p arrays.
         ring.push(e_p);
         if let [r0, r1, r2] = ring.as_slice() {
             let est = dp.estimate_with_lookahead(r0, r1, r2);
-            dp_periods.push(est.period_samples);
+            dp_periods.push(est.period_samples());
             let _oldest = ring.remove(0);
         } else {
             dp_periods.push(0.0); // warmup

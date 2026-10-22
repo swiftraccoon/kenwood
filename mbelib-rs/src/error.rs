@@ -1,41 +1,26 @@
 // SPDX-FileCopyrightText: 2026 Swift Raccoon
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-//! Error types for the AMBE 3600×2400 decoder.
+//! Caller-constructed diagnostics for AMBE FEC correction counts.
 //!
-//! The AMBE 3600×2400 codec uses Golay(23,12) forward error
-//! correction on the C0 and C1 codewords to protect the most critical
-//! parameter bits (C2 and C3 carry data with no FEC). When the channel
-//! introduces more errors than the FEC can correct, the decoder
-//! detects this via syndrome analysis and reports it here.
+//! [`crate::frame_fec`] returns correction counts and frame classification;
+//! [`crate::AmbeDecoder::decode_frame`] returns PCM directly. This diagnostic
+//! type stores counts supplied by a caller that selects an error threshold.
 
 use core::fmt;
 
-/// Errors that can occur during AMBE frame decoding.
+/// An excessive-correction diagnostic with C0 and total correction counts.
 ///
-/// These errors represent conditions where the codec cannot produce
-/// reliable audio output. The decoder handles them internally by
-/// repeating the previous frame's parameters (up to 3 times) and
-/// then muting to silence. Callers generally do not need to inspect
-/// these: [`AmbeDecoder::decode_frame`](crate::AmbeDecoder::decode_frame)
-/// always returns a valid PCM buffer, using silence as the fallback.
+/// The counts describe the caller's reported FEC corrections in bits. They are
+/// observations supplied when constructing the diagnostic.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum DecodeError {
-    /// Too many bit errors for the FEC to correct.
-    ///
-    /// The Golay decoders detected more errors than their correction
-    /// capacity (3 bits per Golay(23,12) codeword). The decoded
-    /// parameters are unreliable and should not be used for
-    /// synthesis.
+    /// Correction counts that exceed the caller's reliability threshold.
     ExcessiveErrors {
-        /// Errors detected in the C0 codeword (Golay-protected).
-        ///
-        /// C0 carries the fundamental frequency index (b0), the most
-        /// critical parameter. Even 1 error here can shift the pitch
-        /// drastically.
+        /// Reported corrections in the C0 codeword, in bits.
         c0_errors: u32,
-        /// Total errors across all four codewords (C0–C3).
+        /// Reported total FEC corrections, in bits.
         total_errors: u32,
     },
 }

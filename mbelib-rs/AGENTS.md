@@ -6,7 +6,7 @@ Pure Rust AMBE 3600x2400 voice codec for D-STAR.
 
 - Decode follows szechyjs/mbelib and arancormonk/mbelib-neo (GPL-2.0-or-later through the mbelib relicensing pathway). Encode ports Max Parke's OP25 `ambe_encoder.cc` and Pavel Yazev's `imbe_vocoder/v_uv_det.cc`.
 - The `kenwood-tables` filter coefficients and postfilter weights are lifted from TH-D75 firmware under DMCA 1201(f); their doc comments deliberately carry firmware provenance, which is a reviewed standing exception to the root policy. Do not strip it.
-- The AMBE+2 half-rate variant (DMR, YSF, NXDN) is deliberately NOT implemented: DVSI US Patent 8,359,197 B2 covers it until 2028-05-20. See LICENSE for jurisdictional notes.
+- The implemented wire format is AMBE 3600x2400. Keep AMBE+2 half-rate, IMBE and other variants outside this codec.
 
 ## Commands
 
@@ -21,7 +21,7 @@ cargo test -p mbelib-rs --features kenwood-tables --test kenwood_hitl_anchors --
 - Only `golden`, `roundtrip`, and `tuning` always compile. Every other test target and every `validate_*_vs_op25` example is declared with `required-features`, so a bare `cargo test` skips it silently.
 - The `wave-enhance` suites reach lint.sh only through the workspace test pass, because `sextant` enables that feature and Cargo unifies it. A scoped `-p mbelib-rs` run must name the feature itself.
 - The repo root is a virtual workspace, so `-p mbelib-rs` is required on example runs.
-- `decode_ambe_stream` reads `MBELIB_TUNING=alpha=..,exp=..,lo=..,hi=..,uv=..` and applies the offline enhancer when `MBELIB_WAVE_ENHANCE=1`.
+- `decode_ambe_stream` reads checked `MBELIB_TUNING=alpha=..,exp=..,lo=..,hi=..,uv=..` values and applies the offline enhancer when `MBELIB_WAVE_ENHANCE=1`. With `kenwood-tables`, `MBELIB_KENWOOD_POSTFILTER=1` explicitly selects the Kenwood envelope algorithm. Feature unification alone keeps the reference algorithms.
 
 ## Quality gate
 
@@ -35,9 +35,9 @@ cargo test -p mbelib-rs --features kenwood-tables --test kenwood_hitl_anchors --
 
 - DVSI wire frames are LSB-first per byte (dsdcc `dstar.cpp:566`), handled in `unpack.rs` and `encode/pack.rs`. Validated against a live reflector capture with zero FEC corrections and 0.98 envelope correlation versus the mbelib C reference.
 - Layout-bug diagnosis: decode a reflector capture through this crate and the mbelib C reference, compare 20 ms RMS envelope correlation, and histogram the FEC-corrected wire-bit positions. A fixed lattice of positions is a layout bug; a random spread is genuine RF error.
-- `0x70 0x4F 0x93` is the D-STAR slow-data scrambler, not a firmware voice-whitening constant. Never apply whitening to voice bytes. `apply_whitening()` in `kenwood::anchors` reproduces the superseded analysis only and is not in the encode path.
+- Never apply the historical diagnostic XOR to voice bytes. `apply_diagnostic_xor()` in `kenwood::anchors` serves ignored capture probes and is not in the encode path.
 - The capture-integrity test tier is `#[ignore]`d because its baseline captures were sliced under the old bit order; recapture on hardware before any anchor analysis.
-- Decode disposition mirrors mbelib exactly: repeat the previous RAW params when `errs2 > 3` (Golay mis-corrects silently above that), erasure or tone gives silence plus a full state reset, mute after more than 3 repeats.
+- Preserve decoder disposition: repeat previous raw parameters when `errs2 > 3`; erasure and invalid-tone descriptors emit silence and reset history; valid tones use the oscillator; mute after more than three repeats. History resets restore PARITY coefficients and retain explicit envelope algorithm selection.
 
 ## Encoder status
 
@@ -46,4 +46,4 @@ cargo test -p mbelib-rs --features kenwood-tables --test kenwood_hitl_anchors --
 - Pure-sine input is degenerate for AMBE (near-zero magnitude above the fundamental collapses the gain mean), so large per-field deltas on synthetic input are not a quality measure. Real voice puts the gain field back in its active range.
 - `PITCH_CANDIDATES` in `src/encode/pitch.rs` covers periods 21-122 samples, that is 65.6-381 Hz. Inputs above 381 Hz octave-fold (440 to 219, 550 to 276). Widening it touches every array sized by `PITCH_CANDIDATES`.
 - The spectral envelope path (PRBA and HOC in `src/encode/quantize.rs`) is the known-broken area.
-- Four bit-exact TH-D75 anchors live in `src/encode/kenwood/anchors.rs` with `STABLE_BIT_MASK` (58 of 72 bits, excluding slow-data and parity volatility). Reproducing the masked frames byte-for-byte is the "Kenwood-perfect" target for the voiced path.
+- Historical TH-D75 candidates and a 58-bit mask live in `src/encode/kenwood/anchors.rs`. Recapture with verified framing before using them as codec targets. `apply_diagnostic_xor` has no voice-wire-format interpretation.

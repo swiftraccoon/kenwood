@@ -124,13 +124,12 @@ fn parse_trace(path: &str) -> Result<Vec<Op25Frame>, std::io::Error> {
 }
 
 /// Build a [`PitchEstimate`] from OP25's `ref_pitch` (Q8.8 period).
-fn pitch_from_op25(ref_pitch_q88: u16, confidence: f32) -> PitchEstimate {
+fn pitch_from_op25(
+    ref_pitch_q88: u16,
+    confidence: f32,
+) -> Result<PitchEstimate, mbelib_rs::StageError> {
     let period = f32::from(ref_pitch_q88) / 256.0;
-    PitchEstimate {
-        period_samples: period,
-        f0_hz: 8000.0 / period,
-        confidence,
-    }
+    PitchEstimate::new(period, mbelib_rs::PitchMetric::new(confidence)?)
 }
 
 /// Convert OP25's per-harmonic `v_uv_dsn` to this crate's per-band `VuvDecisions`.
@@ -139,7 +138,11 @@ fn pitch_from_op25(ref_pitch_q88: u16, confidence: f32) -> PitchEstimate {
 /// l=1..=36, then single-harmonic bands. OP25's `v_uv_dsn` is already
 /// expanded to per-harmonic (each group of 3 shares a value). This
 /// reverses that: `v_uv_dsn[band * 3]` becomes the band's voiced flag.
-fn vuv_from_op25(v_uv_dsn: &[bool], num_harms: usize, num_bands: usize) -> VuvDecisions {
+fn vuv_from_op25(
+    v_uv_dsn: &[bool],
+    num_harms: usize,
+    num_bands: usize,
+) -> Result<VuvDecisions, mbelib_rs::StageError> {
     let mut voiced = [false; MAX_BANDS];
     for (b_idx, slot) in voiced.iter_mut().enumerate().take(num_bands.min(MAX_BANDS)) {
         let harm_in_band = b_idx * 3;
@@ -148,10 +151,7 @@ fn vuv_from_op25(v_uv_dsn: &[bool], num_harms: usize, num_bands: usize) -> VuvDe
             .copied()
             .unwrap_or(false);
     }
-    VuvDecisions {
-        voiced,
-        num_bands: num_bands.min(MAX_BANDS),
-    }
+    VuvDecisions::new(voiced, num_bands)
 }
 
 /// Build [`SpectralAmplitudes`] from OP25's int16-scaled `sa[]`.
@@ -159,7 +159,10 @@ fn vuv_from_op25(v_uv_dsn: &[bool], num_harms: usize, num_bands: usize) -> VuvDe
 /// `quantize` multiplies each magnitude by `SA_SCALE = 32768.0`
 /// before `log2` to match OP25's lsa scale, so this divides by 32768
 /// to reverse the scaling and end up with the same value OP25 uses.
-fn amps_from_op25(sa: &[i32], num_harms: usize) -> SpectralAmplitudes {
+fn amps_from_op25(
+    sa: &[i32],
+    num_harms: usize,
+) -> Result<SpectralAmplitudes, mbelib_rs::StageError> {
     let mut magnitudes = [0.0_f32; MAX_HARMONICS];
     for (slot, &v) in magnitudes.iter_mut().zip(sa.iter().take(num_harms)) {
         // Pass OP25's sa verbatim as the "raw" magnitude. Our quantize
@@ -174,10 +177,7 @@ fn amps_from_op25(sa: &[i32], num_harms: usize) -> SpectralAmplitudes {
         let f = v as f32 / 32768.0;
         *slot = f;
     }
-    SpectralAmplitudes {
-        magnitudes,
-        num_harmonics: num_harms.min(MAX_HARMONICS),
-    }
+    SpectralAmplitudes::new(magnitudes, num_harms)
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -202,39 +202,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // silence-ish frame.
     let mut prev_frame: Option<&Op25Frame> = None;
     for (i, f) in frames.iter().enumerate() {
-        let prev = prev_frame.map_or_else(
-            || PrevFrameState {
-                log2_ml: [0.0_f32; 57],
-                l: 0,
-                // OP25 trace format predates the `prev_gamma` predictor
-                // subtraction. Use zero here; tests that exercise the
-                // gain path beyond frame 0 will diverge from OP25
-                // (which emits absolute gain, not the decoder-matching
-                // delta) and that divergence is the whole reason this
-                // field now exists.
-                prev_gamma: 0.0,
-            },
-            |pf| PrevFrameState {
-                log2_ml: pf.prev_log2_ml,
-                l: pf.prev_l,
-                prev_gamma: 0.0,
-            },
-        );
+        // This trace format supplies log magnitudes/count but no reconstructed gain.
+        let prev = match prev_frame {
+            None => PrevFrameState::ZERO,
+            Some(pf) => PrevFrameState::new(pf.prev_log2_ml, pf.prev_l, 0.0)?,
+        };
         prev_frame = Some(f);
         if f.num_harms == 0 {
             continue; // silence-ish frame in OP25; skip
         }
-        let pitch = pitch_from_op25(f.ref_pitch_q88, 0.5);
-        let amps = amps_from_op25(&f.sa, f.num_harms);
+        let pitch = pitch_from_op25(f.ref_pitch_q88, 0.5)?;
+        let amps = amps_from_op25(&f.sa, f.num_harms)?;
         // OP25 picks num_bands based on the pitch-dependent band
         // layout; we approximate by using our own VUV bands count.
         // Using num_harms/3 rounded up matches IMBE's grouping.
         let num_bands = f.num_harms.div_ceil(3).min(MAX_BANDS);
-        let vuv = vuv_from_op25(&f.v_uv_dsn, f.num_harms, num_bands);
+        let vuv = vuv_from_op25(&f.v_uv_dsn, f.num_harms, num_bands)?;
 
-        let outcome = quantize(pitch, vuv, &amps, &prev);
+        let outcome = quantize(pitch, vuv, &amps, &prev)?;
         // Extract our b[0..8] from the returned ambe_d.
-        let a = &outcome.ambe_d;
+        let a = outcome.data_bits();
         let bit = |k: usize| i32::from(a.get(k).copied().unwrap_or(0));
         let our_b0 = (bit(0) << 6)
             | (bit(1) << 5)

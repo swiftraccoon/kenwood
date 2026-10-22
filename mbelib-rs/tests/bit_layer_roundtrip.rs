@@ -20,7 +20,7 @@ use proptest as _;
 use realfft as _;
 use wide as _;
 
-use mbelib_rs::{AmbeDecoder, AmbeEncoder};
+use mbelib_rs::{AmbeDecoder, AmbeEncoder, PcmFrame};
 
 /// Encode a chosen set of distinct PCM frames and verify each emitted
 /// AMBE frame, when fed back through the decoder pipeline, produces
@@ -35,7 +35,8 @@ use mbelib_rs::{AmbeDecoder, AmbeEncoder};
 /// at positions both early (0..5) and late (48) in `ambe_d`, so any
 /// asymmetry in our pack/unpack/interleave triggers this assertion.
 #[test]
-fn encoder_pack_inverts_decoder_unpack_via_pitch_roundtrip() {
+fn encoder_pack_inverts_decoder_unpack_via_pitch_roundtrip()
+-> Result<(), Box<dyn std::error::Error>> {
     let mut enc = AmbeEncoder::new();
     let mut dec = AmbeDecoder::new();
 
@@ -55,7 +56,7 @@ fn encoder_pack_inverts_decoder_unpack_via_pitch_roundtrip() {
             *slot = 0.3 * (t * 2.0 * std::f32::consts::PI * 1000.0 / 8000.0).sin();
         }
         input_pcm.extend_from_slice(&chunk);
-        let ambe = enc.encode_frame(&chunk);
+        let ambe = enc.encode_frame(&PcmFrame::new(chunk)?);
         // Decoder reads the wire bytes. If pack/unpack are inverse,
         // the decoder reconstructs reasonable PCM.
         let pcm_out = dec.decode_frame(&ambe);
@@ -92,7 +93,7 @@ fn encoder_pack_inverts_decoder_unpack_via_pitch_roundtrip() {
             let t = (t1 + i) as f32;
             *slot = 0.3 * (t * 2.0 * std::f32::consts::PI * 1000.0 / 8000.0).sin();
         }
-        let ambe = enc2.encode_frame(&chunk);
+        let ambe = enc2.encode_frame(&PcmFrame::new(chunk)?);
         let pcm_i16 = dec2.decode_frame(&ambe);
         decoded.extend(pcm_i16.iter().map(|&s| f32::from(s) / 32768.0));
         t1 += 160;
@@ -131,4 +132,5 @@ fn encoder_pack_inverts_decoder_unpack_via_pitch_roundtrip() {
          1 kHz fundamental; the encoder-decoder pipeline isn't preserving \
          the frequency content."
     );
+    Ok(())
 }

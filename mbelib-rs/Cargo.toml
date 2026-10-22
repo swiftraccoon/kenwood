@@ -1,11 +1,16 @@
 [package]
 name = "mbelib-rs"
 version = "0.1.0"
+authors = ["swiftraccoon"]
+categories = ["multimedia::audio", "encoding"]
 edition = "2024"
-rust-version = "1.94"
-description = "Pure Rust AMBE 3600x2400 voice codec for D-STAR digital radio"
+keywords = ["ambe", "dstar", "ham-radio", "audio", "codec"]
 license = "GPL-2.0-or-later"
 publish = false
+readme = "README.md"
+repository = "https://github.com/swiftraccoon/kenwood"
+rust-version = "1.94"
+description = "Pure Rust AMBE 3600x2400 voice codec for D-STAR digital radio"
 
 [dependencies]
 # Real-input FFT for JMBE-compatible unvoiced synthesis (Algorithms #117-126)
@@ -21,19 +26,13 @@ default = []
 # AMBE 3600×2400 D-STAR encoder. Off by default because decode-only
 # consumers are the common case. When enabled, ports Max H. Parke's
 # OP25 `ambe_encoder.cc` + Pavel Yazev's `imbe_vocoder` analysis path.
-# Scope is deliberately D-STAR only: the AMBE+2 "half-rate vocoder"
-# variant (DMR / YSF / NXDN) is NOT implemented and is covered by
-# US Patent 8,359,197 B2 (DVSI, active until 2028-05-20). See LICENSE
-# for full jurisdictional notes.
+# The implemented wire format is AMBE 3600x2400 only.
 encoder = []
 # Reference data lifted from the TH-D75 AMBE DSP firmware image
 # (lawfully owned hardware, DMCA §1201(f) interoperability exception).
 # Enabling this compiles the `encode::kenwood` module, a catalogue of
-# `pub const` tables (filter coefficients, postfilter weights, math
-# constants) that the encoder pipeline can swap in at specific A/B
-# test points against radio-captured AMBE frames. No Kenwood algorithm
-# code is imported; the feature reshapes NUMBERS only. Pulls in
-# `encoder` because every current swap site is encoder-only.
+# coefficient tables and explicit InputFilter/EnvelopePostfilter choices.
+# Feature unification leaves the default reference algorithms unchanged.
 kenwood-tables = ["encoder"]
 # Learned waveform enhancement: small complex-STFT masking networks
 # (weights trained against reflector-published reference decodes of

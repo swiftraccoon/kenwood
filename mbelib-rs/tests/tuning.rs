@@ -5,7 +5,7 @@
 //! the untuned decoder (mbelib/JMBE parity), and each knob actually
 //! reaches its synthesis stage.
 
-use mbelib_rs::{AmbeDecoder, SynthesisTuning};
+use mbelib_rs::{AmbeDecoder, SynthesisTuning, TuningError, TuningSpec};
 
 // Compilation-unit dep acknowledgements (unused_crate_dependencies):
 use proptest as _;
@@ -53,63 +53,154 @@ fn default_tuning_is_bit_exact_with_untuned_decoder() {
 #[test]
 fn parity_constant_is_the_default() {
     assert_eq!(SynthesisTuning::PARITY, SynthesisTuning::default());
+    assert_eq!(
+        SynthesisTuning::default().envelope_postfilter(),
+        mbelib_rs::EnvelopePostfilter::Reference,
+        "optional tables must not change the default decoder algorithm"
+    );
 }
 
 #[test]
-fn unvoiced_gain_reaches_the_excitation() {
+fn unvoiced_gain_reaches_the_excitation() -> Result<(), Box<dyn std::error::Error>> {
     let mut plain = AmbeDecoder::new();
-    let mut tuned = AmbeDecoder::with_tuning(SynthesisTuning {
+    let mut tuned = AmbeDecoder::with_tuning(SynthesisTuning::new(TuningSpec {
         unvoiced_gain: 0.5,
-        ..SynthesisTuning::default()
-    });
+        ..TuningSpec::default()
+    })?);
     assert_ne!(
         decode_all(&mut plain),
         decode_all(&mut tuned),
         "halving unvoiced_gain must change synthesized PCM"
     );
+    Ok(())
 }
 
 #[test]
-fn enhancement_knobs_reach_the_spectral_weighting() {
+fn enhancement_knobs_reach_the_spectral_weighting() -> Result<(), Box<dyn std::error::Error>> {
     let plain = {
         let mut d = AmbeDecoder::new();
         decode_all(&mut d)
     };
     for tuning in [
-        SynthesisTuning {
+        TuningSpec {
             enhance_alpha: 1.5,
-            ..SynthesisTuning::default()
+            ..TuningSpec::default()
         },
-        SynthesisTuning {
+        TuningSpec {
             enhance_exponent: 0.4,
-            ..SynthesisTuning::default()
+            ..TuningSpec::default()
         },
-        SynthesisTuning {
+        TuningSpec {
             enhance_clamp_hi: 2.0,
-            ..SynthesisTuning::default()
+            ..TuningSpec::default()
         },
-        SynthesisTuning {
+        TuningSpec {
             phase_jitter: 0.0,
-            ..SynthesisTuning::default()
+            ..TuningSpec::default()
         },
     ] {
-        let mut d = AmbeDecoder::with_tuning(tuning);
+        let mut d = AmbeDecoder::with_tuning(SynthesisTuning::new(tuning)?);
         assert_ne!(
             plain,
             decode_all(&mut d),
             "tuning {tuning:?} must change synthesized PCM"
         );
     }
+    Ok(())
 }
 
 #[test]
-fn tuned_decoding_stays_deterministic() {
-    let tuning = SynthesisTuning {
+fn tuned_decoding_stays_deterministic() -> Result<(), Box<dyn std::error::Error>> {
+    let tuning = SynthesisTuning::new(TuningSpec {
         enhance_alpha: 1.1,
         unvoiced_gain: 0.8,
-        ..SynthesisTuning::default()
-    };
+        ..TuningSpec::default()
+    })?;
     let mut a = AmbeDecoder::with_tuning(tuning);
     let mut b = AmbeDecoder::with_tuning(tuning);
     assert_eq!(decode_all(&mut a), decode_all(&mut b));
+    Ok(())
+}
+
+#[test]
+fn every_tuning_coefficient_and_relationship_is_checked() {
+    for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -0.01] {
+        for spec in [
+            TuningSpec {
+                enhance_alpha: value,
+                ..TuningSpec::default()
+            },
+            TuningSpec {
+                enhance_exponent: value,
+                ..TuningSpec::default()
+            },
+            TuningSpec {
+                enhance_clamp_lo: value,
+                ..TuningSpec::default()
+            },
+            TuningSpec {
+                enhance_clamp_hi: value,
+                ..TuningSpec::default()
+            },
+            TuningSpec {
+                unvoiced_gain: value,
+                ..TuningSpec::default()
+            },
+            TuningSpec {
+                phase_jitter: value,
+                ..TuningSpec::default()
+            },
+        ] {
+            assert!(matches!(
+                SynthesisTuning::new(spec),
+                Err(TuningError::Coefficient { .. })
+            ));
+        }
+    }
+    assert!(matches!(
+        SynthesisTuning::new(TuningSpec {
+            enhance_clamp_lo: 2.0,
+            enhance_clamp_hi: 1.0,
+            ..TuningSpec::default()
+        }),
+        Err(TuningError::ClampOrder { .. })
+    ));
+}
+
+#[test]
+fn decoder_history_resets_restore_parity_coefficients_and_preserve_algorithm()
+-> Result<(), Box<dyn std::error::Error>> {
+    for algorithm in [
+        mbelib_rs::EnvelopePostfilter::Reference,
+        #[cfg(feature = "kenwood-tables")]
+        mbelib_rs::EnvelopePostfilter::Kenwood,
+    ] {
+        let tuning = SynthesisTuning::new(TuningSpec {
+            unvoiced_gain: 0.5,
+            phase_jitter: 0.0,
+            ..TuningSpec::default()
+        })?
+        .with_envelope_postfilter(algorithm);
+        let reset_tuning = SynthesisTuning::PARITY.with_envelope_postfilter(algorithm);
+        let mut decoder = AmbeDecoder::with_tuning(tuning);
+        assert_eq!(decoder.tuning(), tuning);
+        for frame in REAL_FRAMES {
+            let _pcm = decoder.decode_frame(&frame);
+        }
+        for _ in 0..4 {
+            let _pcm = decoder.conceal_frame();
+        }
+        assert_eq!(decoder.tuning(), reset_tuning);
+
+        let mut tone_decoder = AmbeDecoder::with_tuning(tuning);
+        let _tone =
+            tone_decoder.decode_frame(&[0xD2, 0x4B, 0x28, 0xB2, 0x57, 0x44, 0xE4, 0x08, 0x1C]);
+        assert_eq!(tone_decoder.tuning(), reset_tuning);
+        let mut fresh = AmbeDecoder::with_tuning(reset_tuning);
+        assert_eq!(
+            tone_decoder.decode_frame(&REAL_FRAMES[0]),
+            fresh.decode_frame(&REAL_FRAMES[0])
+        );
+    }
+    Ok(())
 }

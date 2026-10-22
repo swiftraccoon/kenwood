@@ -14,6 +14,19 @@
 //! buffers plus the canonical size constants every downstream module
 //! depends on.
 
+use super::stage::PitchHistory;
+
+/// Explicit encoder input-conditioning algorithm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum InputFilter {
+    /// OP25 first-order DC remover, independent of Cargo feature unification.
+    #[default]
+    Reference,
+    /// TH-D75 coefficient biquad; available when its tables are compiled.
+    #[cfg(feature = "kenwood-tables")]
+    Kenwood,
+}
+
 /// One 20 ms frame at 8 kHz = 160 samples.
 pub(crate) const FRAME: usize = 160;
 
@@ -42,11 +55,8 @@ pub(crate) const WR_HALF_LEN: usize = 111;
 ///
 /// One instance per concurrent voice stream. Holds the sliding
 /// pitch-estimation history, the LPF delay line, and the DC-removal
-/// high-pass filter state. All are zero-initialized; the first frame
-/// processed through a fresh `EncoderBuffers` will be quieter than
-/// steady-state output while the history fills, but intelligibility
-/// is unaffected (the same transient behavior the reference encoder
-/// exhibits).
+/// high-pass filter state. Construction zeroes all history; subsequent
+/// frames update it in place without allocating.
 #[derive(Debug)]
 pub struct EncoderBuffers {
     /// Pitch estimation sample history (LPF output, wideband-removed).
@@ -57,27 +67,31 @@ pub struct EncoderBuffers {
     /// Pitch-estimation LPF delay line (one sample per tap).
     pub(crate) pe_lpf_mem: [f32; PE_LPF_ORD],
     /// OP25 `dc_rmv` single-pole HPF integrator (default path).
-    #[cfg(not(feature = "kenwood-tables"))]
     pub(crate) dc_rmv_mem: f32,
-    /// Kenwood 345 Hz biquad HPF delay line; replaces `dc_rmv_mem`
-    /// as the active input-conditioning state when the
-    /// `kenwood-tables` feature is enabled.
+    /// Kenwood biquad HPF delay line, active only for `InputFilter::Kenwood`.
     #[cfg(feature = "kenwood-tables")]
     pub(crate) kenwood_hpf_mem: crate::encode::kenwood::filter::Biquad2State,
+    pub(crate) input_filter: InputFilter,
 }
 
 impl EncoderBuffers {
     /// Fresh state; all buffers zero.
     #[must_use]
     pub const fn new() -> Self {
+        Self::with_input_filter(InputFilter::Reference)
+    }
+
+    /// Create zeroed history with an explicitly selected input filter.
+    #[must_use]
+    pub const fn with_input_filter(input_filter: InputFilter) -> Self {
         Self {
             pitch_est_buf: [0.0; PITCH_EST_BUF_SIZE],
             pitch_ref_buf: [0.0; PITCH_EST_BUF_SIZE],
             pe_lpf_mem: [0.0; PE_LPF_ORD],
-            #[cfg(not(feature = "kenwood-tables"))]
             dc_rmv_mem: 0.0,
             #[cfg(feature = "kenwood-tables")]
             kenwood_hpf_mem: crate::encode::kenwood::filter::Biquad2State::new(),
+            input_filter,
         }
     }
 
@@ -96,9 +110,14 @@ impl EncoderBuffers {
     /// Diagnostic-only: exposed so the `validate_analysis_vs_op25`
     /// example can feed the buffer into [`crate::PitchTracker::estimate`].
     #[must_use]
-    #[doc(hidden)]
-    pub const fn pitch_est_buf(&self) -> &[f32; PITCH_EST_BUF_SIZE] {
-        &self.pitch_est_buf
+    pub const fn pitch_est_buf(&self) -> PitchHistory<'_> {
+        PitchHistory(&self.pitch_est_buf)
+    }
+
+    /// Return the input-conditioning algorithm selected at construction.
+    #[must_use]
+    pub const fn input_filter(&self) -> InputFilter {
+        self.input_filter
     }
 }
 

@@ -60,6 +60,7 @@
 //! [`crate::tables`]; [`PitchEstimate::period_samples`] is the
 //! fractional period this module hands downstream.
 
+use super::stage::{PitchErrors, PitchHistory, PitchMetric, StageError, StageField};
 use crate::encode::state::PITCH_EST_BUF_SIZE;
 use crate::encode::window::WI;
 
@@ -157,14 +158,55 @@ fn period_to_idx(period: f32) -> usize {
 pub struct PitchEstimate {
     /// Pitch period in samples at 8 kHz. Fractional: either an
     /// integer or integer + 0.5 on the IMBE pitch grid.
-    pub period_samples: f32,
+    pub(crate) period_samples: f32,
     /// Fundamental frequency in Hz (8000 / `period_samples`).
-    pub f0_hz: f32,
+    pub(crate) f0_hz: f32,
     /// Confidence score in `[0, 1]`, computed as `1 − E(p)` at the
     /// chosen pitch. Values above ≈0.5 typically indicate stable
     /// voiced speech; below ≈0.05 indicates noise or silence and is
     /// the trigger for the encoder to emit `AMBE_SILENCE`.
-    pub confidence: f32,
+    pub(crate) confidence: f32,
+}
+
+impl PitchEstimate {
+    /// Construct a finite pitch at or below Nyquist with a checked confidence.
+    ///
+    /// The period is at least two samples; frequency is derived as 8000/period.
+    /// The tracker's own candidates cover 21 through 122 samples, while supplied
+    /// diagnostic estimates can use fractional periods outside that grid.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StageError::Value`] for a nonfinite period or fewer than two samples.
+    pub fn new(period_samples: f32, confidence: PitchMetric) -> Result<Self, StageError> {
+        if !period_samples.is_finite() || period_samples < 2.0 {
+            return Err(StageError::Value {
+                field: StageField::PitchPeriod,
+                index: 0,
+                value: period_samples,
+            });
+        }
+        Ok(Self {
+            period_samples,
+            f0_hz: 8000.0 / period_samples,
+            confidence: confidence.get(),
+        })
+    }
+    /// Return the fractional period in samples at 8 kHz.
+    #[must_use]
+    pub const fn period_samples(self) -> f32 {
+        self.period_samples
+    }
+    /// Return the derived fundamental frequency in hertz.
+    #[must_use]
+    pub const fn f0_hz(self) -> f32 {
+        self.f0_hz
+    }
+    /// Return confidence in `[0,1]`.
+    #[must_use]
+    pub const fn confidence(self) -> f32 {
+        self.confidence
+    }
 }
 
 /// Per-stream pitch-tracker state, matching OP25's `pitch_est` member
@@ -218,8 +260,24 @@ impl PitchTracker {
     /// 3. Otherwise fall back to the global `E(p)` minimum.
     /// 4. Sub-multiples analysis tests `p/2..p/5` per OP25's 3-tier
     ///    threshold cascade; the winner is committed.
-    pub fn estimate(&mut self, pitch_est_buf: &[f32; PITCH_EST_BUF_SIZE]) -> PitchEstimate {
-        let e_p = compute_e_p(pitch_est_buf);
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StageError::ArithmeticRange`] when finite history values
+    /// overflow detectability arithmetic. Tracker state is unchanged on error.
+    pub fn estimate(&mut self, history: PitchHistory<'_>) -> Result<PitchEstimate, StageError> {
+        let errors = compute_e_p(history)?;
+        Ok(self.estimate_scores(errors.scores()))
+    }
+
+    pub(crate) fn estimate_kernel(
+        &mut self,
+        pitch_est_buf: &[f32; PITCH_EST_BUF_SIZE],
+    ) -> PitchEstimate {
+        self.estimate_scores(&compute_e_p_kernel(pitch_est_buf))
+    }
+
+    fn estimate_scores(&mut self, e_p: &[f32; PITCH_CANDIDATES]) -> PitchEstimate {
         if e_p.iter().all(|&v| v >= 1.0 - f32::EPSILON) {
             // Silent buffer: hold previous state, return zero-confidence.
             let period = idx_to_period(self.prev_pitch_idx);
@@ -229,7 +287,7 @@ impl PitchTracker {
                 confidence: 0.0,
             };
         }
-        self.track_single_frame(&e_p)
+        self.track_single_frame(e_p)
     }
 
     /// Run the single-frame look-back + sub-multiples decision over a
@@ -401,13 +459,22 @@ impl PitchTracker {
     /// `prev_pitch_idx`, `prev_e_p`, and their `prev_prev`
     /// shadows roll forward.
     #[must_use]
+    pub fn estimate_with_lookahead(
+        &mut self,
+        current: &PitchErrors,
+        next: &PitchErrors,
+        next_next: &PitchErrors,
+    ) -> PitchEstimate {
+        self.estimate_with_lookahead_kernel(current.scores(), next.scores(), next_next.scores())
+    }
+
     #[expect(
         clippy::too_many_lines,
         reason = "Mirrors OP25's pitch_est lookahead block so the port can be read \
                   side-by-side with the reference. The long linear structure comes from \
                   OP25's algorithm; splitting would obscure the one-to-one mapping."
     )]
-    pub fn estimate_with_lookahead(
+    pub(crate) fn estimate_with_lookahead_kernel(
         &mut self,
         e_p_current: &[f32; PITCH_CANDIDATES],
         e_p_next: &[f32; PITCH_CANDIDATES],
@@ -577,14 +644,28 @@ impl PitchTracker {
 /// Exposed so the encoder can maintain a ring of 3 `E(p)` arrays
 /// and hand them to [`PitchTracker::estimate_with_lookahead`]. The
 /// single-frame [`PitchTracker::estimate`] calls this internally.
-#[must_use]
+///
+/// # Errors
+///
+/// Returns [`StageError::ArithmeticRange`] when finite history values overflow
+/// detectability arithmetic. The history and tracker state remain unchanged.
+pub fn compute_e_p(history: PitchHistory<'_>) -> Result<PitchErrors, StageError> {
+    PitchErrors::new(compute_e_p_kernel(history.samples())).map_err(|_| {
+        StageError::ArithmeticRange {
+            field: StageField::PitchHistory,
+        }
+    })
+}
+
 #[expect(
     clippy::similar_names,
     reason = "OP25's e_p() body is kept close to the reference: similar variable names \
               (e.g., cef/ceb, pb/pf) mirror OP25's pitch_est.cc, which makes \
               cross-referencing straightforward."
 )]
-pub fn compute_e_p(pitch_est_buf: &[f32; PITCH_EST_BUF_SIZE]) -> [f32; PITCH_CANDIDATES] {
+pub(crate) fn compute_e_p_kernel(
+    pitch_est_buf: &[f32; PITCH_EST_BUF_SIZE],
+) -> [f32; PITCH_CANDIDATES] {
     let mut windowed = [0.0_f32; PITCH_EST_BUF_SIZE];
     for (i, (&x, &w)) in pitch_est_buf.iter().zip(WI.iter()).enumerate() {
         if let Some(slot) = windowed.get_mut(i) {
@@ -683,7 +764,7 @@ mod tests {
     fn silent_input_gives_zero_confidence() {
         let buf = [0.0_f32; PITCH_EST_BUF_SIZE];
         let mut tracker = PitchTracker::new();
-        let est = tracker.estimate(&buf);
+        let est = tracker.estimate_kernel(&buf);
         assert!(
             est.confidence.abs() < f32::EPSILON,
             "expected confidence 0 on silent input, got {}",
@@ -719,9 +800,9 @@ mod tests {
         }
         let mut tracker = PitchTracker::new();
         for _ in 0..20 {
-            let _ = tracker.estimate(&buf);
+            let _ = tracker.estimate_kernel(&buf);
         }
-        let est = tracker.estimate(&buf);
+        let est = tracker.estimate_kernel(&buf);
         let acceptable_periods = [53.3_f32, 106.6];
         let matched = acceptable_periods
             .iter()
@@ -739,7 +820,7 @@ mod tests {
     /// look-ahead slots to simulate a long steady-state sine.
     #[test]
     fn sine_at_200hz_locks_to_valid_octave_via_dp() {
-        use super::compute_e_p;
+        use super::compute_e_p_kernel as compute_e_p;
         let mut buf = [0.0_f32; PITCH_EST_BUF_SIZE];
         let f0_hz = 200.0_f32;
         let sr = 8000.0_f32;
@@ -756,9 +837,9 @@ mod tests {
         // Warm the look-back state with a few estimates so the DP's
         // prev_e_p history is representative.
         for _ in 0..5 {
-            let _ = tracker.estimate_with_lookahead(&e_p, &e_p, &e_p);
+            let _ = tracker.estimate_with_lookahead_kernel(&e_p, &e_p, &e_p);
         }
-        let est = tracker.estimate_with_lookahead(&e_p, &e_p, &e_p);
+        let est = tracker.estimate_with_lookahead_kernel(&e_p, &e_p, &e_p);
         // Valid octaves for 200 Hz at 8 kHz: 40, 80, 120. Sub-multiples
         // analysis in the DP should prefer the smallest acceptable
         // period (40), since E(40) ≈ E(80) ≈ E(120) on pure sines.
@@ -778,7 +859,7 @@ mod tests {
     /// pulled up by frame 0/1's bad score, so the DP picks P.
     #[test]
     fn lookahead_dp_picks_pitch_stable_across_frames() {
-        use super::{PITCH_CANDIDATES, compute_e_p};
+        use super::{PITCH_CANDIDATES, compute_e_p_kernel as compute_e_p};
         let mut tracker = PitchTracker::new();
 
         // Generate a 200 Hz sine for all three slots. All three
@@ -794,7 +875,7 @@ mod tests {
         }
         let e_p = compute_e_p(&buf);
 
-        let est = tracker.estimate_with_lookahead(&e_p, &e_p, &e_p);
+        let est = tracker.estimate_with_lookahead_kernel(&e_p, &e_p, &e_p);
         // Confidence should be high: 3 frames agree perfectly.
         assert!(
             est.confidence > 0.9,
@@ -836,9 +917,9 @@ mod tests {
         }
         let mut tracker = PitchTracker::new();
         for _ in 0..20 {
-            let _ = tracker.estimate(&buf);
+            let _ = tracker.estimate_kernel(&buf);
         }
-        let est = tracker.estimate(&buf);
+        let est = tracker.estimate_kernel(&buf);
         let expected = 53.3_f32;
         assert!(
             (est.period_samples - expected).abs() < 3.0,
@@ -870,9 +951,9 @@ mod tests {
         }
         let mut tracker = PitchTracker::new();
         let (init_idx, _, _, _) = tracker.state();
-        let _ = tracker.estimate(&buf);
+        let _ = tracker.estimate_kernel(&buf);
         let (p1, pp1, _, _) = tracker.state();
-        let _ = tracker.estimate(&buf);
+        let _ = tracker.estimate_kernel(&buf);
         let (p2, pp2, _, _) = tracker.state();
         assert_eq!(
             pp1, init_idx,

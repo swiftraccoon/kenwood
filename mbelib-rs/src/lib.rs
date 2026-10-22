@@ -8,69 +8,32 @@
 // (also GPL-2.0-or-later).
 
 #![doc = include_str!("../README.md")]
-//! Pure Rust AMBE 3600×2400 voice codec decoder for D-STAR digital radio.
-//!
-//! The AMBE (Advanced Multi-Band Excitation) 3600×2400 codec compresses
-//! speech at 3600 bits/second with 2400 bits of voice data and 1200 bits
-//! of forward error correction (FEC). It is the mandatory voice codec
-//! for the JARL D-STAR digital radio standard, used in all D-STAR
-//! transceivers and reflectors worldwide.
-//!
-//! Each voice frame is 9 bytes (72 bits), transmitted at 50 frames per
-//! second (20 ms per frame). The codec models speech as a sum of
-//! harmonically related sinusoids, with each band independently
-//! classified as voiced or unvoiced.
-//!
-//! # Usage
-//!
-//! ```
-//! use mbelib_rs::AmbeDecoder;
-//!
-//! // Create one decoder per voice stream; it carries inter-frame state
-//! // needed for delta decoding and phase-continuous synthesis.
-//! let mut decoder = AmbeDecoder::new();
-//!
-//! // Feed 9-byte AMBE frames from D-STAR VoiceFrame.ambe field.
-//! let ambe_frame: [u8; 9] = [0; 9];
-//! let pcm: [i16; 160] = decoder.decode_frame(&ambe_frame);
-//!
-//! // Output: 160 samples at 8 kHz, 16-bit signed PCM (20 ms of audio).
-//! assert_eq!(pcm.len(), 160);
-//! ```
-//!
-//! # Decode Pipeline
-//!
-//! Each frame passes through these stages:
-//!
-//! 1. **Bit unpacking**: 72-bit frame → 4 FEC codeword bitplanes
-//! 2. **Error correction**: Golay(23,12) on C0 and C1 (3-error
-//!    correction). AMBE 3600×2400 does not apply Hamming to C3; those
-//!    14 bits are copied verbatim into the parameter vector.
-//! 3. **Demodulation**: LFSR descrambling of C1 using C0 seed
-//! 4. **Parameter extraction**: 49 decoded bits → fundamental frequency,
-//!    harmonic count, voiced/unvoiced decisions, spectral magnitudes.
-//!    Disposition then splits three ways: valid tone frames (b0 in
-//!    126..=127) are synthesized directly by a dedicated tone oscillator;
-//!    erasure frames (b0 in 120..=123) and out-of-range tone descriptors
-//!    emit silence and fully re-initialize the decoder state; voice frames
-//!    whose FEC required more than 3 corrected bits reuse the previous
-//!    frame's parameters and increment the repeat counter.
-//! 5. **Spectral enhancement**: adaptive amplitude weighting for clarity
-//! 6. **Adaptive smoothing**: JMBE algorithms #111-116, gracefully
-//!    damps spurious magnitudes/voicing decisions on noisy frames
-//! 7. **Frame muting check**: comfort noise on excessive errors or
-//!    sustained repeat frames (JMBE-compatible)
-//! 8. **Synthesis**: voiced bands per-band cosine oscillators (with
-//!    JMBE phase/amplitude interpolation for low harmonics) plus a
-//!    single FFT-based unvoiced pass (JMBE algorithms #117-126)
-//! 9. **Output conversion**: float PCM → i16 with SIMD-vectorized
-//!    gain and clamping
 
 // Dev-dependency `proptest` is used only inside the `encoder` feature module
 // (`src/encode/pack.rs`). Acknowledge it at the lib level so
 // `unused_crate_dependencies` stays silent in the default-features build.
 #[cfg(all(test, not(feature = "encoder")))]
 use proptest as _;
+use wide::{f32x4, i32x4};
+
+use ecc::AMBE_DATA_BITS;
+use params::MbeParams;
+use synthesize::FRAME_SAMPLES;
+use unpack::AMBE_FRAME_BITS;
+
+#[cfg(feature = "kenwood-tables")]
+pub use encode::kenwood;
+#[cfg(feature = "encoder")]
+pub use encode::{
+    AmbeEncoder, CodewordBits, EncoderBuffers, EncoderOptions, FftPlan, FundamentalBin,
+    InputFilter, MAX_BANDS, MAX_HARMONICS, PITCH_ERROR_CANDIDATES, PITCH_HISTORY_SAMPLES,
+    PitchErrors, PitchEstimate, PitchHistory, PitchMetric, PitchTracker, PitchTracking,
+    SPECTRUM_BINS, SpectralAmplitudes, Spectrum, StageError, StageField, VuvDecisions, VuvState,
+    analyze_frame, compute_e_p, detect_vuv, detect_vuv_and_sa, extract_spectral_amplitudes,
+    pack_frame, validation,
+};
+pub use error::DecodeError;
+pub use pcm::{PCM_FRAME_SAMPLES, PcmError, PcmFrame, PcmSamples};
 
 mod adaptive;
 mod decode;
@@ -85,17 +48,48 @@ pub mod enhance_wave;
 mod error;
 mod math;
 mod params;
+mod pcm;
 mod synthesize;
 mod tables;
 mod unpack;
 mod unvoiced_fft;
 
-pub use error::DecodeError;
+/// Immutable stateless unpack/FEC/parameter inspection result.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DecodeTrace {
+    parameters: [usize; 9],
+    angular_frequency_rad: f32,
+    harmonics: usize,
+    data_bits: [u8; 49],
+}
 
-/// Inspection helper for golden-vector validation.
+impl DecodeTrace {
+    /// Return the nine unpacked codebook indices `b0` through `b8`.
+    #[must_use]
+    pub const fn parameters(self) -> [usize; 9] {
+        self.parameters
+    }
+    /// Return the table-derived fundamental angular frequency, in radians/sample.
+    #[must_use]
+    pub const fn angular_frequency_rad(self) -> f32 {
+        self.angular_frequency_rad
+    }
+    /// Return the table-derived harmonic count, including zero for nonvoice indices.
+    #[must_use]
+    pub const fn harmonics(self) -> usize {
+        self.harmonics
+    }
+    /// Return the 49 corrected data bits, each represented by zero or one.
+    #[must_use]
+    pub const fn data_bits(self) -> [u8; 49] {
+        self.data_bits
+    }
+}
+
+/// Inspect unpacking, FEC and parameter extraction for one arbitrary wire frame.
 ///
 /// Runs just the unpack → ECC → parameter-extract pipeline for a
-/// single frame and returns `(b[0..9], w0, L, ambe_d)` as the decoder
+/// single frame and returns named indices, radians/sample, count and data bits as the decoder
 /// sees them.  Used by the validation harness in
 /// `examples/decode_ambe_stream.rs` to diff against mbelib's decoded
 /// `(b, w0, L, ambe_d)` for identical wire bytes.
@@ -110,7 +104,7 @@ pub use error::DecodeError;
 /// `MbeParams`), so the output depends only on the input bytes and
 /// can be compared frame-for-frame against another implementation.
 #[must_use]
-pub fn decode_trace(ambe: &[u8; 9]) -> ([usize; 9], f32, usize, [u8; 49]) {
+pub fn decode_trace(ambe: &[u8; 9]) -> DecodeTrace {
     let mut ambe_fr = [0u8; AMBE_FRAME_BITS];
     let mut ambe_d = [0u8; AMBE_DATA_BITS];
     unpack::unpack_frame(ambe, &mut ambe_fr);
@@ -161,7 +155,12 @@ pub fn decode_trace(ambe: &[u8; 9]) -> ([usize; 9], f32, usize, [u8; 49]) {
                   sign loss cannot occur within the defined table range."
     )]
     let big_l = *tables::L_TABLE.get(b0).unwrap_or(&0.0) as usize;
-    (b, w0, big_l, ambe_d)
+    DecodeTrace {
+        parameters: b,
+        angular_frequency_rad: w0,
+        harmonics: big_l,
+        data_bits: ambe_d,
+    }
 }
 
 /// Classification of a decoded AMBE frame, derived from the b0 field.
@@ -254,25 +253,60 @@ pub const PARAM_BANDS: usize = 56;
 pub struct FrameParams {
     /// Fundamental frequency in Hz (8 kHz sample-rate domain).
     /// Zero for erasure/tone frames.
-    pub f0_hz: f32,
+    f0_hz: f32,
     /// Harmonic band count L (9..=56 for voice frames, else 0).
-    pub harmonics: usize,
+    harmonics: usize,
     /// Frame classification (voice / erasure / tone).
-    pub kind: FrameKind,
+    kind: FrameKind,
     /// Voiced decision per band; index `i` is band `i + 1`, valid
     /// for `i < harmonics`, padding `false` beyond.
-    pub voiced: [bool; PARAM_BANDS],
+    voiced: [bool; PARAM_BANDS],
     /// Linear spectral magnitude per band, same indexing, padding 0.
-    pub amplitudes: [f32; PARAM_BANDS],
+    amplitudes: [f32; PARAM_BANDS],
     /// Total FEC-corrected bits in this frame.
-    pub fec_errors: u32,
+    fec_errors: u32,
     /// True when the frame's parameters were repeated from the
     /// previous frame (untrustworthy FEC or concealment), mirroring
     /// the decoder's repeat disposition.
-    pub repeated: bool,
+    repeated: bool,
 }
 
 impl FrameParams {
+    /// Return the fundamental frequency in hertz, or zero for a reset/nonvoice frame.
+    #[must_use]
+    pub const fn f0_hz(&self) -> f32 {
+        self.f0_hz
+    }
+    /// Return the number of active harmonic entries.
+    #[must_use]
+    pub const fn harmonics(&self) -> usize {
+        self.harmonics
+    }
+    /// Return the decoded frame classification.
+    #[must_use]
+    pub const fn kind(&self) -> FrameKind {
+        self.kind
+    }
+    /// Borrow voiced decisions, padded with false after the harmonic count.
+    #[must_use]
+    pub const fn voiced(&self) -> &[bool; PARAM_BANDS] {
+        &self.voiced
+    }
+    /// Borrow linear magnitudes, padded with zero after the harmonic count.
+    #[must_use]
+    pub const fn amplitudes(&self) -> &[f32; PARAM_BANDS] {
+        &self.amplitudes
+    }
+    /// Return the number of corrected bits.
+    #[must_use]
+    pub const fn fec_errors(&self) -> u32 {
+        self.fec_errors
+    }
+    /// Return whether parameters repeat the preceding raw frame.
+    #[must_use]
+    pub const fn repeated(&self) -> bool {
+        self.repeated
+    }
     const fn empty(kind: FrameKind, fec_errors: u32) -> Self {
         Self {
             f0_hz: 0.0,
@@ -398,29 +432,6 @@ impl AmbeParamExtractor {
     }
 }
 
-#[cfg(feature = "encoder")]
-pub use encode::{
-    AmbeEncoder, EncoderBuffers, FftPlan, MAX_BANDS, MAX_HARMONICS, PitchEstimate, PitchTracker,
-    SpectralAmplitudes, VuvDecisions, VuvState, analyze_frame, compute_e_p, detect_vuv,
-    detect_vuv_and_sa, extract_spectral_amplitudes, pack_frame, validation,
-};
-
-/// Kenwood-specific constants for A/B testing the encoder, gated
-/// behind the `kenwood-tables` feature.
-///
-/// The encoder pipeline does NOT consume these by default; the
-/// module is a catalogue, not a swap. Swap points are introduced
-/// deliberately, one at a time, with each change measurable against
-/// hardware-in-the-loop captures.
-#[cfg(feature = "kenwood-tables")]
-pub use encode::kenwood;
-
-use ecc::AMBE_DATA_BITS;
-use params::MbeParams;
-use synthesize::FRAME_SAMPLES;
-use unpack::AMBE_FRAME_BITS;
-use wide::{f32x4, i32x4};
-
 /// Output audio gain applied during float-to-i16 conversion.
 const GAIN: f32 = 7.0;
 
@@ -485,21 +496,112 @@ pub struct SynthesisTuning {
     /// Spectral-enhancement sharpening factor (mbelib parity: `0.96`).
     /// Larger values weight loud harmonics harder relative to the
     /// spectral floor.
-    pub enhance_alpha: f32,
+    enhance_alpha: f32,
     /// Spectral-enhancement weight exponent (mbelib parity: `0.25`).
     /// Controls how aggressively the density ratio reshapes bands.
-    pub enhance_exponent: f32,
+    enhance_exponent: f32,
     /// Lower clamp on the per-band enhancement weight (parity: `0.5`).
-    pub enhance_clamp_lo: f32,
+    enhance_clamp_lo: f32,
     /// Upper clamp on the per-band enhancement weight (parity: `1.2`).
-    pub enhance_clamp_hi: f32,
+    enhance_clamp_hi: f32,
     /// Multiplier on the unvoiced excitation level (parity: `1.0`).
-    pub unvoiced_gain: f32,
+    unvoiced_gain: f32,
     /// Multiplier on the voiced phase jitter (parity: `1.0`).
     /// `0.0` accumulates fully deterministic harmonic phases:
     /// cleaner, at the risk of a more mechanical timbre.
+    phase_jitter: f32,
+    envelope_postfilter: EnvelopePostfilter,
+}
+
+/// Explicit decoder envelope algorithm; Cargo features only expose choices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EnvelopePostfilter {
+    /// Reference spectral enhancement, independent of enabled features.
+    #[default]
+    Reference,
+    /// Apply the TH-D75 envelope weights after reference enhancement.
+    #[cfg(feature = "kenwood-tables")]
+    Kenwood,
+}
+
+/// Named candidate coefficients accepted only through [`SynthesisTuning::new`].
+///
+/// Every coefficient must be finite and nonnegative; the lower enhancement
+/// clamp must not exceed the upper clamp. Defaults reproduce reference parity.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TuningSpec {
+    /// Spectral-density sharpening factor.
+    pub enhance_alpha: f32,
+    /// Density-ratio exponent.
+    pub enhance_exponent: f32,
+    /// Lower enhancement weight.
+    pub enhance_clamp_lo: f32,
+    /// Upper enhancement weight.
+    pub enhance_clamp_hi: f32,
+    /// Unvoiced excitation multiplier.
+    pub unvoiced_gain: f32,
+    /// Voiced phase-jitter multiplier.
     pub phase_jitter: f32,
 }
+
+impl Default for TuningSpec {
+    fn default() -> Self {
+        SynthesisTuning::PARITY.spec()
+    }
+}
+
+/// Rejected synthesis coefficient name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TuningParameter {
+    /// Spectral-density sharpening factor.
+    EnhanceAlpha,
+    /// Density-ratio exponent.
+    EnhanceExponent,
+    /// Lower enhancement weight.
+    EnhanceClampLo,
+    /// Upper enhancement weight.
+    EnhanceClampHi,
+    /// Unvoiced excitation multiplier.
+    UnvoicedGain,
+    /// Voiced phase-jitter multiplier.
+    PhaseJitter,
+}
+
+/// Invalid candidate coefficients, rejected before constructing a decoder.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TuningError {
+    /// A coefficient was nonfinite or negative.
+    Coefficient {
+        /// Rejected coefficient.
+        parameter: TuningParameter,
+        /// Rejected value.
+        value: f32,
+    },
+    /// Lower enhancement weight exceeded the upper weight.
+    ClampOrder {
+        /// Proposed lower weight.
+        lower: f32,
+        /// Proposed upper weight.
+        upper: f32,
+    },
+}
+
+impl std::fmt::Display for TuningError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            Self::Coefficient { parameter, value } => write!(
+                formatter,
+                "{parameter:?} coefficient {value} must be finite and nonnegative"
+            ),
+            Self::ClampOrder { lower, upper } => write!(
+                formatter,
+                "enhancement clamp {lower} exceeds upper weight {upper}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for TuningError {}
 
 impl SynthesisTuning {
     /// The exact mbelib/JMBE constants. Decoding with this tuning is
@@ -511,7 +613,85 @@ impl SynthesisTuning {
         enhance_clamp_hi: 1.2,
         unvoiced_gain: 1.0,
         phase_jitter: 1.0,
+        envelope_postfilter: EnvelopePostfilter::Reference,
     };
+
+    /// Validate named synthesis coefficients as one configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TuningError::Coefficient`] for nonfinite/negative values or
+    /// [`TuningError::ClampOrder`] for reversed enhancement bounds. Coefficients
+    /// are tuning multipliers, not calibrated physical measurements; large
+    /// finite values can drive the decoder's existing output clipping.
+    pub fn new(spec: TuningSpec) -> Result<Self, TuningError> {
+        for (parameter, value) in [
+            (TuningParameter::EnhanceAlpha, spec.enhance_alpha),
+            (TuningParameter::EnhanceExponent, spec.enhance_exponent),
+            (TuningParameter::EnhanceClampLo, spec.enhance_clamp_lo),
+            (TuningParameter::EnhanceClampHi, spec.enhance_clamp_hi),
+            (TuningParameter::UnvoicedGain, spec.unvoiced_gain),
+            (TuningParameter::PhaseJitter, spec.phase_jitter),
+        ] {
+            if !value.is_finite() || value < 0.0 {
+                return Err(TuningError::Coefficient { parameter, value });
+            }
+        }
+        if spec.enhance_clamp_lo > spec.enhance_clamp_hi {
+            return Err(TuningError::ClampOrder {
+                lower: spec.enhance_clamp_lo,
+                upper: spec.enhance_clamp_hi,
+            });
+        }
+        Ok(Self {
+            enhance_alpha: spec.enhance_alpha,
+            enhance_exponent: spec.enhance_exponent,
+            enhance_clamp_lo: spec.enhance_clamp_lo,
+            enhance_clamp_hi: spec.enhance_clamp_hi,
+            unvoiced_gain: spec.unvoiced_gain,
+            phase_jitter: spec.phase_jitter,
+            envelope_postfilter: EnvelopePostfilter::Reference,
+        })
+    }
+
+    /// Return an immutable coefficient snapshot for inspection or checked editing.
+    #[must_use]
+    pub const fn spec(self) -> TuningSpec {
+        TuningSpec {
+            enhance_alpha: self.enhance_alpha,
+            enhance_exponent: self.enhance_exponent,
+            enhance_clamp_lo: self.enhance_clamp_lo,
+            enhance_clamp_hi: self.enhance_clamp_hi,
+            unvoiced_gain: self.unvoiced_gain,
+            phase_jitter: self.phase_jitter,
+        }
+    }
+
+    /// Select the envelope algorithm explicitly, preserving coefficients.
+    #[must_use]
+    pub const fn with_envelope_postfilter(mut self, algorithm: EnvelopePostfilter) -> Self {
+        self.envelope_postfilter = algorithm;
+        self
+    }
+
+    /// Return the selected envelope algorithm.
+    #[must_use]
+    pub const fn envelope_postfilter(self) -> EnvelopePostfilter {
+        self.envelope_postfilter
+    }
+}
+
+impl TryFrom<TuningSpec> for SynthesisTuning {
+    type Error = TuningError;
+    fn try_from(value: TuningSpec) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl From<SynthesisTuning> for TuningSpec {
+    fn from(value: SynthesisTuning) -> Self {
+        value.spec()
+    }
 }
 
 impl Default for SynthesisTuning {
@@ -535,6 +715,8 @@ impl AmbeDecoder {
     ///
     /// [`SynthesisTuning::PARITY`] reproduces [`AmbeDecoder::new`]
     /// exactly; other values reshape enhancement and excitation only.
+    /// Erasure, tone and sustained-loss history resets restore PARITY's six
+    /// coefficients. The selected envelope algorithm persists across resets.
     #[must_use]
     pub const fn with_tuning(tuning: SynthesisTuning) -> Self {
         Self {
@@ -545,6 +727,20 @@ impl AmbeDecoder {
             tone_phase: 0.0,
             tuning,
         }
+    }
+
+    /// Return current synthesis coefficients and the selected envelope algorithm.
+    ///
+    /// History resets restore PARITY coefficients while retaining the algorithm.
+    #[must_use]
+    pub const fn tuning(&self) -> SynthesisTuning {
+        self.tuning
+    }
+
+    const fn reset_history(&mut self) {
+        *self = Self::with_tuning(
+            SynthesisTuning::PARITY.with_envelope_postfilter(self.tuning.envelope_postfilter()),
+        );
     }
 
     /// Decodes a single 9-byte AMBE frame into 160 PCM samples.
@@ -607,7 +803,7 @@ impl AmbeDecoder {
                 // D-STAR dual-tone table is undocumented): silence +
                 // full state reset, mirroring the reference's tone/
                 // erasure disposition.
-                *self = Self::new();
+                self.reset_history();
                 return [0_i16; FRAME_SAMPLES];
             }
         }
@@ -624,7 +820,7 @@ impl AmbeDecoder {
             let mut pcm_f = [0.0_f32; FRAME_SAMPLES];
             adaptive::synthesize_comfort_noise(&mut pcm_f, &mut self.comfort_noise_state);
             let noise_state = self.comfort_noise_state;
-            *self = Self::new();
+            self.reset_history();
             self.comfort_noise_state = noise_state;
             return float_to_i16(&pcm_f);
         }
@@ -653,7 +849,7 @@ impl AmbeDecoder {
     /// be missing (e.g. a UDP sequence gap on a network transport).
     ///
     /// Runs the same repeat path as an uncorrectable or wire-erasure
-    /// frame: the previous frame's enhanced parameters are reused and
+    /// frame: the previous frame's raw parameters are reused and
     /// the repeat counter increments, so sustained loss degrades to
     /// comfort noise exactly like sustained RF errors (JMBE-
     /// compatible). Call once per missing frame, in stream order,
@@ -675,7 +871,7 @@ impl AmbeDecoder {
             let mut pcm_f = [0.0_f32; FRAME_SAMPLES];
             adaptive::synthesize_comfort_noise(&mut pcm_f, &mut self.comfort_noise_state);
             let noise_state = self.comfort_noise_state;
-            *self = Self::new();
+            self.reset_history();
             self.comfort_noise_state = noise_state;
             return float_to_i16(&pcm_f);
         }
@@ -708,7 +904,7 @@ impl AmbeDecoder {
         }
         let phase = self.tone_phase;
         let noise_state = self.comfort_noise_state;
-        *self = Self::new();
+        self.reset_history();
         self.tone_phase = phase;
         self.comfort_noise_state = noise_state;
         pcm
@@ -1105,7 +1301,7 @@ mod frame_fec_tests {
     #[test]
     fn kind_agrees_with_decode_trace_b0() {
         for frame in [[0u8; 9], SILENCE, [0xFF; 9], [0xA5; 9]] {
-            let (b, _, _, _) = decode_trace(&frame);
+            let b = decode_trace(&frame).parameters();
             assert_eq!(
                 frame_fec(&frame).kind,
                 classify_b0(b[0]),

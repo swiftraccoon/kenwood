@@ -14,7 +14,7 @@ use proptest as _;
 use realfft as _;
 use wide as _;
 
-use mbelib_rs::AmbeEncoder;
+use mbelib_rs::{AmbeEncoder, PcmFrame};
 
 /// Canonical D-STAR silence bytes. If the encoder is short-circuiting
 /// real voice input to this pattern every frame, the decoder will
@@ -58,11 +58,11 @@ fn make_voiced_chunk(t0_samples: usize) -> [f32; 160] {
 /// pattern, a catastrophic failure that produces exactly the
 /// "noise with volume envelope, no content" symptom.
 #[test]
-fn voiced_input_must_not_encode_to_silence() {
+fn voiced_input_must_not_encode_to_silence() -> Result<(), Box<dyn std::error::Error>> {
     let mut enc = AmbeEncoder::new();
     let mut t0 = 0_usize;
     for _ in 0..20 {
-        let _ = enc.encode_frame(&make_voiced_chunk(t0));
+        let _ = enc.encode_frame(&PcmFrame::new(make_voiced_chunk(t0))?);
         t0 += 160;
     }
     let mut silence_count = 0_u32;
@@ -70,7 +70,7 @@ fn voiced_input_must_not_encode_to_silence() {
     for _ in 0..sample_count {
         let chunk = make_voiced_chunk(t0);
         t0 += 160;
-        let ambe = enc.encode_frame(&chunk);
+        let ambe = enc.encode_frame(&PcmFrame::new(chunk)?);
         if ambe == AMBE_SILENCE {
             silence_count += 1;
         }
@@ -83,13 +83,14 @@ fn voiced_input_must_not_encode_to_silence() {
          voice frames: pitch tracker confidence is falling below SILENCE_CONFIDENCE \
          even for a clean 150 Hz harmonic signal"
     );
+    Ok(())
 }
 
 /// Pure sine at 150 Hz; the decoder's f0 must match. If decoded
 /// spectrum has more energy at 300 Hz than 150 Hz, the pitch-index
 /// path is writing the wrong b0 (doubled or halved).
 #[test]
-fn pure_sine_pitch_preserved_through_codec() {
+fn pure_sine_pitch_preserved_through_codec() -> Result<(), Box<dyn std::error::Error>> {
     let mut enc = AmbeEncoder::new();
     let mut dec = mbelib_rs::AmbeDecoder::new();
 
@@ -109,13 +110,13 @@ fn pure_sine_pitch_preserved_through_codec() {
     };
     let mut t0 = 0_usize;
     for _ in 0..20 {
-        let _ = enc.encode_frame(&make_pure(t0));
-        let _ = dec.decode_frame(&enc.encode_frame(&make_pure(t0)));
+        let _ = enc.encode_frame(&PcmFrame::new(make_pure(t0))?);
+        let _ = dec.decode_frame(&enc.encode_frame(&PcmFrame::new(make_pure(t0))?));
         t0 += 160;
     }
     let mut decoded = Vec::with_capacity(20 * 160);
     for _ in 0..20 {
-        let ambe = enc.encode_frame(&make_pure(t0));
+        let ambe = enc.encode_frame(&PcmFrame::new(make_pure(t0))?);
         t0 += 160;
         decoded.extend_from_slice(&dec.decode_frame(&ambe));
     }
@@ -151,6 +152,7 @@ fn pure_sine_pitch_preserved_through_codec() {
     eprintln!("  150 Hz (f0):   {e_150:.6}");
     eprintln!("  300 Hz (2f0):  {e_300:.6}");
     eprintln!("  450 Hz (3f0):  {e_450:.6}");
+    Ok(())
 }
 
 /// End-to-end: voice-in → encode → decode → check spectral content.
@@ -161,7 +163,7 @@ fn pure_sine_pitch_preserved_through_codec() {
 /// instead of a proper harmonic spectrum, this will show as
 /// near-uniform energy across all bins rather than peaks at f0/2f0/3f0.
 #[test]
-fn voiced_input_produces_harmonic_output() {
+fn voiced_input_produces_harmonic_output() -> Result<(), Box<dyn std::error::Error>> {
     let mut enc = AmbeEncoder::new();
     let mut dec = mbelib_rs::AmbeDecoder::new();
 
@@ -170,7 +172,7 @@ fn voiced_input_produces_harmonic_output() {
     for _ in 0..20 {
         let chunk = make_voiced_chunk(t0);
         t0 += 160;
-        let ambe = enc.encode_frame(&chunk);
+        let ambe = enc.encode_frame(&PcmFrame::new(chunk)?);
         let _ = dec.decode_frame(&ambe);
     }
 
@@ -178,7 +180,7 @@ fn voiced_input_produces_harmonic_output() {
     for _ in 0..20 {
         let chunk = make_voiced_chunk(t0);
         t0 += 160;
-        let ambe = enc.encode_frame(&chunk);
+        let ambe = enc.encode_frame(&PcmFrame::new(chunk)?);
         let pcm = dec.decode_frame(&ambe);
         decoded.extend_from_slice(&pcm);
     }
@@ -253,4 +255,5 @@ fn voiced_input_produces_harmonic_output() {
          (f0={e_fund:.4} 2f0={e_harm2:.4} 3f0={e_harm3:.4} noise={e_bg:.4}); \
          decoder is likely synthesizing unvoiced noise for a voiced input"
     );
+    Ok(())
 }

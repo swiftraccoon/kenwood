@@ -38,7 +38,8 @@ use mbelib_rs::{
     AmbeEncoder, EncoderBuffers, FftPlan, analyze_frame, compute_e_p, detect_vuv_and_sa,
     validation::{PrevFrameState, quantize},
 };
-use realfft::num_complex::Complex;
+use mbelib_rs::{FundamentalBin, PcmFrame, PitchErrors, PitchMetric, Spectrum};
+use realfft as _;
 use std::io::{BufRead, BufReader, Read};
 
 /// D-STAR `ambe_d` bit positions for each `b_N` field, MSB-first.
@@ -86,8 +87,8 @@ struct Op25Frame {
 /// the FFT output it was derived from: pitch is committed for frame
 /// N-2 only after frame N's analysis has produced `E(p)_N`.
 struct DpSlot {
-    e_p: [f32; 203],
-    fft_out: Vec<Complex<f32>>,
+    e_p: PitchErrors,
+    fft_out: Spectrum,
 }
 
 fn parse_trace(path: &str) -> Result<Vec<Op25Frame>, std::io::Error> {
@@ -179,14 +180,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // `ambe_d` not the scrambled/interleaved wire bytes.
     let mut bufs = EncoderBuffers::new();
     let mut plan = FftPlan::new();
-    let mut fft_out: Vec<Complex<f32>> = vec![Complex::new(0.0, 0.0); 129];
     let mut tracker_state = mbelib_rs::PitchTracker::new();
     let mut vuv_state = mbelib_rs::VuvState::new();
-    let mut prev = PrevFrameState {
-        log2_ml: [0.0_f32; 57],
-        l: 0,
-        prev_gamma: 0.0,
-    };
+    let mut prev = PrevFrameState::ZERO;
     // Ignore AmbeEncoder here: it would short-circuit to silence on
     // low-confidence pitch, which hides the b_vec values for silence.
     // Construct-and-drop (kept as a smoke test that `::new()` doesn't panic).
@@ -208,14 +204,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         let mut samples = [0.0_f32; 160];
         samples.copy_from_slice(chunk);
-        analyze_frame(&samples, &mut bufs, &mut plan, &mut fft_out);
-        let e_p_current = compute_e_p(bufs.pitch_est_buf());
+        let fft_out = analyze_frame(&PcmFrame::new(samples)?, &mut bufs, &mut plan);
+        let e_p_current = compute_e_p(bufs.pitch_est_buf())?;
 
         // Pick pitch path + FFT to quantize against.
         let (pitch, target_fft, emit_idx) = if use_dp {
             let slot = DpSlot {
                 e_p: e_p_current,
-                fft_out: fft_out.clone(),
+                fft_out,
             };
             if dp_slots.len() < 2 {
                 dp_slots.push(slot);
@@ -232,21 +228,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Frame N-2 corresponds to trace index frame_idx - 2.
             (p, target, frame_idx - 2)
         } else {
-            let p = tracker_state.estimate(bufs.pitch_est_buf());
-            (p, fft_out.clone(), frame_idx)
+            let p = tracker_state.estimate(bufs.pitch_est_buf())?;
+            (p, fft_out, frame_idx)
         };
 
-        let f0_bin = 256.0_f32 / pitch.period_samples;
-        let e_p_for_vuv = (1.0 - pitch.confidence).clamp(0.0, 1.0);
-        let (vuv, amps) = detect_vuv_and_sa(&target_fft, f0_bin, &mut vuv_state, e_p_for_vuv);
+        let f0_bin = FundamentalBin::new(256.0_f32 / pitch.period_samples())?;
+        let e_p_for_vuv = PitchMetric::new((1.0 - pitch.confidence()).clamp(0.0, 1.0))?;
+        let (vuv, amps) = detect_vuv_and_sa(&target_fft, f0_bin, &mut vuv_state, e_p_for_vuv)?;
 
-        let outcome = quantize(pitch, vuv, &amps, &prev);
-        prev = PrevFrameState {
-            log2_ml: outcome.prev_log2_ml,
-            l: outcome.prev_l,
-            prev_gamma: outcome.prev_gamma,
-        };
-        let ours = reassemble_b_vec(&outcome.ambe_d);
+        let outcome = quantize(pitch, vuv, &amps, &prev)?;
+        prev = outcome.previous_state();
+        let ours = reassemble_b_vec(&outcome.data_bits());
         let op25_idx = emit_idx;
 
         let Some(op25_f) = op25.get(op25_idx) else {

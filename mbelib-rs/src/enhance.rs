@@ -187,7 +187,9 @@ pub(crate) fn spectral_amp_enhance(params: &mut MbeParams, tuning: &SynthesisTun
     }
 
     #[cfg(feature = "kenwood-tables")]
-    apply_kenwood_envelope_postfilter(params);
+    if tuning.envelope_postfilter == crate::EnvelopePostfilter::Kenwood {
+        apply_kenwood_envelope_postfilter(params);
+    }
 }
 
 /// Apply Kenwood TH-D75 firmware's per-frequency envelope-shaping

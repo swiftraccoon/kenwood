@@ -1,265 +1,183 @@
 # mbelib-rs
 
-AMBE 3600×2400 voice codec for D-STAR. Pure Rust, no `unsafe`, no FFI.
-Decoder on by default; encoder behind the `encoder` Cargo feature.
+AMBE 3600×2400 codec and PCM enhancement for D-STAR. One nine-byte wire
+frame produces 160 signed 16-bit PCM samples at 8 kHz, or 20 ms of audio.
+Each decoder and encoder owns one stream's prediction and synthesis history.
+The crate contains no handwritten unsafe code or FFI.
 
-## Scope
+The decoder is always available. The `encoder` feature adds an experimental
+encoder and checked diagnostic stages. Hardware interoperability of the encoder
+remains unverified; the ignored spectral-envelope correlation regression is an
+existing qualification requirement. AMBE+, AMBE+2 and IMBE are outside the
+implemented wire format.
 
-- **Decoder** (default): 9-byte AMBE 3600×2400 voice frames → 160-sample
-  PCM at 8 kHz (20 ms/frame, 50 frames/s).
-- **Encoder** (`--features encoder`): 160-sample PCM → 9-byte AMBE frames.
-  All 9 parameter fields (pitch / V/UV / gain / PRBA × 2 / HOC × 4) are
-  populated from real signal analysis, FEC-encoded, scrambled, and packed
-  to wire form. The encoder is experimental: reliable DVSI hardware
-  interoperability is not yet validated, and the ignored correlation test
-  tracks a known spectral-envelope defect.
-- **Waveform enhancement** (`--features wave-enhance`): learned
-  post-processors for decoder output (small complex-STFT masking
-  networks adversarially fine-tuned against reference hardware-grade
-  decodes of identical AMBE frames) that regenerate waveform fine
-  structure the base synthesis cannot. Two variants compile in:
-  `enhance_wave`, the offline whole-clip model (bidirectional
-  recurrence: best quality, requires the complete clip), and
-  `enhance_live`, its causal counterpart with a forward-only
-  recurrence and a streaming frame-at-a-time API whose total
-  algorithmic lookahead (< 56 ms) fits inside a typical network
-  playout buffer. Opt-in, ≈5.5 MiB of embedded weights, and each
-  variant ships only after blind operator listening prefers it.
-- **D-STAR only**: AMBE 3600×2400 is the mandatory voice codec for the
-  JARL D-STAR standard. The decoder synthesizes valid single-tone frames,
-  but the encoder does not emit tone frames. Does **not** support AMBE+,
-  AMBE+2, IMBE, or the AMBE+2 "half-rate" variant used by DMR / YSF / NXDN
-  (which remains covered by US Patent 8,359,197 until 2028-05-20).
+## Decode and inspect a stream
 
-## Usage
-
-### Decoder (always available)
+Arbitrary nine-byte frames are valid decoder inputs. `frame_fec` reports the
+correction counts and frame classification; `decode_trace` exposes immutable
+codebook indices, radians per sample, harmonic count and corrected bits.
+`AmbeParamExtractor` performs stateful parameter extraction without synthesis.
 
 ```rust
-use mbelib_rs::AmbeDecoder;
+use mbelib_rs::{AmbeDecoder, AmbeParamExtractor, decode_trace};
 
+let frame = [0x9e, 0x8d, 0x32, 0x88, 0x26, 0x1a, 0x3f, 0x61, 0xe8];
 let mut decoder = AmbeDecoder::new();
-let ambe_frame: [u8; 9] = [0; 9];
-let pcm: [i16; 160] = decoder.decode_frame(&ambe_frame);
+let pcm: [i16; 160] = decoder.decode_frame(&frame);
+assert_eq!(pcm.len(), 160);
+let trace = decode_trace(&frame);
+assert!(trace.data_bits().iter().all(|&bit| bit <= 1));
+let mut extractor = AmbeParamExtractor::new();
+let parameters = extractor.extract(&frame);
+assert!(parameters.harmonics() <= 56);
+let concealed: [i16; 160] = decoder.conceal_frame();
+assert_eq!(concealed.len(), 160);
 ```
 
-### Encoder (feature-gated)
+Erasure and invalid-tone frames emit silence and clear stream history. Sustained
+FEC failures repeat prior parameters before muting. Tone frames use the tone
+oscillator. History resets restore PARITY coefficients while retaining the
+selected envelope algorithm. A fresh decoder starts with deterministic reference
+tuning and zero stream history.
 
-```rust,ignore
-use mbelib_rs::AmbeEncoder;
+## Checked PCM
+
+`PcmFrame` contains exactly 160 finite `f32` samples in inclusive `[-1, 1]`.
+`PcmSamples` validates any borrowed block in the same amplitude domain, including
+an empty block. Constructors reject invalid lengths, NaN, infinity and samples
+outside the domain. Signed 16-bit frame conversion divides by 32768.
+
+```rust
+use mbelib_rs::{PcmFrame, PcmSamples};
+
+let frame = PcmFrame::new([0.0; 160])?;
+assert_eq!(frame.as_pcm_samples().as_slice().len(), 160);
+assert!(PcmSamples::new(&[f32::NAN]).is_err());
+let normalized = PcmFrame::from([i16::MIN; 160]);
+assert_eq!(normalized.samples()[0], -1.0);
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+```rust
+# #[cfg(feature = "encoder")]
+# {
+use mbelib_rs::{AmbeEncoder, PcmFrame};
 
 let mut encoder = AmbeEncoder::new();
-let pcm: [f32; 160] = [0.0; 160]; // 20 ms @ 8 kHz, nominal [-1.0, 1.0)
-let ambe: [u8; 9] = encoder.encode_frame(&pcm);
-// Or from i16 PCM directly:
-let pcm_i16: [i16; 160] = [0; 160];
-let ambe: [u8; 9] = encoder.encode_frame_i16(&pcm_i16);
+let frame = PcmFrame::new([0.0; 160])?;
+let wire: [u8; 9] = encoder.encode_frame(&frame);
+let from_integer: [u8; 9] = encoder.encode_frame_i16(&[0; 160]);
+assert_eq!(wire.len(), from_integer.len());
+# }
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-One decoder/encoder per voice stream (each carries inter-frame state).
+Encoder construction allocates FFT plans, reusable scratch and optional lookahead
+slots. Frame processing reuses this storage. `EncoderOptions` selects the input
+filter and single-frame or two-frame-lookahead pitch tracking; lookahead adds two
+20 ms frames and emits silence while filling. It has no implicit tail flush.
 
-### Waveform enhancement (feature-gated)
+## Inspect the encoder stages
 
-```rust,ignore
+Diagnostic stages are public checked contracts. `Spectrum` has 129 complex bins
+from a 256-point real FFT. `PitchHistory` borrows 301 finite samples. Pitch
+periods are measured in samples, frequencies in Hz or FFT bins as named, and
+`PitchMetric` is in `[0, 1]`. Related count/array constructors reject excessive
+counts or nonzero padding. Public numerical stages return `StageError` if a
+finite candidate causes an unrepresentable intermediate result; failed stateful
+estimation leaves its history unchanged.
+
+```rust
+# #[cfg(feature = "encoder")]
+# {
+use mbelib_rs::{EncoderBuffers, FftPlan, FundamentalBin, PcmFrame,
+    PitchMetric, PitchTracker, VuvState, analyze_frame, detect_vuv_and_sa};
+use mbelib_rs::validation::{PrevFrameState, quantize};
+
+let mut buffers = EncoderBuffers::new();
+let mut plan = FftPlan::new();
+let spectrum = analyze_frame(&PcmFrame::new([0.0; 160])?, &mut buffers, &mut plan);
+let pitch = PitchTracker::new().estimate(buffers.pitch_est_buf())?;
+let bin = FundamentalBin::new(256.0 / pitch.period_samples())?;
+let (voicing, amplitudes) = detect_vuv_and_sa(&spectrum, bin,
+    &mut VuvState::default(), PitchMetric::new(1.0 - pitch.confidence())?)?;
+let outcome = quantize(pitch, voicing, &amplitudes, &PrevFrameState::ZERO)?;
+assert!(outcome.data_bits().iter().all(|&bit| bit <= 1));
+# }
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+## Tuning and optional algorithms
+
+`SynthesisTuning::new(TuningSpec)` checks finite, nonnegative coefficients and
+ordered enhancement bounds. `PARITY` is the default. Large coefficients can
+saturate signed PCM output; construction establishes the parameter domain,
+not a perceptual quality target.
+
+```rust
+use mbelib_rs::{AmbeDecoder, SynthesisTuning, TuningSpec};
+
+let tuning = SynthesisTuning::new(TuningSpec {
+    phase_jitter: 0.0,
+    ..SynthesisTuning::PARITY.spec()
+})?;
+let decoder = AmbeDecoder::with_tuning(tuning);
+assert_eq!(decoder.tuning(), tuning);
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+`kenwood-tables` exposes coefficient data and explicit `InputFilter::Kenwood`
+and `EnvelopePostfilter::Kenwood` choices. Enabling the feature leaves default
+encoder and decoder algorithms at their reference settings. Changing tuning,
+filter choice or waveform models changes the audio configuration; synthesis or
+enhancement changes require the crate's blind listening qualification.
+
+## Waveform enhancement
+
+`wave-enhance` adds offline and causal waveform models with embedded immutable
+weights. Construction parses the model and allocates its caches. Whole-clip
+processing allocates in proportion to the clip. The causal stream retains
+bounded staging, model history and output tail regardless of input block size;
+each push allocates the returned output in proportion to the ready samples.
+Call `finish` to drain the tail and reset a stream for reuse. Dropping without
+finishing discards delayed samples. Total output after finishing equals input
+length; no clock or I/O is read by these processors.
+
+```rust
+# #[cfg(feature = "wave-enhance")]
+# {
+use mbelib_rs::enhance_live::LiveWaveEnhancer;
 use mbelib_rs::enhance_wave::WaveEnhancer;
 
-let enhancer = WaveEnhancer::new()?;
-let decoded: Vec<i16> = todo!("whole clip of decoder output, 8 kHz mono");
-let enhanced: Vec<i16> = enhancer.process(&decoded);
+let decoded = [0_i16; 160];
+let offline = WaveEnhancer::new()?;
+assert_eq!(offline.process(&decoded).len(), decoded.len());
+let live = LiveWaveEnhancer::new()?;
+let mut stream = live.stream();
+let mut output = stream.push_frame(&decoded);
+output.extend(stream.finish());
+assert_eq!(output.len(), decoded.len());
+# }
+# Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-Enhance after decoding a complete transmission, not per frame: the
-network reads the whole clip. Output length equals input length, and
-clips shorter than a few STFT frames pass through unchanged. One
-`WaveEnhancer` can be reused across clips (it is stateless between
-calls).
+## Stream tools
 
-For live playback, the causal variant streams frame by frame:
-
-```rust,ignore
-use mbelib_rs::enhance_live::LiveWaveEnhancer;
-
-let enhancer = LiveWaveEnhancer::new()?;
-let mut stream = enhancer.stream();
-// For each decoded 20 ms frame as it arrives:
-let ready: Vec<i16> = stream.push_frame(&decoded_frame);
-// At end of transmission (flushes the tail; resets for reuse):
-let tail: Vec<i16> = stream.finish();
-```
-
-`push_frame` returns every sample that has become final; output lags
-input by the model's fixed lookahead (under 56 ms), and after
-`finish` the total output length equals the total input length. The
-streaming path computes bit-for-bit the same enhancement as the
-batch `process` call on the same audio.
-
-## Pipeline
-
-1. Unpack 72 bits into 4 FEC codewords (C0, C1, C2, C3).
-2. Golay(23,12) error correction on C0 and C1. C2 (11 bits) and C3 (14
-   bits) are unprotected data.
-3. LFSR demodulation of C1 using corrected C0 as seed.
-4. Parameter extraction into 49-bit vector → `w0`, `L`, voiced/unvoiced
-   decisions, spectral magnitudes. Disposition then splits three ways:
-   valid tone frames (b0=126..=127) are synthesized directly by a
-   dedicated tone oscillator; erasure frames (b0=120..=123) and
-   out-of-range tone descriptors emit silence and fully re-initialize
-   the decoder state; voice frames whose FEC required more than 3
-   corrected bits reuse the previous frame's parameters and increment
-   the repeat counter.
-5. Spectral amplitude enhancement.
-6. JMBE adaptive smoothing (algorithms #111-116).
-7. Frame muting: if the error rate exceeds 9.6% or the repeat counter
-   exceeds 3, emit comfort noise.
-8. Synthesis: voiced bands via windowed cosine oscillator bank (with
-   JMBE phase/amplitude interpolation for low harmonics with stable
-   pitch); unvoiced bands via a single 256-point FFT + WOLA combine
-   (JMBE algorithms #117-126).
-9. Float → i16 with SIMD gain/clamp.
-
-Deterministic: same input sequence produces bit-identical output.
-
-## Encoder pipeline (feature-gated)
-
-Symmetrical to decode, plus an analysis front-end:
-
-1. DC-removal high-pass + 21-tap pitch-estimation LPF.
-2. 221-sample windowed 256-point FFT for spectral analysis.
-3. Sub-harmonic-summation pitch estimator (OP25 `pitch_est.cc` E(p)
-   approach): for each candidate period `p`, score the normalized
-   sum of windowed autocorrelations at `p`, `2p`, `3p`, …. The true
-   fundamental accumulates contributions from every harmonic; sub-
-   multiples miss half their terms. A soft log-distance-from-prior
-   penalty breaks residual ties smoothly without hard-pinning.
-4. Per-harmonic-band voiced/unvoiced decisions from harmonic-to-total
-   energy ratios.
-5. Per-harmonic magnitudes from 3-bin-integrated FFT power.
-6. Parameter quantization against the mbelib codebooks (same tables as
-   decode): L-constrained `W0_TABLE` search for pitch (pick the `b0`
-   where `L_TABLE[b0] == num_harms` AND W0 closest to target),
-   `VUV_TABLE` for voicing summary, `DG_TABLE` for gain, `PRBA24_TABLE`
-   + `PRBA58_TABLE` for spectral envelope (via inverse 8-point DCT on
-   Ri from block-DCT Cik), and `HOC_B5..B8_TABLE` for within-block
-   detail. `b8` uses stride-2 search because the wire format forces
-   its LSB to zero (mbelib decoder convention).
-7. Closed-loop `prev_log2_ml` reconstruction: after emitting the
-   49-bit parameter vector the encoder runs `decode_params()` internally
-   to capture what the on-air decoder will reconstruct, and carries that
-   state into the next frame's prediction residual computation, so
-   encoder and decoder track identical magnitude history.
-8. Golay(23,12) encode on C0 and C1 + outer parity.
-9. LFSR scramble of C1 seeded from C0 data bits.
-10. 72-bit interleave to transmission order, pack to 9 wire bytes.
-
-### Stream tools and validation infrastructure
-
-Decode concatenated 9-byte AMBE frames to signed 16-bit little-endian PCM,
-or encode 8 kHz mono PCM in the other direction:
-
-```bash
+```sh
 cargo run -p mbelib-rs --example decode_ambe_stream -- input.ambe output.s16
 cargo run -p mbelib-rs --features encoder --example encode_ambe_stream -- input.s16 output.ambe
 ```
 
-Four validation harnesses compare against OP25's reference
-implementation with identical inputs. Each is an `encoder`-feature
-example, run with:
+The `validate_analysis_vs_op25`, `validate_bvec_vs_op25`,
+`validate_dp_vs_op25` and `validate_quantize_vs_op25` examples compare supplied
+PCM or parameter traces with OP25. Their outputs describe the supplied fixture;
+they perform no hardware qualification. Historical TH-D75 anchor fixtures require
+recapture with verified framing before they can qualify encoder output.
 
-```bash
-cargo run -p mbelib-rs --release --features encoder --example <name> -- <args>
-```
+## Dependencies and license
 
-- `validate_quantize_vs_op25 <op25.trace>`: feeds OP25's exact
-  `imbe_param` (sa, `v_uv_dsn`, `ref_pitch`, prev state) into this crate's
-  `quantize()` and reports `b[0..8]` field differences. Match rates depend
-  on the supplied trace; no fixed percentage is treated as a current
-  guarantee.
-- `validate_analysis_vs_op25 <pcm> <op25.trace>`: runs this crate's full
-  analysis pipeline on identical PCM and compares `pitch`/`num_harms`
-  against OP25's IMBE. The 2-frame DP look-ahead from OP25
-  `pitch_est.cc:229-281` is implemented (`AmbeEncoder::new_with_lookahead`,
-  `PitchTracker::estimate_with_lookahead`), closing most of this gap
-  at the cost of ≈40 ms added latency.
-- `validate_bvec_vs_op25 <pcm> <op25.trace>`: per-field `b0..b8` diff
-  of this encoder against OP25's `ambe_encode_dump` trace, reverse-
-  deriving each field from the emitted 49-bit `ambe_d` via the D-STAR
-  bit layout.
-- `validate_dp_vs_op25 <pcm> <op25.trace>`: A/B of single-frame
-  `PitchTracker::estimate` against the 2-frame DP
-  `estimate_with_lookahead`, reporting the pitch-match rate for each.
-
-Produce the `.trace` input with the `ambe_encode_dump` harness
-built against an OP25 checkout (CLI: `ambe_encode_dump <pcm>
-<out.ambe> <trace>`).
-
-The encoder currently clears structural round-trip and non-silence tests,
-but `sine_roundtrip_has_nonzero_correlation_with_input` remains ignored at
-roughly 0.04 correlation. The PRBA/HOC spectral-envelope fields (`b3` through
-`b8`) are the active investigation area. These harnesses are diagnostic tools;
-they do not exercise DVSI hardware.
-
-Derived from Max H. Parke (KA1RBI)'s `ambe_encoder.cc` and Pavel
-Yazev's `imbe_vocoder` in [boatbod/op25](https://github.com/boatbod/op25)
-(GPL-3.0-or-later, 2009–2016). This Rust formulation simplifies the
-ETSI fixed-point arithmetic to native f32 throughout; bit-exact output and
-reliable DVSI chip interoperability are not guaranteed.
-
-## Dependencies
-
-- `realfft`: 256-point real FFT for unvoiced synthesis (decoder),
-  spectral analysis (encoder), and the enhancement STFT
-  (`wave-enhance`).
-- `wide`: `f32x4`/`i32x4` SIMD for float→i16 conversion.
-
-Both are pure Rust (MIT/Apache-2.0), so no C, no FFI, no `unsafe`.
-
-## License
-
-GPL-2.0-or-later (decoder) / GPL-3.0-or-later (encoder, feature-gated).
-
-- Base decoder: ported from szechyjs's ISC-licensed
-  [mbelib](https://github.com/szechyjs/mbelib).
-- JMBE-parity decoder algorithms (FFT unvoiced, adaptive smoothing,
-  phase interpolation): from arancormonk's GPL-2.0-or-later
-  [mbelib-neo](https://github.com/arancormonk/mbelib-neo).
-- D-STAR interleave tables: szechyjs's ISC-licensed
-  [dsd](https://github.com/szechyjs/dsd).
-- Encoder analysis path: ported from Max H. Parke (KA1RBI)'s
-  `ambe_encoder.cc` + Pavel Yazev's `imbe_vocoder` in
-  [boatbod/op25](https://github.com/boatbod/op25), GPL-3.0-or-later.
-  Enabling the `encoder` feature activates GPL-3.0-or-later provisions
-  for the resulting binary.
-
-See [`LICENSE`](https://github.com/swiftraccoon/kenwood/blob/main/mbelib-rs/LICENSE)
-for upstream copyright notices. Full license texts in
-[`LICENSES/`](https://github.com/swiftraccoon/kenwood/tree/main/mbelib-rs/LICENSES).
-
-## Patents
-
-US patents commonly cited as covering AMBE 3600×2400 (all expired per
-Google Patents):
-
-| Patent          | Assignee               | Expired      |
-|-----------------|------------------------|--------------|
-| US 5,715,365    | Digital Voice Systems  | 2015-02-03   |
-| US 5,754,974    | Digital Voice Systems  | 2015-05-19   |
-| US 5,826,222    | Digital Voice Systems  | 2015-01-12   |
-| US 5,870,405    | Digital Voice Systems  | 2012-11-30   |
-| US 6,161,089    | Digital Voice Systems  | 2017-03-14   |
-| US 6,199,037    | Digital Voice Systems  | 2017-12-04   |
-| US 6,377,916    | Digital Voice Systems  | 2019-11-29   |
-| US 6,397,178    | Conexant Systems       | 2018-09-18 † |
-
-† US 6,397,178 is a generic speech-coding patent, included here because
-it appears in commonly-circulated AMBE patent lists; its applicability
-to AMBE 3600×2400 is debatable.
-
-AMBE+, AMBE+2, and AMBE-3000 may be covered by additional patents and
-are not implemented here.
-
-This is not legal advice. Patent status can change (reexamination, term
-adjustment, foreign equivalents); verify before commercial use.
-
-Amateur radio transmissions are "readily accessible to the general
-public" under 18 USC 2511(2)(g)(ii) in the US; consult local rules for
-other jurisdictions.
+`realfft` supplies real FFT plans and `wide` supplies SIMD conversion primitives.
+The decoder uses GPL-2.0-or-later licensing; the optional OP25-derived encoder
+contains GPL-3.0-or-later code. The upstream attribution and applicable texts are
+in [LICENSE](https://github.com/swiftraccoon/kenwood/blob/main/mbelib-rs/LICENSE)
+and [LICENSES](https://github.com/swiftraccoon/kenwood/tree/main/mbelib-rs/LICENSES).

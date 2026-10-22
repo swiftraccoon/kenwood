@@ -338,9 +338,7 @@ fn decode_spectral_offsets(ambe_d: &[u8; AMBE_DATA_BITS], big_l: usize) -> [f32;
     // 9 codebook indices the decoder pulled out of `ambe_d` plus the
     // partially-reconstructed `cik[2]` (block 2 mean + first AC, before
     // HOC fill). Used to compare against `MBELIB_DUMP_QUANTIZE=1`'s
-    // emitter output frame-by-frame; this caught the FEC double-modulation
-    // bug (April 2026) by showing decoder b3 = 304 where the encoder
-    // had written b3 = 368 for the same input.
+    // emitter output frame by frame.
     if std::env::var_os("MBELIB_DUMP_DECODE").is_some() {
         eprintln!(
             "  DEC b3={b3} b4={b4} b5={b5} b6={b6} b7={b7} b8={b8} L={big_l} ji={:?}",

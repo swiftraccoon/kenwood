@@ -22,7 +22,7 @@ use proptest as _;
 use realfft as _;
 use wide as _;
 
-use mbelib_rs::{AmbeDecoder, AmbeEncoder};
+use mbelib_rs::{AmbeDecoder, AmbeEncoder, PcmFrame};
 
 /// Build a 1 kHz sine wave chunk at -20 dBFS, 160 samples @ 8 kHz
 /// (one 20 ms AMBE frame). `-20 dBFS` ≈ typical spoken-voice level.
@@ -81,7 +81,7 @@ fn peak_i16(pcm: &[i16]) -> f32 {
 /// deliberately generous: we're asserting "some signal survives",
 /// not bit-exactness.
 #[test]
-fn sine_1khz_encode_decode_produces_audio() {
+fn sine_1khz_encode_decode_produces_audio() -> Result<(), Box<dyn std::error::Error>> {
     let mut enc = AmbeEncoder::new();
     let mut dec = AmbeDecoder::new();
 
@@ -91,7 +91,7 @@ fn sine_1khz_encode_decode_produces_audio() {
     let mut t0 = 0_usize;
     for _ in 0..8 {
         let chunk = make_sine_chunk(t0);
-        let _ambe = enc.encode_frame(&chunk);
+        let _ambe = enc.encode_frame(&PcmFrame::new(chunk)?);
         t0 += 160;
     }
 
@@ -101,7 +101,7 @@ fn sine_1khz_encode_decode_produces_audio() {
     for _ in 0..10 {
         let chunk = make_sine_chunk(t0);
         t0 += 160;
-        let ambe = enc.encode_frame(&chunk);
+        let ambe = enc.encode_frame(&PcmFrame::new(chunk)?);
         let pcm = dec.decode_frame(&ambe);
         decoded.extend_from_slice(&pcm);
     }
@@ -119,6 +119,7 @@ fn sine_1khz_encode_decode_produces_audio() {
          peak={peak:.4} rms={rms:.4}. This means the encoder is emitting AMBE bytes that even \
          our own decoder interprets as silence, a codec internal-consistency bug."
     );
+    Ok(())
 }
 
 /// Zero (silent) input round-trips to comfort-noise level output,
@@ -137,14 +138,14 @@ fn sine_1khz_encode_decode_produces_audio() {
 /// broken gain path (which is the 0.22-peak symptom we caught
 /// during the 2400 migration).
 #[test]
-fn zero_input_encode_decode_is_comfort_noise_level() {
+fn zero_input_encode_decode_is_comfort_noise_level() -> Result<(), Box<dyn std::error::Error>> {
     let mut enc = AmbeEncoder::new();
     let mut dec = AmbeDecoder::new();
 
     let zero_chunk = [0.0_f32; 160];
     let mut decoded = Vec::with_capacity(10 * 160);
     for _ in 0..10 {
-        let ambe = enc.encode_frame(&zero_chunk);
+        let ambe = enc.encode_frame(&PcmFrame::new(zero_chunk)?);
         let pcm = dec.decode_frame(&ambe);
         decoded.extend_from_slice(&pcm);
     }
@@ -157,6 +158,7 @@ fn zero_input_encode_decode_is_comfort_noise_level() {
          the decoder is synthesizing a real signal for what should be silence. \
          Expected behaviour: comfort noise floor well below speech level."
     );
+    Ok(())
 }
 
 /// Dump the AMBE bytes emitted for zero input across N frames so we
@@ -164,27 +166,29 @@ fn zero_input_encode_decode_is_comfort_noise_level() {
 /// test; it's diagnostic only.
 #[test]
 #[ignore = "diagnostic dump, asserts nothing; run explicitly with --ignored --nocapture"]
-fn diagnostic_dump_zero_input_ambe() {
+fn diagnostic_dump_zero_input_ambe() -> Result<(), Box<dyn std::error::Error>> {
     let mut enc = AmbeEncoder::new();
     for frame_num in 0..12 {
-        let ambe = enc.encode_frame(&[0.0_f32; 160]);
+        let ambe = enc.encode_frame(&PcmFrame::new([0.0_f32; 160])?);
         println!("zero-input frame {frame_num}: ambe = {ambe:02x?}");
     }
+    Ok(())
 }
 
 /// Dump the AMBE bytes emitted for sine input so we can compare
 /// against zero and see how different they are.
 #[test]
 #[ignore = "diagnostic dump, asserts nothing; run explicitly with --ignored --nocapture"]
-fn diagnostic_dump_sine_input_ambe() {
+fn diagnostic_dump_sine_input_ambe() -> Result<(), Box<dyn std::error::Error>> {
     let mut enc = AmbeEncoder::new();
     let mut t0 = 0_usize;
     for frame_num in 0..12 {
         let chunk = make_sine_chunk(t0);
         t0 += 160;
-        let ambe = enc.encode_frame(&chunk);
+        let ambe = enc.encode_frame(&PcmFrame::new(chunk)?);
         println!("sine-1khz frame {frame_num}: ambe = {ambe:02x?}");
     }
+    Ok(())
 }
 
 /// Cross-correlation of an encode→decode loopback must preserve
@@ -217,7 +221,7 @@ fn diagnostic_dump_sine_input_ambe() {
 /// drive the encoder toward recognizable voice.
 #[test]
 #[ignore = "tracks spectral-envelope encoder bug: correlation ~0.04 on sines"]
-fn sine_roundtrip_has_nonzero_correlation_with_input() {
+fn sine_roundtrip_has_nonzero_correlation_with_input() -> Result<(), Box<dyn std::error::Error>> {
     let mut enc = AmbeEncoder::new();
     let mut dec = AmbeDecoder::new();
 
@@ -229,7 +233,7 @@ fn sine_roundtrip_has_nonzero_correlation_with_input() {
     for _ in 0..frames {
         let chunk = make_sine_chunk(t0);
         input_pcm.extend_from_slice(&chunk);
-        let ambe = enc.encode_frame(&chunk);
+        let ambe = enc.encode_frame(&PcmFrame::new(chunk)?);
         let pcm_out = dec.decode_frame(&ambe);
         output_pcm.extend(pcm_out.iter().map(|&s| f32::from(s) / 32768.0));
         t0 += 160;
@@ -314,6 +318,7 @@ fn sine_roundtrip_has_nonzero_correlation_with_input() {
          Fix the spectral path; loosen this threshold only as a \
          regression tightening, not a regression loosening."
     );
+    Ok(())
 }
 
 /// Voice-band roundtrip: 200 Hz fundamental with 4 decaying harmonics
@@ -369,7 +374,7 @@ fn make_voice_chunk(t0_samples: usize) -> [f32; 160] {
 }
 
 #[test]
-fn voice_band_200hz_roundtrip_correlation() {
+fn voice_band_200hz_roundtrip_correlation() -> Result<(), Box<dyn std::error::Error>> {
     let mut enc = AmbeEncoder::new();
     let mut dec = AmbeDecoder::new();
 
@@ -381,10 +386,13 @@ fn voice_band_200hz_roundtrip_correlation() {
     for f in 0..frames {
         let chunk = make_voice_chunk(t0);
         input_pcm.extend_from_slice(&chunk);
-        let ambe = enc.encode_frame(&chunk);
+        let ambe = enc.encode_frame(&PcmFrame::new(chunk)?);
         // Diagnostic: dump first 5 stable-state frames after warm-up.
         if (10..15).contains(&f) {
-            let (b, w0, big_l, _) = mbelib_rs::decode_trace(&ambe);
+            let trace = mbelib_rs::decode_trace(&ambe);
+            let b = trace.parameters();
+            let w0 = trace.angular_frequency_rad();
+            let big_l = trace.harmonics();
             let f0_hz = w0 * 8000.0 / (2.0 * std::f32::consts::PI);
             eprintln!(
                 "voice frame {}: b0={} (f0={:.0}Hz, L={}), b1={}, b2={}, b3={}, b4={}, b5..b8={},{},{},{}",
@@ -471,6 +479,7 @@ fn voice_band_200hz_roundtrip_correlation() {
         max_ncc > 0.0,
         "voice-band encode→decode produced zero or anti-correlated output: {max_ncc:.4}"
     );
+    Ok(())
 }
 
 /// Self-golden pin of the encoder's steady-state wire output for the
@@ -487,16 +496,17 @@ fn voice_band_200hz_roundtrip_correlation() {
 /// known-broken spectral path included). It is a drift alarm, not a
 /// correctness claim.
 #[test]
-fn steady_state_wire_output_for_voice_band_signal_is_pinned() {
+fn steady_state_wire_output_for_voice_band_signal_is_pinned()
+-> Result<(), Box<dyn std::error::Error>> {
     let mut enc = AmbeEncoder::new();
     let mut t0 = 0_usize;
     let mut steady: Vec<([usize; 9], usize)> = Vec::new();
     for f in 0..13 {
-        let ambe = enc.encode_frame(&make_voice_chunk(t0));
+        let ambe = enc.encode_frame(&PcmFrame::new(make_voice_chunk(t0))?);
         t0 += 160;
         if f >= 10 {
-            let (b, _w0, big_l, _d) = mbelib_rs::decode_trace(&ambe);
-            steady.push((b, big_l));
+            let trace = mbelib_rs::decode_trace(&ambe);
+            steady.push((trace.parameters(), trace.harmonics()));
         }
     }
     let expected: Vec<([usize; 9], usize)> = vec![
@@ -508,26 +518,28 @@ fn steady_state_wire_output_for_voice_band_signal_is_pinned() {
         steady, expected,
         "steady-state encoder wire output drifted from the pinned b-vectors"
     );
+    Ok(())
 }
 
 /// Sine input and zero input must produce DIFFERENT AMBE frames.
 /// If the encoder outputs the same bytes for both, it's collapsing
 /// any signal to a silence-equivalent pattern.
 #[test]
-fn sine_input_differs_from_zero_input_encoding() {
+fn sine_input_differs_from_zero_input_encoding() -> Result<(), Box<dyn std::error::Error>> {
     let mut enc_sine = AmbeEncoder::new();
     let mut enc_zero = AmbeEncoder::new();
     let mut t0 = 0_usize;
     for _ in 0..8 {
-        let _ = enc_sine.encode_frame(&make_sine_chunk(t0));
-        let _ = enc_zero.encode_frame(&[0.0_f32; 160]);
+        let _ = enc_sine.encode_frame(&PcmFrame::new(make_sine_chunk(t0))?);
+        let _ = enc_zero.encode_frame(&PcmFrame::new([0.0_f32; 160])?);
         t0 += 160;
     }
-    let ambe_sine = enc_sine.encode_frame(&make_sine_chunk(t0));
-    let ambe_zero = enc_zero.encode_frame(&[0.0_f32; 160]);
+    let ambe_sine = enc_sine.encode_frame(&PcmFrame::new(make_sine_chunk(t0))?);
+    let ambe_zero = enc_zero.encode_frame(&PcmFrame::new([0.0_f32; 160])?);
     assert_ne!(
         ambe_sine, ambe_zero,
         "encoder emitted identical AMBE bytes for sine and zero input: \
          sine={ambe_sine:02x?} zero={ambe_zero:02x?}. V/UV or gain path is collapsing all inputs."
     );
+    Ok(())
 }

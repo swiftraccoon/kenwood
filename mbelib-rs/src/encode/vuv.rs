@@ -45,6 +45,7 @@
 
 use realfft::num_complex::Complex;
 
+use super::stage::{FundamentalBin, PitchMetric, Spectrum, StageError, StageField};
 use crate::encode::spectral::{MAX_HARMONICS, SpectralAmplitudes};
 use crate::encode::wr_sp::{WR_SP, WR_SP_CENTER};
 
@@ -86,15 +87,52 @@ impl Default for VuvState {
 }
 
 /// Per-frame V/UV decision vector.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VuvDecisions {
     /// `true` = voiced band (periodic content dominates), `false` =
     /// unvoiced (noise-like). Only the first `num_bands` entries
     /// are valid; the rest are padding zeros.
-    pub voiced: [bool; MAX_BANDS],
+    pub(crate) voiced: [bool; MAX_BANDS],
     /// Number of active harmonic bands for this frame (derived from
     /// the pitch).
-    pub num_bands: usize,
+    pub(crate) num_bands: usize,
+}
+
+impl VuvDecisions {
+    /// Validate an active band count and false inactive padding.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StageError::Count`] above twelve bands or
+    /// [`StageError::Padding`] for a voiced inactive band.
+    pub fn new(voiced: [bool; MAX_BANDS], num_bands: usize) -> Result<Self, StageError> {
+        if num_bands > MAX_BANDS {
+            return Err(StageError::Count {
+                field: StageField::Voicing,
+                actual: num_bands,
+                maximum: MAX_BANDS,
+            });
+        }
+        for (index, &value) in voiced.iter().enumerate().skip(num_bands) {
+            if value {
+                return Err(StageError::Padding {
+                    field: StageField::Voicing,
+                    index,
+                });
+            }
+        }
+        Ok(Self { voiced, num_bands })
+    }
+    /// Borrow all band decisions, including inactive padding.
+    #[must_use]
+    pub const fn voiced(&self) -> &[bool; MAX_BANDS] {
+        &self.voiced
+    }
+    /// Return the active band count.
+    #[must_use]
+    pub const fn num_bands(self) -> usize {
+        self.num_bands
+    }
 }
 
 /// Stateless one-shot V/UV convenience wrapper.
@@ -105,11 +143,22 @@ pub struct VuvDecisions {
 /// simple "classify this spectrum" call; the encoder itself uses
 /// [`detect_vuv_and_sa`] directly so that hysteresis + ``th_max`` carry
 /// across frames.
-#[must_use]
-pub fn detect_vuv(fft_out: &[Complex<f32>], f0_bin: f32) -> VuvDecisions {
+///
+/// # Errors
+///
+/// Returns the numerical errors documented by [`detect_vuv_and_sa`].
+pub fn detect_vuv(
+    spectrum: &Spectrum,
+    fundamental: FundamentalBin,
+) -> Result<VuvDecisions, StageError> {
     let mut state = VuvState::new();
-    let (vuv, _sa) = detect_vuv_and_sa(fft_out, f0_bin, &mut state, 0.5);
-    vuv
+    let (vuv, _sa) = detect_vuv_and_sa(spectrum, fundamental, &mut state, PitchMetric::HALF)?;
+    Ok(vuv)
+}
+
+#[cfg(test)]
+fn detect_vuv_kernel(spectrum: &[Complex<f32>], fundamental: f32) -> VuvDecisions {
+    detect_vuv_and_sa_kernel(spectrum, fundamental, &mut VuvState::new(), 0.5).0
 }
 
 /// Integrated V/UV + spectral amplitude extraction.
@@ -124,7 +173,32 @@ pub fn detect_vuv(fft_out: &[Complex<f32>], f0_bin: f32) -> VuvDecisions {
 /// pitch tracker); passing a large value (`> 0.55`) disables voicing
 /// in all but the first band: the pitch quality is too low to trust
 /// the harmonic model.
-#[must_use]
+///
+/// # Errors
+///
+/// Returns [`StageError`] when arithmetic produces nonfinite power/magnitudes
+/// or an invalid derived count. The supplied state changes only after a complete
+/// validated result; no partial hysteresis update escapes rejection.
+pub fn detect_vuv_and_sa(
+    spectrum: &Spectrum,
+    fundamental: FundamentalBin,
+    state: &mut VuvState,
+    error: PitchMetric,
+) -> Result<(VuvDecisions, SpectralAmplitudes), StageError> {
+    let mut next = *state;
+    let (voicing, amplitudes) =
+        detect_vuv_and_sa_kernel(spectrum.bins(), fundamental.get(), &mut next, error.get());
+    let voicing = VuvDecisions::new(voicing.voiced, voicing.num_bands)?;
+    let amplitudes = SpectralAmplitudes::new(amplitudes.magnitudes, amplitudes.num_harmonics)?;
+    if !next.th_max.is_finite() {
+        return Err(StageError::ArithmeticRange {
+            field: StageField::Spectrum,
+        });
+    }
+    *state = next;
+    Ok((voicing, amplitudes))
+}
+
 #[expect(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
@@ -145,7 +219,7 @@ pub fn detect_vuv(fft_out: &[Complex<f32>], f0_bin: f32) -> VuvDecisions {
               earlier `m_num[kk]`/`sc_coef[kk]` entries while the per-`k` slots would \
               still be mutably borrowed by the zip."
 )]
-pub fn detect_vuv_and_sa(
+pub(crate) fn detect_vuv_and_sa_kernel(
     fft_out: &[Complex<f32>],
     f0_bin: f32,
     state: &mut VuvState,
@@ -416,18 +490,8 @@ fn wr_sp_sample(bin: usize, harmonic_center: f32) -> f32 {
 /// `voiced_sa_calc(M_num, M_den)` where `M_den` is `sc_coef =
 /// 1 / Σ wr_sp²`.
 ///
-/// **OP25-exact port (April 2026):** the prior pure-`sqrt(num/den)` form
-/// produced sa values 800× smaller than OP25's int16-scale sa[]. The
-/// downstream `compute_lsa` then needed `SA_SCALE = 32768` to inflate
-/// log2(sa) into OP25's working range, but that pre-multiplication
-/// inflates strong AND weak harmonics non-uniformly relative to
-/// OP25's M_den-dependent scaling. Direct frame-by-frame diff against
-/// OP25's `imbe_param->sa[]` (via the standalone `op25_dump` harness)
-/// showed this crate's voiced-harmonic values trail OP25's by exactly the
-/// factor `512 * sqrt(2) / M_den`, the magnitude of OP25's
-/// `voiced_sa_calc(num, den) = (Word16)(2*256*sqrt(2*num/den))`
-/// formula. Restoring that factor here aligns voiced sa with OP25
-/// and lets `SA_SCALE` drop to 1 in the lsa stage.
+/// Uses OP25's `2 * 256 * sqrt(2 * num / den)` scale before the
+/// downstream logarithmic quantization.
 #[inline]
 fn voiced_sa_calc(m_num: f32, sc: f32) -> f32 {
     // OP25 fixed-point form: `(Word16)(2 * 256 * sqrt(2 * num / den))`
@@ -464,7 +528,10 @@ fn unvoiced_sa_calc(m_num: f32, bin_count: usize) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_BANDS, VuvState, detect_vuv, detect_vuv_and_sa};
+    use super::{
+        FundamentalBin, MAX_BANDS, PitchMetric, Spectrum, VuvState,
+        detect_vuv_and_sa_kernel as detect_vuv_and_sa, detect_vuv_kernel as detect_vuv,
+    };
     use realfft::num_complex::Complex;
 
     /// A silent spectrum is classified as entirely unvoiced (all
@@ -630,5 +697,29 @@ mod tests {
             total > 0.0,
             "integrated SA all zero on harmonic input ({amps:?})"
         );
+    }
+
+    #[test]
+    fn rejected_numerical_result_does_not_commit_hysteresis()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut bins = [Complex::new(0.0, 0.0); 129];
+        bins[6] = Complex::new(f32::MAX.sqrt() * 0.8, 0.0);
+        let spectrum = Spectrum::new(bins)?;
+        let mut state = VuvState::new();
+        let before_power = state.th_max.to_bits();
+        let before_voicing = state.prev_voiced;
+        let result = super::detect_vuv_and_sa(
+            &spectrum,
+            FundamentalBin::new(6.4)?,
+            &mut state,
+            PitchMetric::new(0.0)?,
+        );
+        assert!(
+            result.is_err(),
+            "extreme finite spectrum must reject overflowing integrated magnitude: {result:?}"
+        );
+        assert_eq!(state.th_max.to_bits(), before_power);
+        assert_eq!(state.prev_voiced, before_voicing);
+        Ok(())
     }
 }

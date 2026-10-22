@@ -6,8 +6,7 @@
 //!
 //! Port of the signal-conditioning and FFT section of
 //! `imbe_vocoder::encode()` in OP25. Accepts one 160-sample PCM frame
-//! (16 kHz-equivalent energy, i.e. i16 inputs normalized to `[-1,
-//! 1)`) and produces:
+//! at 8 kHz, normalized to inclusive `[-1, 1]`, and produces:
 //!
 //! 1. updated pitch-history buffers (DC-removed in `pitch_ref_buf`,
 //!    LPF'd in `pitch_est_buf`), ready for downstream pitch estimation
@@ -15,50 +14,51 @@
 //!    `pitch_ref_buf[150]`, ready for pitch refinement and spectral
 //!    amplitude extraction
 //!
-//! The pitch-estimation step (`pitch_est()`) itself runs in phase P3
-//! and consumes `pitch_est_buf`. Phase P4 consumes the FFT output.
+//! Pitch estimation consumes the updated history; voicing and magnitude
+//! extraction consume the returned spectrum.
 
 use realfft::RealFftPlanner;
 use realfft::num_complex::Complex;
 
-#[cfg(not(feature = "kenwood-tables"))]
+use super::stage::{SPECTRUM_BINS, Spectrum};
+use crate::PcmFrame;
 use crate::encode::dc_rmv::dc_rmv;
 use crate::encode::pe_lpf::pe_lpf;
-use crate::encode::state::{EncoderBuffers, FFT_LENGTH, FRAME, PITCH_EST_BUF_SIZE};
+use crate::encode::state::{EncoderBuffers, FFT_LENGTH, FRAME, InputFilter, PITCH_EST_BUF_SIZE};
 use crate::encode::window::WR_HALF;
 
 /// Per-stream FFT planning cache.
 ///
-/// Plans are thread-bound in `realfft`; one plan is kept per
-/// encoder instance rather than re-planning every frame. Each call
-/// to [`analyze_frame`] borrows the planner through a `&mut`.
+/// Each encoder retains its plans and reusable scratch across frames.
+/// The cache implements `Send` and `Sync`; [`analyze_frame`] requires
+/// exclusive access while updating it.
 pub struct FftPlan {
-    planner: RealFftPlanner<f32>,
-    /// Scratch buffer the realfft plan uses internally. Sized by the
-    /// plan on first use.
+    fft: std::sync::Arc<dyn realfft::RealToComplex<f32>>,
+    /// Scratch allocated when the fixed-size plan is constructed.
     scratch: Vec<Complex<f32>>,
+    input: [f32; FFT_LENGTH],
 }
 
 impl std::fmt::Debug for FftPlan {
-    // `RealFftPlanner` does not implement `Debug` (upstream choice:
-    // the FFTW-style plans hold runtime codegen state). We print the
-    // cached scratch size instead so debug output remains useful.
+    // Identify the planner type and report the reusable scratch length.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FftPlan")
-            .field("planner", &"RealFftPlanner<f32> { .. }")
+            .field("fft_length", &FFT_LENGTH)
             .field("scratch_len", &self.scratch.len())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
 impl FftPlan {
-    /// Construct a fresh FFT plan cache. Cheap; the actual plan is
-    /// built lazily on the first [`analyze_frame`] call.
+    /// Construct the fixed 256-point FFT plan and allocate its scratch once.
     #[must_use]
     pub fn new() -> Self {
+        let fft = RealFftPlanner::<f32>::new().plan_fft_forward(FFT_LENGTH);
+        let scratch = fft.make_scratch_vec();
         Self {
-            planner: RealFftPlanner::<f32>::new(),
-            scratch: Vec::new(),
+            fft,
+            scratch,
+            input: [0.0; FFT_LENGTH],
         }
     }
 }
@@ -71,77 +71,55 @@ impl Default for FftPlan {
 
 /// Ingest one 160-sample frame and run the front-end analysis.
 ///
-/// - `snd` is the new audio frame as f32 samples in nominal `[-1, 1)`.
-///   Callers converting from i16 should divide by 32768.0.
+/// - `snd` is one checked finite frame in inclusive `[-1,1]`.
 /// - `bufs` is the per-stream working state; buffers are shifted and
 ///   updated in place.
 /// - `plan` carries the realfft plan cache.
-/// - `fft_out` receives a complex spectrum of length `FFT_LENGTH / 2 + 1`
+/// - The returned spectrum contains `FFT_LENGTH / 2 + 1`
 ///   = 129. Realfft returns only the non-redundant half of the
 ///   Hermitian-symmetric complex FFT; for the purposes of pitch
 ///   refinement and spectral amplitude extraction that's sufficient.
 ///
-/// # Panics
-///
-/// Panics if `snd.len() < FRAME` or `fft_out.len() != FFT_LENGTH / 2 + 1`.
-/// Both are caller contracts; the downstream encoder controls both.
-pub fn analyze_frame(
-    snd: &[f32],
+/// Processing reuses the plan's input/scratch storage and allocates no heap
+/// buffer. See the [checked PCM workflow](crate#checked-pcm).
+#[must_use]
+pub fn analyze_frame(snd: &PcmFrame, bufs: &mut EncoderBuffers, plan: &mut FftPlan) -> Spectrum {
+    let mut output = [Complex::new(0.0, 0.0); SPECTRUM_BINS];
+    analyze_kernel(snd.samples(), bufs, plan, &mut output);
+    Spectrum(output)
+}
+
+pub(crate) fn analyze_kernel(
+    snd: &[f32; FRAME],
     bufs: &mut EncoderBuffers,
     plan: &mut FftPlan,
-    fft_out: &mut [Complex<f32>],
+    fft_out: &mut [Complex<f32>; SPECTRUM_BINS],
 ) {
-    assert!(
-        snd.len() >= FRAME,
-        "analyze_frame: snd must contain at least FRAME samples",
-    );
-    assert_eq!(
-        fft_out.len(),
-        FFT_LENGTH / 2 + 1,
-        "analyze_frame: fft_out must be FFT_LENGTH/2 + 1 complex bins",
-    );
-
     // Step 1: slide both pitch-history buffers one frame left to make
     // room for the new samples at the tail.
     bufs.shift_pitch_history();
 
-    // Step 2: input conditioning. Remove DC (plus, when Kenwood
-    // tables are enabled, everything below ≈345 Hz) and write the
-    // result into `pitch_ref_buf`'s tail. The default path uses
-    // OP25's 13 Hz first-order HPF; the `kenwood-tables` path uses
-    // the radio's own 345 Hz biquad HPF (zeros on the unit circle
-    // at DC, corner ≈345 Hz) which rejects rumble entirely before
-    // pitch analysis sees it. Either way, the tail slice of
-    // `pitch_ref_buf` is what downstream pitch refinement + FFT
-    // stages read; swapping the filter doesn't change the data
-    // flow, only the frequency response of the input.
+    // Input conditioning uses the explicitly selected coefficient path.
     let tail_start = PITCH_EST_BUF_SIZE - FRAME;
-    // The length assert at the top of this function guarantees the
-    // split below cannot panic.
-    let (frame, _) = snd.split_at(FRAME);
+    let frame = snd;
     let (prefix, tail) = bufs.pitch_ref_buf.split_at_mut(tail_start);
     let _ = prefix; // keeping older history intact
-    #[cfg(not(feature = "kenwood-tables"))]
-    dc_rmv(frame, tail, &mut bufs.dc_rmv_mem);
-    #[cfg(feature = "kenwood-tables")]
-    crate::encode::kenwood::filter::biquad_df1_section(
-        &crate::encode::kenwood::biquads::HPF_345HZ_COEFFS,
-        frame,
-        tail,
-        &mut bufs.kenwood_hpf_mem,
-    );
+    match bufs.input_filter {
+        InputFilter::Reference => dc_rmv(frame, tail, &mut bufs.dc_rmv_mem),
+        #[cfg(feature = "kenwood-tables")]
+        InputFilter::Kenwood => crate::encode::kenwood::filter::biquad_df1_section(
+            &crate::encode::kenwood::biquads::HPF_345HZ_COEFFS,
+            frame,
+            tail,
+            &mut bufs.kenwood_hpf_mem,
+        ),
+    }
 
     // Step 3: apply the pitch-estimation LPF from pitch_ref_buf into
-    // pitch_est_buf (both in the same tail slot). We can't borrow
-    // `bufs.pitch_ref_buf` and `bufs.pitch_est_buf` mutably together,
-    // so copy the DC-removed samples into a small scratch vec first.
-    let dc_removed_tail: Vec<f32> = bufs
-        .pitch_ref_buf
-        .get(tail_start..)
-        .map(<[f32]>::to_vec)
-        .unwrap_or_default();
+    // pitch_est_buf, borrowing the distinct history fields directly.
+    let dc_removed_tail = bufs.pitch_ref_buf.get(tail_start..).unwrap_or_default();
     let (_, est_tail) = bufs.pitch_est_buf.split_at_mut(tail_start);
-    pe_lpf(&dc_removed_tail, est_tail, &mut bufs.pe_lpf_mem);
+    pe_lpf(dc_removed_tail, est_tail, &mut bufs.pe_lpf_mem);
 
     // Step 4: build a 256-sample real-input buffer with Yazev's
     // scatter layout: windowed signal at indices [146..256] and
@@ -149,7 +127,8 @@ pub fn analyze_frame(
     // 221-sample analysis window at index 0 of the FFT input (time
     // domain) so the spectrum comes out with zero group delay for the
     // center sample.
-    let mut real_buf = vec![0.0_f32; FFT_LENGTH];
+    plan.input.fill(0.0);
+    let real_buf = &mut plan.input;
     // [146..256] ← pitch_ref_buf[40..150] × WR_HALF[0..110]
     for i in 0..110 {
         let sig = *bufs.pitch_ref_buf.get(40 + i).unwrap_or(&0.0);
@@ -172,18 +151,13 @@ pub fn analyze_frame(
     }
     // [111..146] already zero.
 
-    // Step 5: forward FFT. RealFftPlanner reuses a plan per length;
-    // the first call per-stream is O(FFT_LENGTH log FFT_LENGTH)
-    // planning cost, subsequent calls reuse.
-    let fft = plan.planner.plan_fft_forward(FFT_LENGTH);
-    let scratch_len = fft.get_scratch_len();
-    if plan.scratch.len() < scratch_len {
-        plan.scratch.resize(scratch_len, Complex::new(0.0, 0.0));
-    }
+    // Step 5: forward FFT using the plan and scratch allocated at construction.
     // realfft returns an error on length mismatch; our lengths are
     // invariant so we handle it by zeroing output on any unexpected
     // failure rather than propagating.
-    let result = fft.process_with_scratch(&mut real_buf, fft_out, &mut plan.scratch);
+    let result = plan
+        .fft
+        .process_with_scratch(real_buf, fft_out, &mut plan.scratch);
     if result.is_err() {
         for bin in fft_out.iter_mut() {
             *bin = Complex::new(0.0, 0.0);
@@ -193,15 +167,15 @@ pub fn analyze_frame(
 
 #[cfg(test)]
 mod tests {
-    use super::{FFT_LENGTH, FRAME, FftPlan, analyze_frame};
+    use super::{FFT_LENGTH, FRAME, FftPlan, analyze_kernel as analyze_frame};
     use crate::encode::state::EncoderBuffers;
     use realfft::num_complex::Complex;
 
-    fn fresh_state() -> (EncoderBuffers, FftPlan, Vec<Complex<f32>>) {
+    fn fresh_state() -> (EncoderBuffers, FftPlan, [Complex<f32>; 129]) {
         (
             EncoderBuffers::new(),
             FftPlan::new(),
-            vec![Complex::new(0.0, 0.0); FFT_LENGTH / 2 + 1],
+            [Complex::new(0.0, 0.0); FFT_LENGTH / 2 + 1],
         )
     }
 
@@ -227,17 +201,15 @@ mod tests {
         let sample_rate = 8000.0_f32;
         // Run 5 frames to let transients settle.
         for frame_idx in 0..5 {
-            let snd: Vec<f32> = (0..FRAME)
-                .map(|i| {
-                    #[expect(
-                        clippy::cast_precision_loss,
-                        reason = "test tone generator: frame_idx * FRAME + i stays under \
+            let snd: [f32; FRAME] = std::array::from_fn(|i| {
+                #[expect(
+                    clippy::cast_precision_loss,
+                    reason = "test tone generator: frame_idx * FRAME + i stays under \
                                   5 * 160 = 800, far below f32 mantissa precision."
-                    )]
-                    let t = (frame_idx * FRAME + i) as f32;
-                    (t * 2.0 * std::f32::consts::PI * freq_hz / sample_rate).sin()
-                })
-                .collect();
+                )]
+                let t = (frame_idx * FRAME + i) as f32;
+                (t * 2.0 * std::f32::consts::PI * freq_hz / sample_rate).sin()
+            });
             analyze_frame(&snd, &mut bufs, &mut plan, &mut fft_out);
         }
 

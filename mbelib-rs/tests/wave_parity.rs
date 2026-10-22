@@ -31,7 +31,7 @@ fn forward_pass_matches_training_checkpoint() -> TestResult {
     let expected = all.get(n..2 * n).ok_or("short expected")?;
 
     let enhancer = WaveEnhancer::new()?;
-    let output = enhancer.process_f32(input);
+    let output = enhancer.process_f32(mbelib_rs::PcmSamples::new(input)?);
     assert_eq!(output.len(), expected.len());
 
     let mut max_diff = 0.0_f32;

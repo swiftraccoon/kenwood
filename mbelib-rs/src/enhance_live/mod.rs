@@ -704,9 +704,12 @@ impl LiveWaveEnhancer {
     /// Float-domain batch processing (unit-scale samples). The parity
     /// test drives this directly against the training checkpoint's
     /// output.
+    ///
+    /// Allocates spectra, network intermediates and a returned vector proportional
+    /// to the complete clip. Use [`Self::stream`] for bounded retained history.
     #[must_use]
-    pub fn process_f32(&self, samples: &[f32]) -> Vec<f32> {
-        self.model.process_f32(samples)
+    pub fn process_f32(&self, samples: crate::PcmSamples<'_>) -> Vec<f32> {
+        self.model.process_f32(samples.as_slice())
     }
 
     /// Begin a streaming session sharing this enhancer's weights.
@@ -873,17 +876,30 @@ impl LiveWaveStream {
     /// concatenation of all per-push outputs plus
     /// [`finish_f32`](Self::finish_f32) equals
     /// [`LiveWaveEnhancer::process_f32`] of the concatenated input.
+    ///
+    /// Input is processed in 64-sample hops. Retained staging, padding and
+    /// holdback storage stay bounded independently of the caller's block length;
+    /// the returned vector owns all samples released by this call and scales
+    /// with that output. Invalid samples are rejected by [`crate::PcmSamples`]
+    /// before this method can alter stream history.
     #[must_use]
-    pub fn push_samples_f32(&mut self, samples: &[f32]) -> Vec<f32> {
+    pub fn push_samples_f32(&mut self, samples: crate::PcmSamples<'_>) -> Vec<f32> {
         if self.pure_i16 {
             self.pure_i16 = false;
             self.stash.clear();
         }
-        for &s in samples {
-            self.ingest(s);
+        let mut output = Vec::new();
+        for block in samples.as_slice().chunks(HOP) {
+            for &sample in block {
+                self.ingest(sample);
+            }
+            self.pump();
+            if self.received >= RELEASE_MIN {
+                self.stash.clear();
+                output.append(&mut self.pending);
+            }
         }
-        self.pump();
-        self.drain_released()
+        output
     }
 
     /// Flush the tail and reset the session for reuse.
@@ -1295,5 +1311,43 @@ impl std::fmt::Debug for LiveWaveStream {
             .field("next_col", &self.next_col)
             .field("pending_samples", &self.pending.len())
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod standards_tests {
+    use super::*;
+
+    #[test]
+    fn large_input_blocks_preserve_chunk_output_and_bound_retained_capacity()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let enhancer = LiveWaveEnhancer::new()?;
+        let input = vec![0.125; 8192];
+        let mut whole = enhancer.stream();
+        let mut output = whole.push_samples_f32(crate::PcmSamples::new(&input)?);
+        for (name, capacity) in [
+            ("staging", whole.staging.capacity()),
+            ("padding", whole.pad_ring.capacity()),
+            ("pending", whole.pending.capacity()),
+            ("tail", whole.tail_ring.capacity()),
+        ] {
+            assert!(
+                capacity <= 4 * N_FFT,
+                "{name} capacity {capacity} depends on the caller's block length"
+            );
+        }
+        output.extend(whole.finish_f32());
+        let mut chunks = enhancer.stream();
+        let mut chunked = Vec::new();
+        for block in input.chunks(313) {
+            chunked.extend(chunks.push_samples_f32(crate::PcmSamples::new(block)?));
+        }
+        chunked.extend(chunks.finish_f32());
+        assert_eq!(
+            output, chunked,
+            "chunk boundaries must preserve identical stream arithmetic and output order"
+        );
+        assert_eq!(output.len(), input.len());
+        Ok(())
     }
 }

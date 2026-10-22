@@ -1,16 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Swift Raccoon
 // SPDX-License-Identifier: GPL-2.0-or-later
 //
-// Hardware-in-the-loop verification: every test in this file parses
-// real AMBE byte streams captured from a TH-D75 in D-STAR TX mode and
-// asserts that the captured data matches the structural and bit-level
-// findings codified in `src/encode/kenwood/anchors.rs`. The captures
-// in tests/fixtures/thd75/ are lawful artifacts of running
-// `AMBE_CAPTURE=<path>` on `thd75-repl` against an owned radio per
-// DMCA §1201(f).
-
-//! Hardware-in-the-loop bit-exact verification of the AMBE encoder
-//! against radio-captured anchors.
+//! Ignored capture-comparison probes for historical TH-D75 candidates.
 //!
 //! These tests exist on two tiers:
 //!
@@ -24,11 +15,11 @@
 //!    .ambe fixtures are not committed. Recapture from hardware, then
 //!    run these with `--ignored` to re-verify.
 //!
-//! 2. **Encoder-vs-anchor tests** (`#[ignore]`'d until the encoder is
-//!    Kenwood-perfect): synthesize a sinusoidal PCM stream at the
+//! 2. **Encoder-vs-candidate tests** (`#[ignore]`'d): synthesize a sinusoidal PCM stream at the
 //!    anchor frequency, run it through the Rust encoder, mask out
-//!    protocol-overhead bits, assert byte-for-byte equality with the
-//!    captured anchor.
+//!    stored mask positions, compare byte-for-byte with the candidate.
+//!    Capture recertification is required before interpreting a match or
+//!    mismatch as encoder correctness. XOR probes have no protocol meaning.
 //!
 //! Run all (including ignored) with:
 //! ```text
@@ -311,7 +302,7 @@ fn stable_bits_are_actually_stable_in_440hz_capture() -> TestResult {
     Ok(())
 }
 
-// ─── encoder-vs-anchor tests (ignored until encoder is Kenwood-perfect) ─
+// ─── ignored encoder comparisons against historical candidates ──────
 
 /// Synthesize a steady sinusoidal PCM stream at the given frequency.
 ///
@@ -369,9 +360,10 @@ fn synthesize_tone_with_noise(
 fn encode_to_ambe_frames(pcm: &[i16]) -> Vec<[u8; FRAME_LEN]> {
     use mbelib_rs::AmbeEncoder;
 
-    const SAMPLES_PER_FRAME: usize = 160;
     let mut encoder = AmbeEncoder::new_with_lookahead();
-    pcm.chunks_exact(SAMPLES_PER_FRAME)
+    pcm.as_chunks::<160>()
+        .0
+        .iter()
         .map(|chunk| encoder.encode_frame_i16(chunk))
         .collect()
 }
@@ -434,7 +426,9 @@ fn dewhiten_variance_within_one_capture() -> TestResult {
         for (byte, &w) in dewhitened.iter_mut().zip(whiten.iter().cycle()) {
             *byte ^= w;
         }
-        let (b, _, l, _) = decode_trace(&dewhitened);
+        let trace = decode_trace(&dewhitened);
+        let b = trace.parameters();
+        let l = trace.harmonics();
         let key = (b[0], b[1], l);
         *seen.entry(key).or_insert(0) += 1;
         if idx < 30 {
@@ -457,10 +451,7 @@ fn dewhiten_variance_within_one_capture() -> TestResult {
     Ok(())
 }
 
-/// Verify the firmware whitening hypothesis on ALL 4 anchors. If
-/// XOR with cycled 0x704F9340 produces sensible b0/L for every anchor
-/// AND closely matches our self-encoded values, the whitener IS the
-/// wire-format adapter.
+/// Print the historical XOR transform for all four stored candidates.
 ///
 /// Run with `cargo test ... -- --ignored --nocapture
 /// confirm_whitener_on_all_anchors`.
@@ -480,7 +471,9 @@ fn confirm_whitener_on_all_anchors() {
         for (byte, &w) in dewhitened.iter_mut().zip(whiten.iter().cycle()) {
             *byte ^= w;
         }
-        let (b, _, l, _) = decode_trace(&dewhitened);
+        let trace = decode_trace(&dewhitened);
+        let b = trace.parameters();
+        let l = trace.harmonics();
 
         println!(
             "  {:>4} | {} | {} | b0={:>3} b1={:>2} b2={:>2} b3={:>3} b4={:>3} L={}",
@@ -501,7 +494,9 @@ fn confirm_whitener_on_all_anchors() {
         let pcm = synthesize_tone_pcm(anchor.frequency_hz, 150, 16384);
         let frames = encode_to_ambe_frames(&pcm);
         let mid = frames.get(100).copied().unwrap_or([0; 9]);
-        let (b, _, l, _) = decode_trace(&mid);
+        let trace = decode_trace(&mid);
+        let b = trace.parameters();
+        let l = trace.harmonics();
         println!(
             "  {:>4} |                         {} | b0={:>3} b1={:>2} b2={:>2} b3={:>3} b4={:>3} L={}",
             anchor.frequency_hz,
@@ -533,7 +528,9 @@ fn probe_kenwood_wire_format() -> TestResult {
 
     // Helper: try a transformation, decode, print result
     let try_one = |label: &str, transformed: [u8; 9]| {
-        let (b, _, l, _) = decode_trace(&transformed);
+        let trace = decode_trace(&transformed);
+        let b = trace.parameters();
+        let l = trace.harmonics();
         let b0_voice = b[0] < 120;
         let l_plausible = l > 0 && l <= 56;
         let marker = if b0_voice && l_plausible {
@@ -571,7 +568,7 @@ fn probe_kenwood_wire_format() -> TestResult {
     }
     try_one("bits-reversed-all", all_bits_rev);
 
-    // 5. XOR with 0x704F9340 cycled (firmware whitening pattern)
+    // 5. Historical diagnostic XOR pattern, without protocol interpretation.
     let whiten: [u8; 4] = [0x70, 0x4F, 0x93, 0x40];
     let mut whitened = [0_u8; 9];
     for (dst, (&b, &w)) in whitened
@@ -591,10 +588,7 @@ fn probe_kenwood_wire_format() -> TestResult {
     Ok(())
 }
 
-/// Sanity check: decode our OWN encoder output and confirm it round-trips
-/// to sensible b0..b8 values. If this works but the Kenwood capture
-/// decode produces b0=126 (erasure), Kenwood uses a different wire
-/// format than DSD/mbelib.
+/// Print decoded fields of generated encoder output and one capture candidate.
 ///
 /// Run with `cargo test ... -- --ignored --nocapture self_round_trip_b_fields`.
 #[test]
@@ -613,7 +607,10 @@ fn self_round_trip_b_fields() -> TestResult {
     let mid = frames
         .get(100)
         .ok_or("encoder emitted at least 101 frames")?;
-    let (b, w0, l, _) = decode_trace(mid);
+    let trace = decode_trace(mid);
+    let b = trace.parameters();
+    let w0 = trace.angular_frequency_rad();
+    let l = trace.harmonics();
     println!("  raw frame: {}", hex9(mid));
     println!(
         "  b0={} b1={} b2={} b3={} b4={} b5={} b6={} b7={} b8={}",
@@ -623,7 +620,10 @@ fn self_round_trip_b_fields() -> TestResult {
     println!();
     println!("Same operation on Kenwood 210 Hz capture's dominant frame:");
     let kenwood = anchor_for(210.0).ok_or("anchor")?.raw_dominant_frame;
-    let (b, w0, l, _) = decode_trace(&kenwood);
+    let trace = decode_trace(&kenwood);
+    let b = trace.parameters();
+    let w0 = trace.angular_frequency_rad();
+    let l = trace.harmonics();
     println!("  raw frame: {}", hex9(&kenwood));
     println!(
         "  b0={} b1={} b2={} b3={} b4={} b5={} b6={} b7={} b8={}",
@@ -661,7 +661,9 @@ fn probe_b2_with_varied_inputs() {
             println!("  {label:<26} | empty second half");
             return;
         };
-        let (b, _, l, _) = decode_trace(dom);
+        let trace = decode_trace(dom);
+        let b = trace.parameters();
+        let l = trace.harmonics();
         println!(
             "  {label:<26} |   {:>3} {:>2} {:>2} {:>3} {:>2}",
             b[0], b[1], b[2], b[3], l
@@ -750,7 +752,9 @@ fn sweep_noise_floor() {
         let Some((dom, _)) = counts.iter().max_by_key(|&(_, &n)| n) else {
             continue;
         };
-        let (b, _, l, _) = decode_trace(dom);
+        let trace = decode_trace(dom);
+        let b = trace.parameters();
+        let l = trace.harmonics();
         println!(
             "  {:>5} | {:>6.1}  | {:>3} {:>2} {:>2} {:>3} {:>3} {:>2}",
             noise, snr_db, b[0], b[1], b[2], b[3], b[4], l
@@ -769,7 +773,7 @@ fn sweep_noise_floor() {
 fn sweep_amplitude_for_b2_match() {
     use mbelib_rs::decode_trace;
 
-    // Kenwood's b2 for 210 Hz is 48 per dewhitened decode.
+    // Historical transformed-candidate comparison target.
     const KENWOOD_B2: usize = 48;
 
     println!();
@@ -790,7 +794,9 @@ fn sweep_amplitude_for_b2_match() {
         let Some((dom, _)) = counts.iter().max_by_key(|&(_, &n)| n) else {
             continue;
         };
-        let (b, _, l, _) = decode_trace(dom);
+        let trace = decode_trace(dom);
+        let b = trace.parameters();
+        let l = trace.harmonics();
         let dist = i32::try_from(b[2]).unwrap_or(0) - i32::try_from(KENWOOD_B2).unwrap_or(0);
         let marker = if b[2] == KENWOOD_B2 { " ← MATCH" } else { "" };
         println!(
@@ -829,13 +835,16 @@ fn trace_210hz_b_fields() -> TestResult {
         .max_by_key(|&(_, &n)| n)
         .ok_or("non-empty encoder output")?;
 
-    let (rust_b, _, rust_l, _) = decode_trace(rust_dominant_raw);
-    // Dewhiten the Kenwood capture before decoding (firmware applies
-    // XOR 0x704F9340 cycled on the wire). Without this, ECC sees
-    // garbage and decode_trace produces erasure/silence values.
+    let rust_trace = decode_trace(rust_dominant_raw);
+    let rust_b = rust_trace.parameters();
+    let rust_l = rust_trace.harmonics();
+    // Apply the historical diagnostic transform to the stored candidate.
     let anchor = anchor_for(210.0).ok_or("210 Hz anchor")?;
-    let kenwood_dewhit = mbelib_rs::kenwood::anchors::apply_whitening(anchor.raw_dominant_frame);
-    let (anchor_b, _, anchor_l, _) = decode_trace(&kenwood_dewhit);
+    let kenwood_dewhit =
+        mbelib_rs::kenwood::anchors::apply_diagnostic_xor(anchor.raw_dominant_frame);
+    let anchor_trace = decode_trace(&kenwood_dewhit);
+    let anchor_b = anchor_trace.parameters();
+    let anchor_l = anchor_trace.harmonics();
 
     println!(
         "210 Hz Rust dominant raw : {} ({}/{} frames)",
@@ -877,8 +886,8 @@ fn trace_210hz_b_fields() -> TestResult {
 /// pitch_tracker_diagnostic`.
 #[test]
 #[ignore = "diagnostic; prints pitch-tracker output for each anchor"]
-fn pitch_tracker_diagnostic() {
-    use mbelib_rs::{EncoderBuffers, FftPlan, PitchTracker, analyze_frame};
+fn pitch_tracker_diagnostic() -> TestResult {
+    use mbelib_rs::{EncoderBuffers, FftPlan, PcmFrame, PitchTracker, analyze_frame};
 
     println!();
     println!("Pitch tracker output per anchor frequency:");
@@ -886,45 +895,43 @@ fn pitch_tracker_diagnostic() {
     let target_freqs = [210.0, 440.0, 550.0, 660.0];
     for freq in target_freqs {
         let pcm_int = synthesize_tone_pcm(freq, 80, 16384);
-        // Convert i16 PCM to f32 (the encoder API expects f32 in
-        // `i16::MAX`-amplitude scale).
-        let pcm_float: Vec<f32> = pcm_int.iter().map(|&s| f32::from(s)).collect();
+        let pcm_float: Vec<f32> = pcm_int.iter().map(|&s| f32::from(s) / 32768.0).collect();
 
         let mut bufs = EncoderBuffers::new();
         let mut plan = FftPlan::new();
-        let mut fft_out = vec![realfft::num_complex::Complex::new(0.0, 0.0); 129];
         let mut tracker = PitchTracker::new();
 
         // Walk the frames; print every 20th to keep output compact
         for (frame_idx, chunk) in pcm_float.chunks_exact(160).enumerate() {
-            analyze_frame(chunk, &mut bufs, &mut plan, &mut fft_out);
-            let est = tracker.estimate(bufs.pitch_est_buf());
+            let _spectrum = analyze_frame(&PcmFrame::try_from(chunk)?, &mut bufs, &mut plan);
+            let est = tracker.estimate(bufs.pitch_est_buf())?;
             if frame_idx == 0 || frame_idx == 39 || frame_idx == 79 {
                 println!(
                     "  {:>4} | {:>5} | {:>14.3} | {:>9.2} | {:>10.4}",
-                    freq, frame_idx, est.period_samples, est.f0_hz, est.confidence
+                    freq,
+                    frame_idx,
+                    est.period_samples(),
+                    est.f0_hz(),
+                    est.confidence()
                 );
             }
         }
     }
+    Ok(())
 }
 
-/// "True" Hamming distance after applying the firmware whitening adapter.
-/// Compares Rust encoder output XOR'd with the firmware whitener
-/// against Kenwood's raw dominant frame, byte-for-byte. This is the
-/// honest measure of how close we are to Kenwood-bit-exact in the
-/// firmware's own wire format.
+/// Print Hamming distance after the historical diagnostic XOR transform.
 ///
 /// Run with `cargo test ... -- --ignored --nocapture
 /// rust_encoder_distance_with_whitener`.
 #[test]
 #[ignore = "diagnostic; whitened comparison vs Kenwood raw frames"]
 fn rust_encoder_distance_with_whitener() {
-    use mbelib_rs::kenwood::anchors::apply_whitening;
+    use mbelib_rs::kenwood::anchors::apply_diagnostic_xor;
 
     let mut total = 0_u32;
     println!();
-    println!("Hamming distance: Rust encoder × firmware whitener vs Kenwood raw frame");
+    println!("Hamming distance after diagnostic XOR against stored candidate");
     println!("  freq | dist | rust whitened       | kenwood raw         | both decoded b0/L");
     for anchor in PITCH_ANCHORS {
         let pcm = synthesize_tone_pcm(anchor.frequency_hz, 150, 16384);
@@ -940,15 +947,19 @@ fn rust_encoder_distance_with_whitener() {
         let Some((rust_dom, _)) = counts.iter().max_by_key(|&(_, &n)| n) else {
             continue;
         };
-        let rust_whitened = apply_whitening(*rust_dom);
+        let rust_whitened = apply_diagnostic_xor(*rust_dom);
         let kenwood_raw = anchor.raw_dominant_frame;
 
         let dist = hamming_distance(rust_whitened, kenwood_raw);
         total += dist;
 
-        let (rb, _, rl, _) = mbelib_rs::decode_trace(rust_dom);
-        let kenwood_dewhit = apply_whitening(kenwood_raw);
-        let (kb, _, kl, _) = mbelib_rs::decode_trace(&kenwood_dewhit);
+        let rust_trace = mbelib_rs::decode_trace(rust_dom);
+        let rb = rust_trace.parameters();
+        let rl = rust_trace.harmonics();
+        let kenwood_dewhit = apply_diagnostic_xor(kenwood_raw);
+        let kenwood_trace = mbelib_rs::decode_trace(&kenwood_dewhit);
+        let kb = kenwood_trace.parameters();
+        let kl = kenwood_trace.harmonics();
 
         println!(
             "  {:>4} | {:>4} | {} | {} | rust b0={} L={}, kenwood b0={} L={}",

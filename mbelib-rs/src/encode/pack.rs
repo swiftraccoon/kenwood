@@ -22,6 +22,7 @@
 //! The output is a valid 9-byte AMBE wire frame suitable for the
 //! DSVT voice-data slot in the D-STAR frame.
 
+use super::stage::CodewordBits;
 use crate::encode::interleave::{AMBE_FRAME_BITS, INVERSE};
 use crate::unpack::demodulate_c1;
 
@@ -36,7 +37,7 @@ use crate::unpack::demodulate_c1;
 ///
 /// # Arguments
 ///
-/// - `ambe_fr`: a 72-element array where each byte holds a single bit
+/// - `bits`: a checked 72-element array where each byte holds a single bit
 ///   (0 or 1), laid out in FEC-codeword order (C0 at 0..24, C1 at
 ///   24..47, C2 at 47..58, C3 at 58..72). This is the *same* layout
 ///   `unpack_frame` writes into.
@@ -48,18 +49,25 @@ use crate::unpack::demodulate_c1;
 ///
 /// # Round-trip invariant
 ///
-/// For any `ambe_fr` produced by the decoder's `unpack_frame` +
-/// `demodulate_c1`, the following holds (see `tests` below):
+/// The codeword constructor rejects any element other than zero or one.
+/// This packs bits without checking whether their FEC parity is correct.
 ///
-/// ```text
-/// let mut fr = [0u8; 72];
-/// unpack_frame(&wire, &mut fr);
-/// demodulate_c1(&mut fr);
-/// let wire_round_trip = pack_frame(&fr);
-/// assert_eq!(wire, wire_round_trip);
+/// ```rust
+/// # #[cfg(feature = "encoder")]
+/// # {
+/// use mbelib_rs::{CodewordBits, decode_trace, pack_frame};
+/// let bits = CodewordBits::new([0; 72])?;
+/// let wire = pack_frame(&bits);
+/// assert_eq!(decode_trace(&wire).data_bits(), [0; 49]);
+/// # }
+/// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 #[must_use]
-pub fn pack_frame(ambe_fr: &[u8; AMBE_FRAME_BITS]) -> [u8; 9] {
+pub fn pack_frame(bits: &CodewordBits) -> [u8; 9] {
+    pack_kernel(bits.bits())
+}
+
+pub(crate) fn pack_kernel(ambe_fr: &[u8; AMBE_FRAME_BITS]) -> [u8; 9] {
     // Step 1: modulate C1 back to its on-wire scrambled form. The
     // decoder calls `demodulate_c1` after Golay-correcting C0; the
     // encoder must undo that scrambling before packing. XOR is its own
@@ -91,7 +99,7 @@ pub fn pack_frame(ambe_fr: &[u8; AMBE_FRAME_BITS]) -> [u8; 9] {
 
 #[cfg(test)]
 mod tests {
-    use super::{AMBE_FRAME_BITS, pack_frame};
+    use super::{AMBE_FRAME_BITS, pack_kernel as pack_frame};
     use crate::unpack::{demodulate_c1, unpack_frame};
     use proptest::prelude::*;
 

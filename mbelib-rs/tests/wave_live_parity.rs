@@ -6,6 +6,7 @@
 //! vector, and the streaming path must reproduce the batch path
 //! sample for sample.
 
+use mbelib_rs::PcmSamples;
 use mbelib_rs::enhance_live::LiveWaveEnhancer;
 
 // Compilation-unit dep acknowledgements (unused_crate_dependencies):
@@ -48,7 +49,7 @@ fn to_i16(v: f32) -> i16 {
 fn forward_pass_matches_training_checkpoint() -> TestResult {
     let (input, expected) = fixture()?;
     let enhancer = LiveWaveEnhancer::new()?;
-    let output = enhancer.process_f32(&input);
+    let output = enhancer.process_f32(PcmSamples::new(&input)?);
     assert_eq!(output.len(), expected.len());
 
     let mut max_diff = 0.0_f32;
@@ -101,14 +102,14 @@ fn streaming_i16_frames_match_batch_process() -> TestResult {
 fn streaming_f32_matches_batch_and_resets_for_reuse() -> TestResult {
     let (input, _) = fixture()?;
     let enhancer = LiveWaveEnhancer::new()?;
-    let batch = enhancer.process_f32(&input);
+    let batch = enhancer.process_f32(PcmSamples::new(&input)?);
 
     let mut stream = enhancer.stream();
     for pass in 0..2_u8 {
         let mut streamed: Vec<f32> = Vec::new();
         // Deliberately hop-unaligned pushes to exercise buffering.
         for chunk in input.chunks(313) {
-            streamed.extend(stream.push_samples_f32(chunk));
+            streamed.extend(stream.push_samples_f32(PcmSamples::new(chunk)?));
         }
         streamed.extend(stream.finish_f32());
         assert_eq!(streamed.len(), batch.len(), "pass {pass}: length");
@@ -131,12 +132,12 @@ fn partial_final_hop_flushes_to_full_length() -> TestResult {
     // 160-sample frame, so the tail flush handles a partial column.
     let head = input.get(..1000).ok_or("fixture too short")?;
     let enhancer = LiveWaveEnhancer::new()?;
-    let batch = enhancer.process_f32(head);
+    let batch = enhancer.process_f32(PcmSamples::new(head)?);
 
     let mut stream = enhancer.stream();
     let mut streamed: Vec<f32> = Vec::new();
     for chunk in head.chunks(160) {
-        streamed.extend(stream.push_samples_f32(chunk));
+        streamed.extend(stream.push_samples_f32(PcmSamples::new(chunk)?));
     }
     streamed.extend(stream.finish_f32());
 

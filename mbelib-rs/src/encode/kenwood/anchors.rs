@@ -1,105 +1,33 @@
 // SPDX-FileCopyrightText: 2026 Swift Raccoon
 // SPDX-License-Identifier: GPL-2.0-or-later
 //
-// Hardware-in-the-loop verification anchors for the Kenwood-exact
-// encoder. Each constant in this module was derived from radio-captured
-// AMBE bytes: TH-D75 in D-STAR TX mode, AMBE_CAPTURE env var directing
-// the firmware's encoded output to a file. The bit-level structure was
-// reverse-engineered by feeding the radio known sinusoidal tones via
-// the mic and observing which bits are stable (the actual voice
-// encoding) vs. volatile (slow-data interleave + Golay parity).
-
-//! Bit-exact verification anchors from TH-D75 radio captures.
+//! Historical TH-D75 capture candidates and byte-comparison helpers.
 //!
-//! For the Rust encoder to be "Kenwood-perfect" it must, given a
-//! synthesized sinusoidal input matching one of the captured tones,
-//! emit a 9-byte AMBE frame whose 58 stable bits ([`STABLE_BIT_MASK`])
-//! match the corresponding anchor in [`PITCH_ANCHORS`] byte-for-byte.
-//!
-//! ## Wire-format caveat (critical)
-//!
-//! Decoding a Kenwood 210 Hz raw dominant frame through
-//! [`crate::decode_trace`] produces `b0=126` (the AMBE erasure code),
-//! `L=0`, NOT a sensible 210 Hz pitch index. The same `decode_trace`
-//! recovers `b0=86, L=34` correctly when fed this encoder's output.
-//! Conclusion: **TH-D75 does not use the DSD/mbelib wire format**.
-//!
-//! Bit-mask comparison via [`STABLE_BIT_MASK`] is therefore a NECESSARY
-//! but not SUFFICIENT criterion: bit-identical wire bytes guarantee
-//! identical decoded fields only if both encoders use the same
-//! bit-permutation. Until the Kenwood interleaver (firmware
-//! `ambe_bit_interleaver` at 0x11815550) is ported, the masked
-//! comparison effectively measures byte-identity in two different
-//! coordinate systems.
-//!
-//! Order of operations to actually achieve "Kenwood-perfect":
-//!   1. Port the firmware interleaver to a `kenwood-tables` feature
-//!      branch (replaces DSD's `dW[72]/dX[72]`).
-//!   2. Re-derive [`STABLE_BIT_MASK`] / [`VOLATILE_BIT_MASK`] in the
-//!      Kenwood coordinate system (the volatility analysis remains
-//!      valid; only the bit positions translate).
-//!   3. Re-run [`PITCH_ANCHORS`] capture-vs-encoder comparison.
-//!
-//! ## Frame structure (validated against 6 distinct tone captures)
-//!
-//! - **9 bytes per voice frame, no header**, confirmed via stride-9
-//!   repetition in steady-state captures (99/99 frames byte-identical
-//!   in the 440 Hz 2nd half). This matches the firmware's
-//!   `radio_send_dsp_command_9b` IPC name identified during the
-//!   static RE pass. Captures begin at byte 0; nothing precedes the
-//!   first frame.
-//! - **14 of 72 bits volatile per frame**: 8 slow-data positions at
-//!   ~31% volatility + 6 FEC parity positions at ~11-18% volatility.
-//!   The Rust encoder is responsible for the 58 stable bits; slow-data
-//!   bits are protocol-layer state injected outside the codec.
-//!
-//! ## Volatility analysis
-//!
-//! Across the 197-frame 440 Hz capture, every bit position in
-//! [`VOLATILE_BIT_MASK`] flipped at least 11% of frames; every bit
-//! position in [`STABLE_BIT_MASK`] was constant. The same masks held
-//! across 210/550/660 Hz captures, confirming the volatility pattern
-//! is per-frame protocol overhead, not per-pitch.
+//! The stored candidates and masks come from captures whose framing has not
+//! been requalified. Their values remain available for diagnostic comparison;
+//! they are not firmware wire-format or encoder-correctness requirements.
+//! Recapture with verified framing before drawing protocol or audio conclusions.
+//! None of these candidates changes the encoder or decoder processing path.
 
 /// Length of one D-STAR voice frame in bytes (9 = 72 bits).
-///
-/// Matches the firmware-side IPC command name
-/// `radio_send_dsp_command_9b` at ARM address 0xC005D928.
 pub const FRAME_LEN: usize = 9;
 
-/// Candidate whitening pattern (32-bit, cycled), applied as
-/// `out[i] = in[i] ^ WHITENING[i % 4]`.
+/// Four-byte repeating XOR pattern for historical diagnostic transforms.
 ///
-/// Source: DSP firmware function at virtual address 0x118123E0.
-///
-/// # Superseded: do not apply to voice bytes
-///
-/// This was originally read as a firmware wire-format adapter between
-/// mbelib's AMBE bit order and the TH-D75's. That interpretation is
-/// wrong. The leading `0x70 0x4F 0x93` is the standard D-STAR slow-data
-/// scrambler sequence; it appeared to line up with voice bytes only
-/// because the captures under analysis had been sliced MSB-first. DVSI
-/// wire frames are LSB-first per byte, and once that is corrected a
-/// Kenwood capture decodes through the ordinary ECC pipeline with no
-/// dewhitening step at all.
-///
-/// [`apply_whitening`] is retained solely so the historical anchor
-/// analysis remains reproducible. It is not part of the encode path.
-pub const FIRMWARE_WHITENING: [u8; 4] = [0x70, 0x4F, 0x93, 0x40];
+/// This pattern is not a voice-frame wire-format adapter. It is used only
+/// by ignored capture probes, never by codec processing.
+pub const DIAGNOSTIC_XOR_PATTERN: [u8; 4] = [0x70, 0x4F, 0x93, 0x40];
 
-/// Apply the TH-D75 firmware whitening XOR to a 9-byte frame.
+/// XOR nine diagnostic bytes with the repeating [`DIAGNOSTIC_XOR_PATTERN`].
 ///
-/// Self-inverse: calling twice returns the original. Use to convert
-/// between mbelib wire format and TH-D75 wire format in either
-/// direction.
+/// Calling twice returns the original. This transform has no protocol
+/// interpretation and does not convert between voice-frame formats.
 #[must_use]
-pub fn apply_whitening(frame: [u8; FRAME_LEN]) -> [u8; FRAME_LEN] {
+pub fn apply_diagnostic_xor(frame: [u8; FRAME_LEN]) -> [u8; FRAME_LEN] {
     let mut out = frame;
     for (i, byte) in out.iter_mut().enumerate() {
-        // Iter pos i in 0..9, FIRMWARE_WHITENING.len() = 4 (compile-time
-        // const), so i % 4 ∈ 0..4 is statically bounded for the index.
-        let key = FIRMWARE_WHITENING
-            .get(i % FIRMWARE_WHITENING.len())
+        let key = DIAGNOSTIC_XOR_PATTERN
+            .get(i % DIAGNOSTIC_XOR_PATTERN.len())
             .copied()
             .unwrap_or(0);
         *byte ^= key;
@@ -109,14 +37,8 @@ pub fn apply_whitening(frame: [u8; FRAME_LEN]) -> [u8; FRAME_LEN] {
 
 /// Bit positions where steady-state-tone captures show >5% volatility.
 ///
-/// The bits in this mask carry slow-data injection (~31% volatility)
-/// or Golay-parity-of-slow-data (~11-18% volatility). They are NOT
-/// produced by the AMBE codec; they are protocol-layer overhead
-/// stamped on top of the codec output.
-///
-/// To verify the AMBE codec's bit-exact output, AND-mask the encoder's
-/// frame with [`STABLE_BIT_MASK`] (the inverse) and compare to a
-/// [`PITCH_ANCHORS`] entry.
+/// This describes the stored candidate bytes, without assigning protocol
+/// meaning to their changing bit positions. [`STABLE_BIT_MASK`] is its inverse.
 ///
 /// Volatile bit positions (byte:bit notation, derived from 440 Hz
 /// capture and confirmed across 210/550/660 Hz):
@@ -128,41 +50,32 @@ pub const VOLATILE_BIT_MASK: [u8; FRAME_LEN] =
     [0x08, 0x82, 0x20, 0x0C, 0x03, 0xA0, 0x28, 0x80, 0x20];
 
 /// Bit positions stable across all observed steady-state-tone
-/// captures from a given pitch. Inverse of [`VOLATILE_BIT_MASK`].
+/// capture candidates from a given pitch. Inverse of [`VOLATILE_BIT_MASK`].
 ///
-/// Use this mask to extract the 58 codec-determined bits from a raw
-/// 9-byte AMBE frame: `frame[i] & STABLE_BIT_MASK[i]`. The result must
-/// match the corresponding [`PITCH_ANCHORS`] entry for "Kenwood-exact"
-/// encoder verification.
+/// This selects 58 bit positions for historical byte comparisons.
 pub const STABLE_BIT_MASK: [u8; FRAME_LEN] = [0xF7, 0x7D, 0xDF, 0xF3, 0xFC, 0x5F, 0xD7, 0x7F, 0xDF];
 
-/// One bit-exact AMBE frame anchor for a specific input tone.
+/// One historical byte-comparison candidate and its recorded tone metadata.
 ///
-/// `frame` is the masked 9-byte voice frame the TH-D75 firmware emits
-/// in steady state for a sinusoidal input at `frequency_hz`. Lock
+/// `frame` is the stored masked 9-byte capture candidate. Lock
 /// quality is the fraction of 2nd-half-of-capture frames that exactly
 /// matched this anchor (>=0.95 is considered a clean lock).
 ///
 /// `in_op25_pitch_range` flags whether the input frequency's pitch
 /// period (`8000.0 / frequency_hz`) falls inside the OP25 pitch
 /// tracker's supported range of 21..122 samples (= 65.6..381 Hz).
-/// Anchors outside this range will not be reachable by the current
-/// encoder until the pitch search is widened to cover the full
-/// IMBE-spec range (~50..625 Hz). The diagnostic
-/// `pitch_tracker_diagnostic` confirms 440/550/660 Hz inputs
-/// octave-fold to ~220/275/220 Hz inside the OP25 range, producing
-/// a different b0 than Kenwood emits.
-#[derive(Debug, Clone, Copy)]
+/// The record is passive diagnostic metadata, not an accepted encoder input.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PitchAnchor {
     /// Input fundamental frequency in Hz.
     pub frequency_hz: f32,
-    /// Steady-state masked frame the TH-D75 firmware produces.
+    /// Stored masked capture candidate.
     /// Compare to `(rust_encoder_output[i] & STABLE_BIT_MASK[i]) for i in 0..9`.
     pub frame: [u8; FRAME_LEN],
-    /// Steady-state RAW (unmasked) frame the TH-D75 firmware produces.
+    /// Stored unmasked capture candidate.
     ///
     /// At this frequency in 2nd-half steady state. Includes the
-    /// slow-data + parity bits that vary frame-to-frame; this exact
+    /// bit positions that vary frame-to-frame; this exact
     /// byte sequence is the most-frequent raw frame in the
     /// corresponding capture. Use for ECC-aware decoding
     /// (`decode_trace`) since masking destroys Golay codeword
@@ -176,18 +89,7 @@ pub struct PitchAnchor {
     pub in_op25_pitch_range: bool,
 }
 
-/// Bit-exact reference frames captured from a TH-D75 in D-STAR TX
-/// mode, indexed by input tone frequency.
-///
-/// The Rust encoder, fed a synthetic sinusoidal PCM stream at
-/// `frequency_hz`, must produce 9-byte AMBE frames whose stable bits
-/// match `frame` byte-for-byte (allow encoder transient ~50 frames
-/// before the first match).
-///
-/// All four tones lock cleanly (>=0.95 of 2nd-half frames identical).
-/// 100 Hz and 320 Hz captures exist but did not lock, likely due to
-/// reproduction quality limits of the phone-speaker source used during
-/// recording, not codec behaviour. Excluded here.
+/// Historical capture candidates, indexed by the recorded input tone frequency.
 pub const PITCH_ANCHORS: &[PitchAnchor] = &[
     PitchAnchor {
         frequency_hz: 210.0,
@@ -220,10 +122,7 @@ pub const PITCH_ANCHORS: &[PitchAnchor] = &[
 ];
 
 /// Apply [`STABLE_BIT_MASK`] to a raw 9-byte AMBE frame, zeroing the
-/// 14 protocol-overhead bits.
-///
-/// The result is the codec-determined portion of the frame, suitable
-/// for byte-for-byte comparison against a [`PitchAnchor::frame`].
+/// 14 unselected positions. The result can be compared with stored candidates.
 #[must_use]
 pub fn mask_stable_bits(frame: [u8; FRAME_LEN]) -> [u8; FRAME_LEN] {
     let mut out = [0_u8; FRAME_LEN];
@@ -258,23 +157,26 @@ pub fn hamming_distance(lhs: [u8; FRAME_LEN], rhs: [u8; FRAME_LEN]) -> u32 {
 }
 
 #[cfg(test)]
-mod whitener_tests {
-    use super::{FIRMWARE_WHITENING, FRAME_LEN, apply_whitening};
+mod diagnostic_xor_tests {
+    use super::{DIAGNOSTIC_XOR_PATTERN, FRAME_LEN, apply_diagnostic_xor};
 
     #[test]
     fn whitening_is_self_inverse() {
         let original = [0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0, 0x42];
-        assert_eq!(apply_whitening(apply_whitening(original)), original);
+        assert_eq!(
+            apply_diagnostic_xor(apply_diagnostic_xor(original)),
+            original
+        );
     }
 
     #[test]
     fn whitening_xor_pattern() {
-        // First 4 bytes XOR FIRMWARE_WHITENING; subsequent bytes cycle.
+        // The first four bytes repeat across the nine-byte input.
         let zeros = [0_u8; FRAME_LEN];
-        let whitened = apply_whitening(zeros);
+        let whitened = apply_diagnostic_xor(zeros);
         for (i, (&b, &expected)) in whitened
             .iter()
-            .zip(FIRMWARE_WHITENING.iter().cycle())
+            .zip(DIAGNOSTIC_XOR_PATTERN.iter().cycle())
             .enumerate()
         {
             assert_eq!(

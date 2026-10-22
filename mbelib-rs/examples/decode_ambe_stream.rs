@@ -27,11 +27,9 @@ use std::io::{Read, Write};
 /// Parse `MBELIB_TUNING="alpha=0.9,exp=0.3,lo=0.5,hi=1.4,uv=0.8"`;
 /// unknown keys and malformed numbers abort loudly rather than run a
 /// sweep with a silently-ignored knob.
-fn tuning_from_env() -> mbelib_rs::SynthesisTuning {
-    let mut tuning = mbelib_rs::SynthesisTuning::default();
-    let Ok(spec) = std::env::var("MBELIB_TUNING") else {
-        return tuning;
-    };
+fn tuning_from_env() -> std::io::Result<mbelib_rs::SynthesisTuning> {
+    let mut candidate = mbelib_rs::TuningSpec::default();
+    let spec = std::env::var("MBELIB_TUNING").unwrap_or_default();
     for part in spec.split(',').filter(|p| !p.trim().is_empty()) {
         let Some((key, value)) = part.split_once('=') else {
             eprintln!("MBELIB_TUNING: expected key=value, got {part:?}");
@@ -42,19 +40,27 @@ fn tuning_from_env() -> mbelib_rs::SynthesisTuning {
             std::process::exit(2);
         };
         match key.trim() {
-            "alpha" => tuning.enhance_alpha = value,
-            "exp" => tuning.enhance_exponent = value,
-            "lo" => tuning.enhance_clamp_lo = value,
-            "hi" => tuning.enhance_clamp_hi = value,
-            "uv" => tuning.unvoiced_gain = value,
-            "jit" => tuning.phase_jitter = value,
+            "alpha" => candidate.enhance_alpha = value,
+            "exp" => candidate.enhance_exponent = value,
+            "lo" => candidate.enhance_clamp_lo = value,
+            "hi" => candidate.enhance_clamp_hi = value,
+            "uv" => candidate.unvoiced_gain = value,
+            "jit" => candidate.phase_jitter = value,
             other => {
                 eprintln!("MBELIB_TUNING: unknown key {other:?}");
                 std::process::exit(2);
             }
         }
     }
-    tuning
+    let tuning = mbelib_rs::SynthesisTuning::new(candidate)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    #[cfg(feature = "kenwood-tables")]
+    let tuning = if std::env::var("MBELIB_KENWOOD_POSTFILTER").as_deref() == Ok("1") {
+        tuning.with_envelope_postfilter(mbelib_rs::EnvelopePostfilter::Kenwood)
+    } else {
+        tuning
+    };
+    Ok(tuning)
 }
 
 fn main() -> std::io::Result<()> {
@@ -77,7 +83,7 @@ fn main() -> std::io::Result<()> {
         Some("-") | None => None,
         Some(p) => Some(std::fs::File::create(p)?),
     };
-    let mut dec = mbelib_rs::AmbeDecoder::with_tuning(tuning_from_env());
+    let mut dec = mbelib_rs::AmbeDecoder::with_tuning(tuning_from_env()?);
     #[cfg(feature = "wave-enhance")]
     let wave = match std::env::var("MBELIB_WAVE_ENHANCE").as_deref() {
         Ok("1") => match mbelib_rs::enhance_wave::WaveEnhancer::new() {
@@ -103,7 +109,11 @@ fn main() -> std::io::Result<()> {
             // Run the bit-extraction path exposed via the test
             // helper so we can diff against mbelib's per-frame
             // ambe_d / b[] / w0 / L values.
-            let (b, w0, big_l, ambe_d) = mbelib_rs::decode_trace(&frame);
+            let inspected = mbelib_rs::decode_trace(&frame);
+            let b = inspected.parameters();
+            let w0 = inspected.angular_frequency_rad();
+            let big_l = inspected.harmonics();
+            let ambe_d = inspected.data_bits();
             writeln!(t, "FRAME {frame_idx}")?;
             write!(t, "  wire_bytes =")?;
             for x in &frame {

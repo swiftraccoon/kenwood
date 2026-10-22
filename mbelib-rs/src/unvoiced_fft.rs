@@ -34,10 +34,11 @@
 //! GPL-2.0-or-later). The underlying JMBE algorithm numbers refer to
 //! the IMBE/AMBE specification documentation.
 
-use realfft::num_complex::Complex;
-use realfft::{ComplexToReal, RealFftPlanner, RealToComplex};
 use std::cell::RefCell;
 use std::sync::Arc;
+
+use realfft::num_complex::Complex;
+use realfft::{ComplexToReal, RealFftPlanner, RealToComplex};
 
 use crate::params::MbeParams;
 

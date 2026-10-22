@@ -3,7 +3,7 @@
 
 //! Top-level D-STAR AMBE encoder.
 //!
-//! Ties together the front-end ([`analyze_frame`]), pitch tracker,
+//! Ties together the front-end ([`crate::analyze_frame`]), pitch tracker,
 //! V/UV detector, spectral amplitude extractor, and bit packer into
 //! a single `AmbeEncoder::encode_frame(pcm) -> [u8; 9]` entry point.
 //!
@@ -37,15 +37,54 @@
 //! 7. LFSR scramble of C1 seeded from C0 data bits.
 //! 8. 72-bit DSD-style interleave to wire order, pack to 9 bytes.
 
-use crate::ecc::ecc_encode;
-use crate::encode::analyze::{FftPlan, analyze_frame};
-use crate::encode::interleave::AMBE_FRAME_BITS;
-use crate::encode::pack::pack_frame;
-use crate::encode::pitch::{PITCH_CANDIDATES, PitchTracker, compute_e_p};
-use crate::encode::quantize::quantize;
-use crate::encode::state::{EncoderBuffers, FFT_LENGTH, FRAME};
-use crate::encode::vuv::{VuvState, detect_vuv_and_sa};
 use realfft::num_complex::Complex;
+
+use crate::PcmFrame;
+use crate::ecc::ecc_encode;
+use crate::encode::analyze::{FftPlan, analyze_kernel};
+use crate::encode::interleave::AMBE_FRAME_BITS;
+use crate::encode::pack::pack_kernel;
+use crate::encode::pitch::{PITCH_CANDIDATES, PitchTracker, compute_e_p_kernel};
+use crate::encode::quantize::quantize_kernel;
+use crate::encode::state::{EncoderBuffers, FFT_LENGTH, FRAME, InputFilter};
+use crate::encode::vuv::{VuvState, detect_vuv_and_sa_kernel};
+
+/// Pitch-tracker latency policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PitchTracking {
+    /// Commit the current frame using look-back and sub-multiple analysis.
+    #[default]
+    SingleFrame,
+    /// Buffer two frames and commit a frame after 40 ms of lookahead.
+    Lookahead,
+}
+
+/// Independent encoder algorithm choices; every combination is valid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct EncoderOptions {
+    /// Pitch-tracker latency policy.
+    pub pitch_tracking: PitchTracking,
+    /// Input-conditioning coefficients, selected independently of Cargo features.
+    pub input_filter: InputFilter,
+}
+
+struct Quantizer {
+    prev_log2_ml: [f32; 57],
+    prev_l: usize,
+    prev_gamma: f32,
+    vuv_state: VuvState,
+}
+
+impl Quantizer {
+    const fn new() -> Self {
+        Self {
+            prev_log2_ml: [0.0; 57],
+            prev_l: 0,
+            prev_gamma: 0.0,
+            vuv_state: VuvState::new(),
+        }
+    }
+}
 
 /// Per-frame snapshot buffered by the 2-frame look-ahead pipeline.
 ///
@@ -57,76 +96,27 @@ use realfft::num_complex::Complex;
 /// spectrum the encoder saw at analysis time.
 struct FrameSlot {
     e_p: [f32; PITCH_CANDIDATES],
-    fft_out: Vec<Complex<f32>>,
+    fft_out: [Complex<f32>; 129],
 }
 
 /// Top-level D-STAR AMBE 3600×2400 encoder.
 ///
-/// Owns one instance of every per-stream state object. Not thread-safe;
-/// construct one per concurrent voice stream.
+/// Owns one instance of every per-stream state object. Construct one per
+/// concurrent voice stream and feed each stream's frames in order. The encoder
+/// implements `Send` and `Sync`; encoding requires exclusive mutable access.
 ///
-/// # Usage
-///
-/// ```ignore
-/// use mbelib_rs::AmbeEncoder;
-///
-/// let mut encoder = AmbeEncoder::new();
-/// // Feed 160-sample (20 ms at 8 kHz) frames of f32 PCM in [-1.0, 1.0).
-/// let pcm: [f32; 160] = [0.0; 160];
-/// let ambe_frame: [u8; 9] = encoder.encode_frame(&pcm);
-/// ```
+/// See the [checked PCM](crate#checked-pcm) and
+/// [diagnostic-stage workflows](crate#inspect-the-encoder-stages).
 pub struct AmbeEncoder {
     bufs: EncoderBuffers,
     plan: FftPlan,
     pitch: PitchTracker,
     /// Scratch FFT output reused across frames.
-    fft_out: Vec<Complex<f32>>,
-    /// Per-band log-magnitude from the previous frame, indexed by
-    /// harmonic number `l` (1-based; slot 0 mirrors slot 1 for the
-    /// decoder's band-0 boundary condition).
-    ///
-    /// The spectral quantization path needs this to compute the
-    /// prediction residual `T[l] = lsa[l] - 0.65 * interp_prev[l]`
-    /// before matching against the PRBA / HOC codebooks. Without
-    /// this the receiver sees `lsa + 0.65*prev_interp` instead of
-    /// `lsa`, which drifts unbounded and produces a "generative,
-    /// not-voice" sound.
-    ///
-    /// Updated at the end of every `encode_frame` to track what the
-    /// decoder will have after parsing the frame just emitted.
-    prev_log2_ml: [f32; 57],
-    /// Previous frame's harmonic count. Used by the band-ratio
-    /// mapping `kl = (prev_l / cur_l) * l` that drives the prev-frame
-    /// log-magnitude interpolation.
-    prev_l: usize,
-    /// Previous frame's reconstructed gamma (mean log-magnitude).
-    ///
-    /// The D-STAR decoder reconstructs `gamma_cur = DG_TABLE[b2] + 0.5 *
-    /// gamma_prev`. Carrying this state on the encoder side lets
-    /// `quantize_gain` emit the predictive *delta* instead of the
-    /// absolute log-magnitude; without it the receiver's gamma
-    /// drifts to saturation over a few frames.
-    prev_gamma: f32,
-    /// 2-slot ring buffer holding analysis output for frames `N-2`
-    /// and `N-1`. `encode_frame(N)` computes `E(p)_N`, runs the
-    /// DP on `(E(p)_{N-2}, E(p)_{N-1}, E(p)_N)` to commit pitch for
-    /// frame `N-2`, quantize its saved FFT against that pitch, emit
-    /// bytes, then shift the ring.
-    ///
-    /// While `pending.len() < 2` the encoder is warming up: the
-    /// output is `AMBE_SILENCE` and the decoder's `prev_log2_ml`
-    /// state is re-zeroed each time (via
-    /// [`Self::reset_prev_state_after_silence`]).
-    ///
-    /// `None` means look-ahead is disabled entirely: the default
-    /// zero-latency [`Self::new`] sets this to `None`, while
-    /// [`Self::new_with_lookahead`] sets it to `Some(Vec::new())`.
+    fft_out: [Complex<f32>; 129],
+    /// Reconstructed magnitude/gain predictor and V/UV hysteresis history.
+    quantizer: Quantizer,
+    /// At most two saved analysis frames for the optional 40 ms lookahead.
     pending: Option<Vec<FrameSlot>>,
-    /// Hysteretic V/UV state: previous frame's per-band decisions
-    /// plus the slow-update frame-energy ceiling `th_max`. Carried
-    /// across frames so the V/UV threshold reflects the signal's
-    /// recent history (OP25 `v_uv_det.cc:152`).
-    vuv_state: VuvState,
 }
 
 /// Silence shortcut threshold: when the pitch tracker reports
@@ -147,26 +137,31 @@ impl AmbeEncoder {
     /// latency; each [`encode_frame`](Self::encode_frame) call
     /// commits pitch for the just-received frame.
     ///
-    /// This is the backwards-compatible default. Real-voice inputs
-    /// work well here because sub-multiples analysis resolves the
-    /// common octave ambiguities; pure-sine synthetic tests can
-    /// lose the 2P-vs-P disambiguation on settled tones. For the
-    /// full OP25 pitch pipeline (2-frame look-ahead DP), see
-    /// [`Self::new_with_lookahead`]; it costs 40 ms of latency and
-    /// an extra 2-frame warmup but matches OP25's pitch decisions
-    /// on pure sines as well as voice.
+    /// The input filter is `InputFilter::Reference`. Optional two-frame
+    /// lookahead is selected through [`Self::new_with_lookahead`] or
+    /// [`Self::with_options`]. Construction allocates the reusable FFT cache.
     #[must_use]
     pub fn new() -> Self {
+        Self::with_options(EncoderOptions::default())
+    }
+
+    /// Construct zeroed history with explicit input-filter and latency choices.
+    ///
+    /// Plans and scratch allocate during construction. Frame processing uses
+    /// fixed spectra and retains at most two lookahead snapshots without
+    /// allocating or cloning a spectrum vector each frame.
+    #[must_use]
+    pub fn with_options(options: EncoderOptions) -> Self {
         Self {
-            bufs: EncoderBuffers::new(),
+            bufs: EncoderBuffers::with_input_filter(options.input_filter),
             plan: FftPlan::new(),
             pitch: PitchTracker::new(),
-            fft_out: vec![Complex::new(0.0, 0.0); FFT_LENGTH / 2 + 1],
-            prev_log2_ml: [0.0_f32; 57],
-            prev_l: 0,
-            prev_gamma: 0.0,
-            pending: None,
-            vuv_state: VuvState::new(),
+            fft_out: [Complex::new(0.0, 0.0); 129],
+            quantizer: Quantizer::new(),
+            pending: match options.pitch_tracking {
+                PitchTracking::SingleFrame => None,
+                PitchTracking::Lookahead => Some(Vec::with_capacity(2)),
+            },
         }
     }
 
@@ -174,23 +169,31 @@ impl AmbeEncoder {
     /// enabled. The first two [`encode_frame`](Self::encode_frame)
     /// calls return `AMBE_SILENCE` while the pipeline fills; frame
     /// `N-2`'s pitch is committed on the third call (frame `N`).
-    /// Adds ≈40 ms end-to-end latency; matches OP25's pitch-tracking
-    /// behaviour across pure sines and pitch transitions.
+    /// Adds 40 ms of buffering. The final two buffered inputs have no flush
+    /// operation and are discarded when the encoder is dropped.
     #[must_use]
     pub fn new_with_lookahead() -> Self {
-        Self {
-            bufs: EncoderBuffers::new(),
-            plan: FftPlan::new(),
-            pitch: PitchTracker::new(),
-            fft_out: vec![Complex::new(0.0, 0.0); FFT_LENGTH / 2 + 1],
-            prev_log2_ml: [0.0_f32; 57],
-            prev_l: 0,
-            prev_gamma: 0.0,
-            pending: Some(Vec::with_capacity(2)),
-            vuv_state: VuvState::new(),
-        }
+        Self::with_options(EncoderOptions {
+            pitch_tracking: PitchTracking::Lookahead,
+            ..EncoderOptions::default()
+        })
     }
 
+    /// Return the selected algorithm choices without changing stream history.
+    #[must_use]
+    pub const fn options(&self) -> EncoderOptions {
+        EncoderOptions {
+            pitch_tracking: if self.pending.is_some() {
+                PitchTracking::Lookahead
+            } else {
+                PitchTracking::SingleFrame
+            },
+            input_filter: self.bufs.input_filter(),
+        }
+    }
+}
+
+impl Quantizer {
     /// After emitting `AMBE_SILENCE`, overwrite the encoder's
     /// `prev_log2_ml` / `prev_l` with what the decoder will have
     /// after parsing that silence frame; otherwise the next voice
@@ -218,11 +221,12 @@ impl AmbeEncoder {
         // have reconstructed from the silence stream on its side.
         self.prev_gamma = 0.0;
     }
+}
 
+impl AmbeEncoder {
     /// Encode one 20 ms PCM frame into a 9-byte AMBE wire frame.
     ///
-    /// - `pcm` must contain at least 160 f32 samples in
-    ///   `[-1.0, 1.0)`. Convert from `i16` by dividing by 32768.0.
+    /// `pcm` contains exactly 160 finite samples in inclusive `[-1,1]`.
     ///
     /// # Output
     ///
@@ -232,21 +236,20 @@ impl AmbeEncoder {
     /// `MMDVMHost` and DVSI chips use for zero-audio frames, so silent
     /// stretches stay wire-compatible with conformant receivers.
     ///
-    /// # Panics
-    ///
-    /// Never panics under normal use. The look-ahead pipeline's
-    /// internal invariant (`self.pending` is `Some` iff the encoder
-    /// was built with [`Self::new_with_lookahead`]) is enforced at
-    /// construction and never mutated afterwards; the unreachable
-    /// `expect` is kept as a defensive check rather than removed
-    /// entirely.
-    pub fn encode_frame(&mut self, pcm: &[f32]) -> [u8; 9] {
+    /// The selected filter/latency policy is fixed for this stream. A fresh
+    /// encoder begins with zero predictor history. See [checked PCM](crate#checked-pcm).
+    pub fn encode_frame(&mut self, pcm: &PcmFrame) -> [u8; 9] {
         // Front-end: DC remove → LPF → window → FFT. After this
         // call, `self.bufs.pitch_est_buf` holds the latest 301
         // samples of LPF'd audio and `self.fft_out` holds the
         // 129-bin complex spectrum of the just-arrived frame.
-        analyze_frame(pcm, &mut self.bufs, &mut self.plan, &mut self.fft_out);
-        let e_p_current = compute_e_p(&self.bufs.pitch_est_buf);
+        analyze_kernel(
+            pcm.samples(),
+            &mut self.bufs,
+            &mut self.plan,
+            &mut self.fft_out,
+        );
+        let e_p_current = compute_e_p_kernel(&self.bufs.pitch_est_buf);
 
         // Look-ahead path: buffer the e_p array + a copy of the FFT
         // spectrum, then emit bytes only once we have 3 frames. The
@@ -255,19 +258,19 @@ impl AmbeEncoder {
         let Some(pending) = self.pending.as_mut() else {
             // Zero-latency path: commit pitch for the just-received
             // frame via single-frame look-back + sub-multiples.
-            let pitch = self.pitch.estimate(&self.bufs.pitch_est_buf);
-            return self.quantize_and_pack(pitch);
+            let pitch = self.pitch.estimate_kernel(&self.bufs.pitch_est_buf);
+            return self.quantizer.quantize_from_fft(&self.fft_out, pitch);
         };
         let slot = FrameSlot {
             e_p: e_p_current,
-            fft_out: self.fft_out.clone(),
+            fft_out: self.fft_out,
         };
         if pending.len() < 2 {
             pending.push(slot);
             // Pipeline not full yet: emit silence and keep the
             // decoder's `prev_log2_ml` state consistent with what
             // it sees on the wire.
-            self.reset_prev_state_after_silence();
+            self.quantizer.reset_prev_state_after_silence();
             return AMBE_SILENCE;
         }
 
@@ -276,7 +279,7 @@ impl AmbeEncoder {
         // next two as lookahead.
         let pitch = if let [n_minus_2, n_minus_1, ..] = pending.as_slice() {
             self.pitch
-                .estimate_with_lookahead(&n_minus_2.e_p, &n_minus_1.e_p, &slot.e_p)
+                .estimate_with_lookahead_kernel(&n_minus_2.e_p, &n_minus_1.e_p, &slot.e_p)
         } else {
             unreachable!("pending holds two slots after the `< 2` early return above")
         };
@@ -286,21 +289,11 @@ impl AmbeEncoder {
         pending.push(slot);
 
         // Quantize frame N-2's spectrum against the DP-chosen pitch.
-        self.quantize_from_fft(&oldest.fft_out, pitch)
+        self.quantizer.quantize_from_fft(&oldest.fft_out, pitch)
     }
+}
 
-    /// Quantize the encoder's current-frame FFT output (set by
-    /// [`analyze_frame`]) against a just-committed pitch and return
-    /// 9 wire bytes. Used by the zero-latency path.
-    fn quantize_and_pack(&mut self, pitch: crate::encode::pitch::PitchEstimate) -> [u8; 9] {
-        if pitch.confidence < SILENCE_CONFIDENCE {
-            self.reset_prev_state_after_silence();
-            return AMBE_SILENCE;
-        }
-        let fft = self.fft_out.clone();
-        self.quantize_from_fft(&fft, pitch)
-    }
-
+impl Quantizer {
     /// Quantize an arbitrary saved FFT spectrum against a committed
     /// pitch, returning 9 wire bytes. Shared by the zero-latency and
     /// look-ahead paths; the look-ahead path hands in an FFT saved
@@ -326,14 +319,14 @@ impl AmbeEncoder {
         // period). Our PitchEstimate carries `confidence`; invert to
         // get the error.
         let e_p = (1.0 - pitch.confidence).clamp(0.0, 1.0);
-        let (vuv, amps) = detect_vuv_and_sa(fft_out, f0_bin, &mut self.vuv_state, e_p);
+        let (vuv, amps) = detect_vuv_and_sa_kernel(fft_out, f0_bin, &mut self.vuv_state, e_p);
 
         let prev = crate::encode::quantize::PrevFrameState {
             log2_ml: self.prev_log2_ml,
             l: self.prev_l,
             prev_gamma: self.prev_gamma,
         };
-        let outcome = quantize(pitch, vuv, &amps, &prev);
+        let outcome = quantize_kernel(pitch, vuv, &amps, &prev);
         self.prev_log2_ml = outcome.prev_log2_ml;
         self.prev_l = outcome.prev_l;
         self.prev_gamma = outcome.prev_gamma;
@@ -353,19 +346,14 @@ impl AmbeEncoder {
         // through the round-trip (b3 was reading 304 instead of 368
         // for the 1 kHz sine, scrambling the spectral envelope and
         // pinning decoded peaks at the wrong harmonic).
-        pack_frame(&ambe_fr)
+        pack_kernel(&ambe_fr)
     }
+}
 
+impl AmbeEncoder {
     /// Convenience: encode from i16 PCM. Divides by 32768.0 first.
-    pub fn encode_frame_i16(&mut self, pcm: &[i16]) -> [u8; 9] {
-        let mut scratch = [0.0_f32; FRAME];
-        for (i, &s) in pcm.iter().enumerate().take(FRAME) {
-            if let Some(slot) = scratch.get_mut(i) {
-                let f = f32::from(s) / 32768.0;
-                *slot = f;
-            }
-        }
-        self.encode_frame(&scratch)
+    pub fn encode_frame_i16(&mut self, pcm: &[i16; FRAME]) -> [u8; 9] {
+        self.encode_frame(&PcmFrame::from(*pcm))
     }
 }
 
@@ -384,14 +372,17 @@ impl std::fmt::Debug for AmbeEncoder {
 #[cfg(test)]
 mod tests {
     use super::AmbeEncoder;
+    use crate::PcmFrame;
     use crate::encode::state::FRAME;
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
 
     #[test]
-    fn encode_silent_frame_produces_nine_bytes() {
+    fn encode_silent_frame_produces_nine_bytes() -> TestResult {
         let mut enc = AmbeEncoder::new();
         let pcm = [0.0_f32; FRAME];
-        let out = enc.encode_frame(&pcm);
+        let out = enc.encode_frame(&PcmFrame::new(pcm)?);
         assert_eq!(out.len(), 9);
+        Ok(())
     }
 
     /// End-to-end: encode a 200 Hz sine, decode it, verify the
@@ -402,7 +393,7 @@ mod tests {
     /// `encode_frame` → `decode_frame` pipeline doesn't panic or
     /// deadlock on a trivial input.
     #[test]
-    fn encode_sine_round_trips_through_decoder() {
+    fn encode_sine_round_trips_through_decoder() -> TestResult {
         use crate::AmbeDecoder;
         let mut enc = AmbeEncoder::new();
         let sr = 8000.0_f32;
@@ -419,18 +410,19 @@ mod tests {
                 let t = (frame * FRAME + i) as f32;
                 (t * 2.0 * std::f32::consts::PI * f0 / sr).sin()
             });
-            let ambe = enc.encode_frame(&pcm);
+            let ambe = enc.encode_frame(&PcmFrame::new(pcm)?);
             // Decode and verify we got 160 samples.
             let mut dec = AmbeDecoder::new();
             let pcm_out = dec.decode_frame(&ambe);
             assert_eq!(pcm_out.len(), 160);
         }
+        Ok(())
     }
 
     /// Multiple successive calls don't panic and don't leak state
     /// in ways that affect frame shape.
     #[test]
-    fn repeated_frames_remain_nine_bytes() {
+    fn repeated_frames_remain_nine_bytes() -> TestResult {
         let mut enc = AmbeEncoder::new();
         for i in 0..50 {
             let pcm: [f32; FRAME] = core::array::from_fn(|j| {
@@ -442,9 +434,10 @@ mod tests {
                 let t = (i * FRAME + j) as f32;
                 0.5 * (t * 0.1).sin()
             });
-            let out = enc.encode_frame(&pcm);
+            let out = enc.encode_frame(&PcmFrame::new(pcm)?);
             assert_eq!(out.len(), 9, "at frame {i}");
         }
+        Ok(())
     }
 
     /// End-to-end: encode a 200 Hz sine, decode the AMBE frame, and
@@ -453,7 +446,7 @@ mod tests {
     /// (`analyze` → `quantize` → `ecc_encode` → `demodulate_c1` →
     ///  `pack` → `unpack` → `demodulate_c1` → `ecc_data` → `decode`).
     #[test]
-    fn encode_decode_preserves_pitch() {
+    fn encode_decode_preserves_pitch() -> TestResult {
         use crate::AmbeDecoder;
         let mut enc = AmbeEncoder::new();
         let sr = 8000.0_f32;
@@ -472,13 +465,14 @@ mod tests {
                 let t = (frame * FRAME + i) as f32;
                 (t * 2.0 * std::f32::consts::PI * f0 / sr).sin()
             });
-            last_bytes = enc.encode_frame(&pcm);
+            last_bytes = enc.encode_frame(&PcmFrame::new(pcm)?);
         }
 
         let mut dec = AmbeDecoder::new();
         let _ = dec.decode_frame(&last_bytes); // prime state
         let pcm = dec.decode_frame(&last_bytes);
         assert_eq!(pcm.len(), 160);
+        Ok(())
     }
 
     /// End-to-end: encode a sustained voice-like signal (sine plus
@@ -489,7 +483,7 @@ mod tests {
     /// Audio quality (vs. DVSI chip output) is not asserted; that
     /// requires real hardware-in-the-loop testing.
     #[test]
-    fn encode_decode_produces_non_silent_output() {
+    fn encode_decode_produces_non_silent_output() -> TestResult {
         use crate::AmbeDecoder;
         let mut enc = AmbeEncoder::new();
         let mut dec = AmbeDecoder::new();
@@ -525,7 +519,7 @@ mod tests {
         // settles.
         for frame in 0..20 {
             let pcm = make_pcm(frame);
-            let ambe = enc.encode_frame(&pcm);
+            let ambe = enc.encode_frame(&PcmFrame::new(pcm)?);
             let _ = dec.decode_frame(&ambe);
         }
 
@@ -534,7 +528,7 @@ mod tests {
         let mut total_samples: usize = 0;
         for frame in 20..30 {
             let pcm = make_pcm(frame);
-            let ambe = enc.encode_frame(&pcm);
+            let ambe = enc.encode_frame(&PcmFrame::new(pcm)?);
             let decoded = dec.decode_frame(&ambe);
             for &s in &decoded {
                 let sf = f32::from(s) / 32768.0;
@@ -553,5 +547,6 @@ mod tests {
             "decoded PCM is essentially silent (rms={rms}); \
              spectral quantization pipeline is not carrying signal energy",
         );
+        Ok(())
     }
 }

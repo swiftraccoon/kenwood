@@ -52,31 +52,6 @@ const IDCT_BLOCKS: usize = 4;
 /// Max Cik coefficient index per block (k=1..=6).
 const MAX_HOC_TERMS: usize = 6;
 
-/// Quantize analysis outputs into a 49-bit `ambe_d` vector.
-///
-/// Uses the D-STAR AMBE 3600x2400 bit layout: every position below
-/// is the exact mirror of what `crate::decode::decode_params` reads,
-/// which in turn matches `mbe_decodeAmbe2400Parms` in
-/// `mbelib/ambe3600x2400.c`.
-///
-/// # Bit layout
-///
-/// Field widths and `ambe_d` positions:
-///
-/// | Field | Width | Positions (MSB → LSB) |
-/// |-------|-------|-----------------------|
-/// | `b0`  | 7     | `[0, 1, 2, 3, 4, 5, 48]` |
-/// | `b1`  | 4     | `[38, 39, 40, 41]` |
-/// | `b2`  | 6     | `[6, 7, 8, 9, 42, 43]` |
-/// | `b3`  | 9     | `[10, 11, 12, 13, 14, 15, 16, 44, 45]` |
-/// | `b4`  | 7     | `[17, 18, 19, 20, 21, 46, 47]` |
-/// | `b5`  | 4     | `[22, 23, 25, 26]` ← bit 24 deliberately skipped |
-/// | `b6`  | 4     | `[27, 28, 29, 30]` |
-/// | `b7`  | 4     | `[31, 32, 33, 34]` |
-/// | `b8`  | 3     | `[35, 36, 37]` (LSB always 0) |
-///
-/// `ambe_d[24]` is the one position that carries no parameter data
-/// in D-STAR. mbelib's 2400 decoder never reads it.
 /// Per-encoder state the spectral path needs to carry between frames.
 ///
 /// Decoder-side, the reconstruction formula
@@ -86,21 +61,17 @@ const MAX_HOC_TERMS: usize = 6;
 /// no `prev_log2_ml` to subtract, so the receiver would hear
 /// `lsa + 0.65*prev_interp` instead of the intended `lsa`.
 ///
-/// Both fields are owned and updated by `AmbeEncoder`; `quantize()`
-/// reads the state, computes residuals, and returns an updated
-/// [`QuantizeOutcome::prev_log2_ml`] the caller stores for the next
-/// frame.
-#[derive(Debug, Clone, Copy)]
-#[doc(hidden)]
+/// [`quantize`] reads the immutable candidate and returns updated history
+/// through [`QuantizeOutcome::previous_state`].
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PrevFrameState {
     /// Per-band log-magnitude from the previous frame, indexed by
-    /// harmonic number (1-based; slot 0 mirrors slot 1 for the
-    /// boundary condition the band-ratio interpolation uses).
-    pub log2_ml: [f32; 57],
+    /// harmonic number (1-based; slot zero is the interpolation boundary).
+    pub(crate) log2_ml: [f32; 57],
     /// Previous frame's harmonic count `L`. Drives the band-ratio
     /// mapping that projects `prev_log2_ml` onto the current frame's
     /// harmonic grid.
-    pub l: usize,
+    pub(crate) l: usize,
     /// Previous frame's reconstructed `gamma` (mean log-magnitude).
     ///
     /// The D-STAR decoder reconstructs the current frame's gamma as
@@ -113,21 +84,111 @@ pub struct PrevFrameState {
     /// consuming the *previous* frame's bits, so the current frame's
     /// `quantize_gain` can subtract `0.5 * prev_gamma` before the
     /// `DG_TABLE` nearest-neighbor search.
-    pub prev_gamma: f32,
+    pub(crate) prev_gamma: f32,
+}
+
+impl PrevFrameState {
+    /// Initial predictor state before any frame has been quantized.
+    pub const ZERO: Self = Self {
+        log2_ml: [0.0; 57],
+        l: 0,
+        prev_gamma: 0.0,
+    };
+    /// Validate finite reconstructed log magnitudes/gain and at most 56 harmonics.
+    ///
+    /// Unused entries may retain prior history; slot zero is the interpolation
+    /// boundary. A zero count represents the initial predictor state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::StageError::Count`] above 56 or
+    /// [`crate::StageError::Value`] for nonfinite log magnitudes/gain.
+    pub fn new(
+        log2_ml: [f32; 57],
+        harmonics: usize,
+        previous_gain: f32,
+    ) -> Result<Self, crate::StageError> {
+        use super::stage::{StageError, StageField};
+        if harmonics > 56 {
+            return Err(StageError::Count {
+                field: StageField::PreviousMagnitudes,
+                actual: harmonics,
+                maximum: 56,
+            });
+        }
+        for (index, &value) in log2_ml.iter().enumerate() {
+            if !value.is_finite() {
+                return Err(StageError::Value {
+                    field: StageField::PreviousMagnitudes,
+                    index,
+                    value,
+                });
+            }
+        }
+        if !previous_gain.is_finite() {
+            return Err(StageError::Value {
+                field: StageField::PreviousGain,
+                index: 0,
+                value: previous_gain,
+            });
+        }
+        Ok(Self {
+            log2_ml,
+            l: harmonics,
+            prev_gamma: previous_gain,
+        })
+    }
+    /// Borrow reconstructed log magnitudes, indexed by harmonic including boundary zero.
+    #[must_use]
+    pub const fn log2_ml(&self) -> &[f32; 57] {
+        &self.log2_ml
+    }
+    /// Return the previous active harmonic count.
+    #[must_use]
+    pub const fn harmonics(self) -> usize {
+        self.l
+    }
+    /// Return reconstructed log gain.
+    #[must_use]
+    pub const fn previous_gain(self) -> f32 {
+        self.prev_gamma
+    }
+}
+
+impl Default for PrevFrameState {
+    fn default() -> Self {
+        Self::ZERO
+    }
 }
 
 /// Result of a single `quantize()` call: the 49-bit data vector plus
 /// the updated per-frame state to carry into the next call.
-#[derive(Debug, Clone, Copy)]
-#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct QuantizeOutcome {
-    pub ambe_d: [u8; AMBE_DATA_BITS],
-    pub prev_log2_ml: [f32; 57],
-    pub prev_l: usize,
+    pub(crate) ambe_d: [u8; AMBE_DATA_BITS],
+    pub(crate) prev_log2_ml: [f32; 57],
+    pub(crate) prev_l: usize,
     /// Reconstructed gamma the decoder will have after consuming
     /// these bits: `DG_TABLE[b2] + 0.5 * old_prev_gamma`. The caller
     /// stores this as `prev_gamma` for the next frame's quantize.
-    pub prev_gamma: f32,
+    pub(crate) prev_gamma: f32,
+}
+
+impl QuantizeOutcome {
+    /// Return all 49 zero/one data bits before FEC and interleaving.
+    #[must_use]
+    pub const fn data_bits(self) -> [u8; AMBE_DATA_BITS] {
+        self.ambe_d
+    }
+    /// Return the reconstructed predictor state for the following frame.
+    #[must_use]
+    pub const fn previous_state(self) -> PrevFrameState {
+        PrevFrameState {
+            log2_ml: self.prev_log2_ml,
+            l: self.prev_l,
+            prev_gamma: self.prev_gamma,
+        }
+    }
 }
 
 /// Enables env-gated diagnostic `eprintln!`s that emit each
@@ -229,15 +290,44 @@ fn dump_quantize_gm(ri: &[f32; PRBA_BLOCKS + 1], gm: &[f32; PRBA_BLOCKS + 1]) {
     );
 }
 
-#[must_use]
-#[doc(hidden)]
+/// Quantize checked pitch, voicing, amplitudes and predictor history into 49 data bits.
+///
+/// # Errors
+///
+/// Returns [`crate::StageError::BandCount`] when voicing and spectral counts
+/// disagree, or a numeric [`crate::StageError`] when reconstructed state is not
+/// finite. Inputs remain unchanged; callers install the returned predictor
+/// state only after success. See the [diagnostic stages](crate#inspect-the-encoder-stages).
+pub fn quantize(
+    pitch: PitchEstimate,
+    vuv: VuvDecisions,
+    amps: &SpectralAmplitudes,
+    prev: &PrevFrameState,
+) -> Result<QuantizeOutcome, crate::StageError> {
+    let expected = if amps.num_harmonics <= 36 {
+        amps.num_harmonics.div_ceil(3)
+    } else {
+        12
+    };
+    if vuv.num_bands != expected {
+        return Err(crate::StageError::BandCount {
+            harmonics: amps.num_harmonics,
+            expected,
+            actual: vuv.num_bands,
+        });
+    }
+    let output = quantize_kernel(pitch, vuv, amps, prev);
+    let _state = PrevFrameState::new(output.prev_log2_ml, output.prev_l, output.prev_gamma)?;
+    Ok(output)
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "Top-level encoder pipeline: lsa → residual → mean-center → quantize → \
               bit-pack → closed-loop decode. Splitting helpers obscures the data flow \
               that line-by-line mirrors `MMDVMHost`-style block diagrams."
 )]
-pub fn quantize(
+pub(crate) fn quantize_kernel(
     pitch: PitchEstimate,
     vuv: VuvDecisions,
     amps: &SpectralAmplitudes,
@@ -385,13 +475,7 @@ pub fn quantize(
     // result exactly; otherwise the prediction residual
     // `T = lsa − 0.65·interp(prev_log2_ml)` that we subtract at
     // encode time differs from the value the decoder adds back at
-    // decode time, and the reconstructed magnitudes drift frame-
-    // by-frame. Empirically (April 2026 OP25 diff): the drift
-    // showed up as uniform lsa-valued prev on our side (≈11.4 across
-    // all bins) vs OP25's varied decoder-shape (0.0 at boundary,
-    // rising to 9–10 at vowel harmonics, decaying after). That
-    // difference produced unintelligible spectral envelopes despite
-    // matching b0/b2 values.
+    // decode time, and the reconstructed magnitudes drift frame by frame.
     //
     // The reference implementation (OP25 `ambe_encoder.cc:486`)
     // handles this by running mbelib's `mbe_dequantizeAmbe2400Parms`
@@ -700,29 +784,16 @@ fn write_bit(dst: &mut [u8; AMBE_DATA_BITS], idx: usize, value: u8) {
 /// the way to `5.352783` at index 63.
 /// Scale factor applied to harmonic magnitudes before `log2()`.
 ///
-/// **April 2026 calibration:** the upstream `voiced_sa_calc` /
-/// `unvoiced_sa_calc` in [`crate::encode::vuv`] now bake in OP25's
+/// The `voiced_sa_calc` and `unvoiced_sa_calc` stages apply OP25's
 /// `2 * 256 * sqrt(2 * num / den)` and `0.2908 * sqrt(512 * num / den)`
 /// formulas, producing `sa[]` values directly in OP25's int16 sa scale
-/// (peaks ~17000 for voiced fundamentals on a 0.5-amp sine; matches
-/// OP25's `imbe_param->sa[]` within ~10% on the same input).
+/// amplitude scale before logarithmic quantization.
 ///
 /// OP25 reads those int16 sa values straight into `log2()` with no
 /// further scaling (`ambe_encoder.cc:241-248`). Mirroring that, this crate's
 /// `SA_SCALE` is **1.0**: `compute_lsa` and `compute_gain_from_amps`
 /// take `sa.max(1.0).log2()` directly.
 ///
-/// **Why this changed.** A prior revision had `SA_SCALE = 32768.0`
-/// from when `voiced_sa_calc` returned a *bare* `sqrt(num/den)`,
-/// 800× smaller than OP25's int16 scale. The 32768 multiplier
-/// retroactively pushed `log2(sa)` into the right working range.
-/// After the OP25-exact `voiced_sa_calc` port, leaving the multiplier
-/// in place double-scaled, adding +15 to every `log2(sa)` and pushing
-/// `gain` from OP25's typical ~11 to ~19+, well past the
-/// `gain_adjust = 7.5` window where `DG_TABLE` (max 5.35) has entries.
-/// Resulting b2 saturated at 62/63 and the decoder's smoothed
-/// `gamma = DG_TABLE[b2] + 0.5*prev_gamma` blew up to ~10.7,
-/// soft-clipping synthesis to a square-wave ceiling.
 const SA_SCALE: f32 = 1.0;
 
 /// D-STAR-specific gain calibration offset, in log-magnitude units.
@@ -1221,7 +1292,7 @@ fn nearest_prba58(target: &[f32; 4]) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use super::{PrevFrameState, quantize, quantize_pitch};
+    use super::{PrevFrameState, quantize_kernel as quantize, quantize_pitch};
     use crate::encode::pitch::PitchEstimate;
     use crate::encode::vuv::{MAX_BANDS, VuvDecisions};
 
@@ -1419,7 +1490,7 @@ mod tests {
     #[test]
     fn encoder_b3_round_trips_via_decode_trace() {
         use crate::ecc::ecc_encode;
-        use crate::encode::pack::pack_frame;
+        use crate::encode::pack::pack_kernel as pack_frame;
         use crate::encode::pitch::PitchEstimate;
         use crate::encode::spectral::{MAX_HARMONICS, SpectralAmplitudes};
         use crate::encode::vuv::{MAX_BANDS, VuvDecisions};
@@ -1580,11 +1651,7 @@ mod tests {
             num_bands: 10,
         };
         let mut magnitudes = [0.0_f32; MAX_HARMONICS];
-        // OP25-scale sa values: what `voiced_sa_calc` produces for a
-        // typical voiced frame (peak ~12 000 at fundamental, decaying
-        // through subsequent harmonics; matches the dump magnitudes
-        // we cross-checked against OP25's `imbe_param->sa[]` on a
-        // 200 Hz sine in April 2026).
+        // OP25-scale candidate magnitudes, decreasing across harmonics.
         let voiced_sa_envelope = [
             12000.0_f32,
             6000.0,
