@@ -4,19 +4,23 @@
 
 //! MMDVM modem operating mode.
 //!
-//! Mirrors the `MODE_*` constants in `MMDVMHost/Defines.h:31-44`.
-//! The byte values are the same ones used in `SetMode` requests and
-//! in the status response's mode field.
+//! The ordinary protocol modes follow `MMDVM/Globals.h` and the corresponding
+//! `MODE_*` constants in `MMDVMHost/Defines.h`. Host application-state
+//! sentinels are separate from modem wire modes.
+
+use std::fmt;
 
 use crate::command::{
-    MODE_CW, MODE_DMR, MODE_DSTAR, MODE_ERROR, MODE_FM, MODE_IDLE, MODE_LOCKOUT, MODE_NXDN,
-    MODE_P25, MODE_POCSAG, MODE_QUIT, MODE_YSF,
+    MODE_DMR, MODE_DSTAR, MODE_FM, MODE_IDLE, MODE_NXDN, MODE_P25, MODE_POCSAG, MODE_YSF,
 };
+use crate::error::MmdvmError;
 
 /// Modem operating mode (see `MODE_*` byte constants).
 ///
 /// Decoding is lenient: unknown bytes are mapped to `ModemMode::Idle`
-/// by [`ModemMode::from_byte`], in the spirit of the rest of the codec.
+/// by [`ModemMode::from_byte`]. [`TryFrom<u8>`](Self::try_from) performs strict
+/// conversion.
+/// See the [status example](crate#parse-version-and-status-responses).
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ModemMode {
@@ -36,14 +40,6 @@ pub enum ModemMode {
     Pocsag,
     /// Analog FM.
     Fm,
-    /// Continuous-wave (CW) ID.
-    Cw,
-    /// Lockout (carrier-sense blocked).
-    Lockout,
-    /// Error state.
-    Error,
-    /// Quit / shutdown.
-    Quit,
 }
 
 impl ModemMode {
@@ -59,19 +55,13 @@ impl ModemMode {
             Self::Nxdn => MODE_NXDN,
             Self::Pocsag => MODE_POCSAG,
             Self::Fm => MODE_FM,
-            Self::Cw => MODE_CW,
-            Self::Lockout => MODE_LOCKOUT,
-            Self::Error => MODE_ERROR,
-            Self::Quit => MODE_QUIT,
         }
     }
 
     /// Parse a wire byte into a mode.
     ///
-    /// Unknown bytes are mapped to [`ModemMode::Idle`] to keep the
-    /// sans-io core lenient; callers that need strict validation
-    /// should compare the raw byte against the `MODE_*` constants
-    /// themselves.
+    /// Unknown bytes map to [`ModemMode::Idle`]. Use [`Self::try_from`] when an
+    /// unrecognized wire value must be rejected rather than interpreted as idle.
     #[must_use]
     pub const fn from_byte(b: u8) -> Self {
         match b {
@@ -82,19 +72,68 @@ impl ModemMode {
             MODE_NXDN => Self::Nxdn,
             MODE_POCSAG => Self::Pocsag,
             MODE_FM => Self::Fm,
-            MODE_CW => Self::Cw,
-            MODE_LOCKOUT => Self::Lockout,
-            MODE_ERROR => Self::Error,
-            MODE_QUIT => Self::Quit,
             // MODE_IDLE and all other bytes collapse to Idle.
             _ => Self::Idle,
         }
     }
 }
 
+impl TryFrom<u8> for ModemMode {
+    type Error = MmdvmError;
+
+    fn try_from(mode: u8) -> Result<Self, Self::Error> {
+        match mode {
+            MODE_IDLE | MODE_DSTAR | MODE_DMR | MODE_YSF | MODE_P25 | MODE_NXDN | MODE_POCSAG
+            | MODE_FM => Ok(Self::from_byte(mode)),
+            _ => Err(MmdvmError::InvalidModemMode { mode }),
+        }
+    }
+}
+
+impl From<ModemMode> for u8 {
+    fn from(mode: ModemMode) -> Self {
+        mode.as_byte()
+    }
+}
+
+impl fmt::Display for ModemMode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Idle => "idle",
+            Self::Dstar => "D-STAR",
+            Self::Dmr => "DMR",
+            Self::Ysf => "YSF",
+            Self::P25 => "P25",
+            Self::Nxdn => "NXDN",
+            Self::Pocsag => "POCSAG",
+            Self::Fm => "FM",
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
+
+    #[test]
+    fn strict_conversion_rejects_every_unassigned_wire_value() -> TestResult {
+        for byte in 0..=u8::MAX {
+            let lenient = ModemMode::from_byte(byte);
+            let strict = ModemMode::try_from(byte);
+            if [0, 1, 2, 3, 4, 5, 6, 10].contains(&byte) {
+                assert_eq!(u8::from(strict?), byte);
+            } else {
+                assert_eq!(lenient, ModemMode::Idle);
+                assert!(
+                    matches!(strict, Err(MmdvmError::InvalidModemMode { mode }) if mode == byte),
+                    "{strict:?}"
+                );
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn roundtrip_all_known_modes() {
@@ -107,10 +146,6 @@ mod tests {
             ModemMode::Nxdn,
             ModemMode::Pocsag,
             ModemMode::Fm,
-            ModemMode::Cw,
-            ModemMode::Lockout,
-            ModemMode::Error,
-            ModemMode::Quit,
         ];
         for mode in all {
             let back = ModemMode::from_byte(mode.as_byte());
@@ -130,6 +165,5 @@ mod tests {
     fn mode_byte_values_match_command_constants() {
         assert_eq!(ModemMode::Dstar.as_byte(), MODE_DSTAR);
         assert_eq!(ModemMode::Fm.as_byte(), MODE_FM);
-        assert_eq!(ModemMode::Quit.as_byte(), MODE_QUIT);
     }
 }

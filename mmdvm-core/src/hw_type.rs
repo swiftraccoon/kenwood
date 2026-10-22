@@ -7,31 +7,36 @@
 //! Mirrors `enum class HW_TYPE` in `MMDVMHost/Defines.h:54-67` and
 //! the memcmp-based detection in `MMDVMHost/Modem.cpp:1997-2020`.
 
+use std::fmt;
+
 /// Hardware type enum matching `HW_TYPE` in `MMDVMHost`.
+///
+/// Classification uses reported description prefixes. See the
+/// [version example](crate#parse-version-and-status-responses).
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum HwType {
-    /// Generic "MMDVM" board (arduino-class and similar).
+    /// The `MMDVM ` description prefix.
     Mmdvm,
-    /// DVMEGA radio hat.
+    /// The `DVMEGA` description prefix.
     DvMega,
-    /// `ZUMspot` hotspot.
+    /// The `ZUMspot` description prefix.
     MmdvmZumSpot,
-    /// `MMDVM_HS_Hat` Raspberry Pi hat.
+    /// The `MMDVM_HS_Hat` description prefix.
     MmdvmHsHat,
-    /// `MMDVM_HS_Dual_Hat` (dual-band) Pi hat.
+    /// The `MMDVM_HS_Dual_Hat` description prefix.
     MmdvmHsDualHat,
-    /// Nano hotSPOT.
+    /// The `Nano_hotSPOT` description prefix.
     NanoHotspot,
-    /// `Nano_DV` dongle.
+    /// The `Nano_DV` description prefix.
     NanoDv,
-    /// `D2RG_MMDVM_HS` board.
+    /// The `D2RG_MMDVM_HS` description prefix.
     D2rgMmdvmHs,
-    /// `MMDVM_HS` (generic board, description prefix `MMDVM_HS-`).
+    /// The `MMDVM_HS-` description prefix.
     MmdvmHs,
-    /// `OpenGD77_HS` firmware on an HS board.
+    /// The `OpenGD77_HS` description prefix.
     OpenGd77Hs,
-    /// `SkyBridge`.
+    /// The `SkyBridge` description prefix.
     SkyBridge,
     /// Unknown hardware (description didn't match any known prefix).
     Unknown,
@@ -41,8 +46,7 @@ impl HwType {
     /// Guess the hardware type from a `GetVersion` description string.
     ///
     /// The description is matched against the same set of prefixes that
-    /// `MMDVMHost/Modem.cpp:1997-2020` uses. Unknown descriptions,
-    /// including the TH-D75's internal modem, return
+    /// `MMDVMHost/Modem.cpp:1997-2020` uses. Other descriptions return
     /// [`HwType::Unknown`].
     #[must_use]
     pub fn from_description(desc: &str) -> Self {
@@ -82,6 +86,25 @@ impl HwType {
             return Self::SkyBridge;
         }
         Self::Unknown
+    }
+}
+
+impl fmt::Display for HwType {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Mmdvm => "MMDVM",
+            Self::DvMega => "DVMEGA",
+            Self::MmdvmZumSpot => "ZUMspot",
+            Self::MmdvmHsHat => "MMDVM_HS_Hat",
+            Self::MmdvmHsDualHat => "MMDVM_HS_Dual_Hat",
+            Self::NanoHotspot => "Nano_hotSPOT",
+            Self::NanoDv => "Nano_DV",
+            Self::D2rgMmdvmHs => "D2RG_MMDVM_HS",
+            Self::MmdvmHs => "MMDVM_HS",
+            Self::OpenGd77Hs => "OpenGD77_HS",
+            Self::SkyBridge => "SkyBridge",
+            Self::Unknown => "unknown",
+        })
     }
 }
 

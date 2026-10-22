@@ -2,269 +2,215 @@
 // G4KLX, Copyright (C) 2015-2026, licensed under GPL-2.0-or-later.
 // See LICENSE for full attribution.
 
-//! MMDVM command byte constants.
+//! Typed command identifiers, framing bytes, mode bytes and capability masks.
 //!
-//! Every protocol byte used in the MMDVM wire format: command IDs,
-//! response IDs, mode bytes, and capability bitfield masks.
-//!
-//! Mirrors the `MMDVM_*` constants at the top of
-//! `MMDVMHost/Modem.cpp:42-113` and the `MODE_*` constants in
-//! `MMDVMHost/Defines.h:31-44`.
+//! Values follow `MMDVMHost/Modem.cpp:42-126` and the ordinary protocol modes
+//! in `MMDVM/Globals.h`.
+//! See the [frame example](crate#encode-and-decode-a-frame).
 
-// ---------------------------------------------------------------------------
-// Framing
-// ---------------------------------------------------------------------------
+use std::fmt;
 
-/// Start byte marker for all MMDVM frames (`0xE0`).
+/// A command or response identifier, including an unrecognized wire byte.
+///
+/// Every byte is representable so frames from another firmware revision retain
+/// their identifier. Associated constants name the commands recognized here;
+/// interpreting their payloads is a separate operation.
+/// See the [frame example](crate#encode-and-decode-a-frame).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Command(u8);
+
+impl Command {
+    /// Request firmware version information.
+    pub const GET_VERSION: Self = Self(0x00);
+    /// Request current modem status.
+    pub const GET_STATUS: Self = Self(0x01);
+    /// Set modem configuration.
+    pub const SET_CONFIG: Self = Self(0x02);
+    /// Set modem operating mode.
+    pub const SET_MODE: Self = Self(0x03);
+    /// Set modem RX/TX frequency.
+    pub const SET_FREQ: Self = Self(0x04);
+    /// Send a continuous-wave identifier.
+    pub const SEND_CWID: Self = Self(0x0A);
+    /// D-STAR radio header.
+    pub const DSTAR_HEADER: Self = Self(0x10);
+    /// D-STAR voice and slow data.
+    pub const DSTAR_DATA: Self = Self(0x11);
+    /// D-STAR signal lost indication.
+    pub const DSTAR_LOST: Self = Self(0x12);
+    /// D-STAR end of transmission.
+    pub const DSTAR_EOT: Self = Self(0x13);
+    /// DMR slot-1 data.
+    pub const DMR_DATA1: Self = Self(0x18);
+    /// DMR slot-1 signal lost indication.
+    pub const DMR_LOST1: Self = Self(0x19);
+    /// DMR slot-2 data.
+    pub const DMR_DATA2: Self = Self(0x1A);
+    /// DMR slot-2 signal lost indication.
+    pub const DMR_LOST2: Self = Self(0x1B);
+    /// DMR short link control.
+    pub const DMR_SHORTLC: Self = Self(0x1C);
+    /// DMR start of transmission.
+    pub const DMR_START: Self = Self(0x1D);
+    /// DMR transmission abort.
+    pub const DMR_ABORT: Self = Self(0x1E);
+    /// Yaesu System Fusion data.
+    pub const YSF_DATA: Self = Self(0x20);
+    /// Yaesu System Fusion signal lost indication.
+    pub const YSF_LOST: Self = Self(0x21);
+    /// P25 header.
+    pub const P25_HDR: Self = Self(0x30);
+    /// P25 logical data unit.
+    pub const P25_LDU: Self = Self(0x31);
+    /// P25 signal lost indication.
+    pub const P25_LOST: Self = Self(0x32);
+    /// NXDN data.
+    pub const NXDN_DATA: Self = Self(0x40);
+    /// NXDN signal lost indication.
+    pub const NXDN_LOST: Self = Self(0x41);
+    /// POCSAG paging data.
+    pub const POCSAG_DATA: Self = Self(0x50);
+    /// FM parameter set 1.
+    pub const FM_PARAMS1: Self = Self(0x60);
+    /// FM parameter set 2.
+    pub const FM_PARAMS2: Self = Self(0x61);
+    /// FM parameter set 3.
+    pub const FM_PARAMS3: Self = Self(0x62);
+    /// FM parameter set 4.
+    pub const FM_PARAMS4: Self = Self(0x63);
+    /// FM audio data.
+    pub const FM_DATA: Self = Self(0x65);
+    /// FM status.
+    pub const FM_STATUS: Self = Self(0x66);
+    /// FM end of transmission.
+    pub const FM_EOT: Self = Self(0x67);
+    /// FM received signal strength.
+    pub const FM_RSSI: Self = Self(0x68);
+    /// Acknowledgement response.
+    pub const ACK: Self = Self(0x70);
+    /// Negative acknowledgement response.
+    pub const NAK: Self = Self(0x7F);
+    /// Serial data passthrough.
+    pub const SERIAL_DATA: Self = Self(0x80);
+    /// Transparent data.
+    pub const TRANSPARENT: Self = Self(0x90);
+    /// Contact information.
+    pub const QSO_INFO: Self = Self(0x91);
+    /// Debug text with no appended integer values.
+    pub const DEBUG1: Self = Self(0xF1);
+    /// Debug text with one appended integer value.
+    pub const DEBUG2: Self = Self(0xF2);
+    /// Debug text with two appended integer values.
+    pub const DEBUG3: Self = Self(0xF3);
+    /// Debug text with three appended integer values.
+    pub const DEBUG4: Self = Self(0xF4);
+    /// Debug text with four appended integer values.
+    pub const DEBUG5: Self = Self(0xF5);
+    /// Debug memory dump.
+    pub const DEBUG_DUMP: Self = Self(0xFA);
+
+    /// Return the identifier's unchanged wire byte.
+    #[must_use]
+    pub const fn get(self) -> u8 {
+        self.0
+    }
+}
+
+impl From<u8> for Command {
+    fn from(byte: u8) -> Self {
+        Self(byte)
+    }
+}
+
+impl From<Command> for u8 {
+    fn from(command: Command) -> Self {
+        command.get()
+    }
+}
+
+impl fmt::Display for Command {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, formatter)
+    }
+}
+
+impl fmt::LowerHex for Command {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::LowerHex::fmt(&self.0, formatter)
+    }
+}
+
+impl fmt::UpperHex for Command {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::UpperHex::fmt(&self.0, formatter)
+    }
+}
+
+impl fmt::Octal for Command {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Octal::fmt(&self.0, formatter)
+    }
+}
+
+impl fmt::Binary for Command {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Binary::fmt(&self.0, formatter)
+    }
+}
+
+/// Start byte of an MMDVM frame.
 pub const MMDVM_FRAME_START: u8 = 0xE0;
 
-// ---------------------------------------------------------------------------
-// Core command / request IDs
-// ---------------------------------------------------------------------------
-
-/// Request firmware version information.
-pub const MMDVM_GET_VERSION: u8 = 0x00;
-/// Request current modem status.
-pub const MMDVM_GET_STATUS: u8 = 0x01;
-/// Set modem configuration.
-pub const MMDVM_SET_CONFIG: u8 = 0x02;
-/// Set modem operating mode.
-pub const MMDVM_SET_MODE: u8 = 0x03;
-/// Set modem RX/TX frequency.
-pub const MMDVM_SET_FREQ: u8 = 0x04;
-
-/// Send a CW ID.
-pub const MMDVM_SEND_CWID: u8 = 0x0A;
-
-// ---------------------------------------------------------------------------
-// D-STAR
-// ---------------------------------------------------------------------------
-
-/// D-STAR radio header frame.
-pub const MMDVM_DSTAR_HEADER: u8 = 0x10;
-/// D-STAR voice+slow-data frame.
-pub const MMDVM_DSTAR_DATA: u8 = 0x11;
-/// D-STAR signal lost indication.
-pub const MMDVM_DSTAR_LOST: u8 = 0x12;
-/// D-STAR end-of-transmission marker.
-pub const MMDVM_DSTAR_EOT: u8 = 0x13;
-
-// ---------------------------------------------------------------------------
-// DMR
-// ---------------------------------------------------------------------------
-
-/// DMR slot-1 data.
-pub const MMDVM_DMR_DATA1: u8 = 0x18;
-/// DMR slot-1 signal lost.
-pub const MMDVM_DMR_LOST1: u8 = 0x19;
-/// DMR slot-2 data.
-pub const MMDVM_DMR_DATA2: u8 = 0x1A;
-/// DMR slot-2 signal lost.
-pub const MMDVM_DMR_LOST2: u8 = 0x1B;
-/// DMR short LC.
-pub const MMDVM_DMR_SHORTLC: u8 = 0x1C;
-/// DMR start of transmission.
-pub const MMDVM_DMR_START: u8 = 0x1D;
-/// DMR abort current transmission.
-pub const MMDVM_DMR_ABORT: u8 = 0x1E;
-
-// ---------------------------------------------------------------------------
-// Yaesu System Fusion (YSF)
-// ---------------------------------------------------------------------------
-
-/// YSF data frame.
-pub const MMDVM_YSF_DATA: u8 = 0x20;
-/// YSF signal lost.
-pub const MMDVM_YSF_LOST: u8 = 0x21;
-
-// ---------------------------------------------------------------------------
-// P25
-// ---------------------------------------------------------------------------
-
-/// P25 header.
-pub const MMDVM_P25_HDR: u8 = 0x30;
-/// P25 LDU (logical data unit).
-pub const MMDVM_P25_LDU: u8 = 0x31;
-/// P25 signal lost.
-pub const MMDVM_P25_LOST: u8 = 0x32;
-
-// ---------------------------------------------------------------------------
-// NXDN
-// ---------------------------------------------------------------------------
-
-/// NXDN data.
-pub const MMDVM_NXDN_DATA: u8 = 0x40;
-/// NXDN signal lost.
-pub const MMDVM_NXDN_LOST: u8 = 0x41;
-
-// ---------------------------------------------------------------------------
-// POCSAG
-// ---------------------------------------------------------------------------
-
-/// POCSAG paging data.
-pub const MMDVM_POCSAG_DATA: u8 = 0x50;
-
-// ---------------------------------------------------------------------------
-// FM
-// ---------------------------------------------------------------------------
-
-/// FM parameter set 1.
-pub const MMDVM_FM_PARAMS1: u8 = 0x60;
-/// FM parameter set 2.
-pub const MMDVM_FM_PARAMS2: u8 = 0x61;
-/// FM parameter set 3.
-pub const MMDVM_FM_PARAMS3: u8 = 0x62;
-/// FM parameter set 4.
-pub const MMDVM_FM_PARAMS4: u8 = 0x63;
-/// FM audio data.
-pub const MMDVM_FM_DATA: u8 = 0x65;
-/// FM status.
-pub const MMDVM_FM_STATUS: u8 = 0x66;
-/// FM end-of-transmission.
-pub const MMDVM_FM_EOT: u8 = 0x67;
-/// FM RSSI reading.
-pub const MMDVM_FM_RSSI: u8 = 0x68;
-
-// ---------------------------------------------------------------------------
-// Responses
-// ---------------------------------------------------------------------------
-
-/// Acknowledgement response.
-pub const MMDVM_ACK: u8 = 0x70;
-/// Negative acknowledgement response.
-pub const MMDVM_NAK: u8 = 0x7F;
-
-// ---------------------------------------------------------------------------
-// Serial passthrough / transparent / QSO info
-// ---------------------------------------------------------------------------
-
-/// Serial data passthrough.
-pub const MMDVM_SERIAL_DATA: u8 = 0x80;
-
-/// Transparent (bypass) frame.
-pub const MMDVM_TRANSPARENT: u8 = 0x90;
-/// QSO info frame.
-pub const MMDVM_QSO_INFO: u8 = 0x91;
-
-// ---------------------------------------------------------------------------
-// Debug (emitted by radio firmware)
-// ---------------------------------------------------------------------------
-
-/// Firmware debug message, level 1.
-pub const MMDVM_DEBUG1: u8 = 0xF1;
-/// Firmware debug message, level 2.
-pub const MMDVM_DEBUG2: u8 = 0xF2;
-/// Firmware debug message, level 3.
-pub const MMDVM_DEBUG3: u8 = 0xF3;
-/// Firmware debug message, level 4.
-pub const MMDVM_DEBUG4: u8 = 0xF4;
-/// Firmware debug message, level 5.
-pub const MMDVM_DEBUG5: u8 = 0xF5;
-/// Firmware debug memory dump.
-pub const MMDVM_DEBUG_DUMP: u8 = 0xFA;
-
-// ---------------------------------------------------------------------------
-// Capability bitfield bits (GetVersion response, protocol v2)
-// ---------------------------------------------------------------------------
-
-/// D-STAR capability bit in CAP1.
+/// D-STAR capability in the first capability byte.
 pub const CAP1_DSTAR: u8 = 0x01;
-/// DMR capability bit in CAP1.
+/// DMR capability in the first capability byte.
 pub const CAP1_DMR: u8 = 0x02;
-/// YSF capability bit in CAP1.
+/// Yaesu System Fusion capability in the first capability byte.
 pub const CAP1_YSF: u8 = 0x04;
-/// P25 capability bit in CAP1.
+/// P25 capability in the first capability byte.
 pub const CAP1_P25: u8 = 0x08;
-/// NXDN capability bit in CAP1.
+/// NXDN capability in the first capability byte.
 pub const CAP1_NXDN: u8 = 0x10;
-/// FM capability bit in CAP1.
+/// FM capability in the first capability byte.
 pub const CAP1_FM: u8 = 0x40;
-/// POCSAG capability bit in CAP2.
+/// POCSAG capability in the second capability byte.
 pub const CAP2_POCSAG: u8 = 0x01;
 
-// ---------------------------------------------------------------------------
-// Mode byte values (for `SetMode` and the status response)
-// ---------------------------------------------------------------------------
-
-/// Idle mode (no active protocol).
+/// Idle mode byte.
 pub const MODE_IDLE: u8 = 0;
-/// D-STAR mode.
+/// D-STAR mode byte.
 pub const MODE_DSTAR: u8 = 1;
-/// DMR mode.
+/// DMR mode byte.
 pub const MODE_DMR: u8 = 2;
-/// YSF mode.
+/// Yaesu System Fusion mode byte.
 pub const MODE_YSF: u8 = 3;
-/// P25 mode.
+/// P25 mode byte.
 pub const MODE_P25: u8 = 4;
-/// NXDN mode.
+/// NXDN mode byte.
 pub const MODE_NXDN: u8 = 5;
-/// POCSAG paging mode.
+/// POCSAG mode byte.
 pub const MODE_POCSAG: u8 = 6;
-/// FM analog mode.
+/// FM mode byte.
 pub const MODE_FM: u8 = 10;
-/// Continuous-wave (CW) ID mode.
-pub const MODE_CW: u8 = 98;
-/// Lockout (carrier sense) mode.
-pub const MODE_LOCKOUT: u8 = 99;
-/// Error mode.
-pub const MODE_ERROR: u8 = 100;
-/// Quit / shutdown mode.
-pub const MODE_QUIT: u8 = 110;
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn frame_start_byte() {
-        assert_eq!(MMDVM_FRAME_START, 0xE0);
-    }
+    type TestResult = Result<(), Box<dyn std::error::Error>>;
 
     #[test]
-    fn core_command_ids_match_reference() {
-        assert_eq!(MMDVM_GET_VERSION, 0x00);
-        assert_eq!(MMDVM_GET_STATUS, 0x01);
-        assert_eq!(MMDVM_SET_CONFIG, 0x02);
-        assert_eq!(MMDVM_SET_MODE, 0x03);
-        assert_eq!(MMDVM_SET_FREQ, 0x04);
-        assert_eq!(MMDVM_SEND_CWID, 0x0A);
-    }
-
-    #[test]
-    fn dstar_command_range() {
-        assert_eq!(MMDVM_DSTAR_HEADER, 0x10);
-        assert_eq!(MMDVM_DSTAR_DATA, 0x11);
-        assert_eq!(MMDVM_DSTAR_LOST, 0x12);
-        assert_eq!(MMDVM_DSTAR_EOT, 0x13);
-    }
-
-    #[test]
-    fn response_codes() {
-        assert_eq!(MMDVM_ACK, 0x70);
-        assert_eq!(MMDVM_NAK, 0x7F);
-    }
-
-    #[test]
-    fn capability_bits() {
-        // CAP1 is a bitfield: each bit must be distinct.
-        let cap1 = CAP1_DSTAR | CAP1_DMR | CAP1_YSF | CAP1_P25 | CAP1_NXDN | CAP1_FM;
-        assert_eq!(cap1, 0x5F);
-        assert_eq!(CAP2_POCSAG, 0x01);
-    }
-
-    #[test]
-    fn mode_byte_values() {
-        assert_eq!(MODE_IDLE, 0);
-        assert_eq!(MODE_DSTAR, 1);
-        assert_eq!(MODE_DMR, 2);
-        assert_eq!(MODE_YSF, 3);
-        assert_eq!(MODE_P25, 4);
-        assert_eq!(MODE_NXDN, 5);
-        assert_eq!(MODE_POCSAG, 6);
-        assert_eq!(MODE_FM, 10);
-        assert_eq!(MODE_CW, 98);
-        assert_eq!(MODE_LOCKOUT, 99);
-        assert_eq!(MODE_ERROR, 100);
-        assert_eq!(MODE_QUIT, 110);
+    fn unknown_identifiers_and_numeric_formats_preserve_the_wire_byte() -> TestResult {
+        for byte in 0..=u8::MAX {
+            let command = Command::from(byte);
+            assert_eq!(u8::from(command), byte);
+            assert_eq!(command.to_string().parse::<u8>()?, byte);
+            assert_eq!(u8::from_str_radix(&format!("{command:x}"), 16)?, byte);
+            assert_eq!(u8::from_str_radix(&format!("{command:X}"), 16)?, byte);
+            assert_eq!(u8::from_str_radix(&format!("{command:o}"), 8)?, byte);
+            assert_eq!(u8::from_str_radix(&format!("{command:b}"), 2)?, byte);
+        }
+        assert_eq!(format!("{:#04X}", Command::NAK), "0x7F");
+        Ok(())
     }
 }

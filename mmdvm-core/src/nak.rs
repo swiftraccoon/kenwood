@@ -4,27 +4,31 @@
 
 //! NAK response reason codes.
 //!
-//! The MMDVM firmware rejects a command with `[0xE0, len, 0x7F, cmd,
-//! reason]`. The reason codes below are approximated from
-//! `MMDVMHost/Modem.cpp:970-971` and the historical MMDVM
-//! specification; unknown codes are preserved in [`NakReason::Unknown`]
-//! rather than turning into a hard error, so callers can log and
-//! continue.
+//! A negative acknowledgement is `[0xE0, 5, 0x7F, command, reason]`.
+//! Names follow `MMDVM/SerialPort.cpp` `processMessage` and
+//! `MMDVM/DStarTX.cpp` `writeHeader`/`writeData`. Firmware state and command
+//! context can share one reason byte.
+//! See the [NAK example](crate#inspect-negative-acknowledgements).
+
+use std::fmt;
 
 /// NAK response reason code.
+///
+/// Unrecognized bytes retain their value. Code 5 identifies either a queue
+/// capacity refusal or a state refusal; it alone does not identify retry
+/// policy.
+/// See the [NAK example](crate#inspect-negative-acknowledgements).
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum NakReason {
     /// The command byte is not recognised.
     InvalidCommand,
-    /// The modem is in the wrong mode for this command.
-    WrongMode,
-    /// The command frame exceeds the maximum length.
-    CommandTooLong,
+    /// The requested mode is disabled or the active state refuses the command.
+    CommandUnavailable,
     /// The command payload contains incorrect data.
     DataIncorrect,
-    /// The TX buffer is full.
-    BufferFull,
+    /// A TX queue lacks space or the current state refuses the command.
+    QueueOrStateRejected,
     /// Unknown NAK reason byte; the raw code is preserved.
     Unknown {
         /// Raw byte as received from the modem.
@@ -39,11 +43,50 @@ impl NakReason {
     pub const fn from_byte(b: u8) -> Self {
         match b {
             1 => Self::InvalidCommand,
-            2 => Self::WrongMode,
-            3 => Self::CommandTooLong,
+            2 => Self::CommandUnavailable,
             4 => Self::DataIncorrect,
-            5 => Self::BufferFull,
+            5 => Self::QueueOrStateRejected,
             _ => Self::Unknown { code: b },
+        }
+    }
+
+    /// Return the preserved reason byte.
+    #[must_use]
+    pub const fn as_byte(self) -> u8 {
+        match self {
+            Self::InvalidCommand => 1,
+            Self::CommandUnavailable => 2,
+            Self::DataIncorrect => 4,
+            Self::QueueOrStateRejected => 5,
+            Self::Unknown { code } => code,
+        }
+    }
+}
+
+impl From<u8> for NakReason {
+    fn from(byte: u8) -> Self {
+        Self::from_byte(byte)
+    }
+}
+
+impl From<NakReason> for u8 {
+    fn from(reason: NakReason) -> Self {
+        reason.as_byte()
+    }
+}
+
+impl fmt::Display for NakReason {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidCommand => formatter.write_str("invalid command"),
+            Self::CommandUnavailable => {
+                formatter.write_str("command unavailable in the active mode")
+            }
+            Self::DataIncorrect => formatter.write_str("incorrect command data"),
+            Self::QueueOrStateRejected => {
+                formatter.write_str("TX queue or modem state refused the command")
+            }
+            Self::Unknown { code } => write!(formatter, "unknown reason 0x{code:02X}"),
         }
     }
 }
@@ -55,10 +98,10 @@ mod tests {
     #[test]
     fn known_reasons() {
         assert_eq!(NakReason::from_byte(1), NakReason::InvalidCommand);
-        assert_eq!(NakReason::from_byte(2), NakReason::WrongMode);
-        assert_eq!(NakReason::from_byte(3), NakReason::CommandTooLong);
+        assert_eq!(NakReason::from_byte(2), NakReason::CommandUnavailable);
+        assert_eq!(NakReason::from_byte(3), NakReason::Unknown { code: 3 });
         assert_eq!(NakReason::from_byte(4), NakReason::DataIncorrect);
-        assert_eq!(NakReason::from_byte(5), NakReason::BufferFull);
+        assert_eq!(NakReason::from_byte(5), NakReason::QueueOrStateRejected);
     }
 
     #[test]

@@ -6,7 +6,6 @@ use mmdvm_core::{MmdvmError, ModemMode, ModemStatus};
 // crate sees every dev-dep.
 use proptest as _;
 use thiserror as _;
-use tracing as _;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 

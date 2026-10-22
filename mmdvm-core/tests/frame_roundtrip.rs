@@ -1,181 +1,107 @@
-//! Wire frame encode/decode round-trip tests.
+//! Framing vectors and incremental decoding properties.
 
-// Integration-test crate sees every workspace dev-dep; acknowledge
-// the ones we don't touch directly to satisfy
-// `-D unused-crate-dependencies`.
 use thiserror as _;
-use tracing as _;
 
-use mmdvm_core::{
-    MAX_PAYLOAD_LEN, MMDVM_ACK, MMDVM_DMR_DATA1, MMDVM_DSTAR_DATA, MMDVM_DSTAR_EOT,
-    MMDVM_DSTAR_HEADER, MMDVM_DSTAR_LOST, MMDVM_FRAME_START, MMDVM_GET_STATUS, MMDVM_GET_VERSION,
-    MMDVM_NAK, MMDVM_SET_CONFIG, MMDVM_SET_FREQ, MMDVM_SET_MODE, MMDVM_YSF_DATA, MmdvmError,
-    MmdvmFrame, decode_frame, encode_frame,
-};
-
-// `proptest` is a dev-dependency used by the roundtrip property test
-// below; acknowledging it explicitly keeps
-// `-D unused_crate_dependencies` happy on this test binary.
+use mmdvm_core::{Command, MAX_PAYLOAD_LEN, MMDVM_FRAME_START, MmdvmError, MmdvmFrame};
 use proptest::prelude::*;
 
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 #[test]
-fn encode_decode_roundtrip_no_payload() -> TestResult {
-    let frame = MmdvmFrame::new(MMDVM_GET_VERSION);
-    let wire = encode_frame(&frame)?;
-    assert_eq!(wire, [MMDVM_FRAME_START, 3, MMDVM_GET_VERSION]);
-    let decoded = decode_frame(&wire)?.ok_or("expected full frame")?;
-    let (parsed, consumed) = decoded;
+fn short_and_extended_wire_vectors_have_independent_expected_headers() -> TestResult {
+    assert_eq!(
+        MmdvmFrame::new(Command::GET_VERSION).to_bytes(),
+        [0xE0, 3, 0]
+    );
+    let frame = MmdvmFrame::with_payload(Command::DSTAR_DATA, vec![0xAA; 12])?;
+    let wire = frame.to_bytes();
+    assert_eq!(wire.get(..3), Some([0xE0, 15, 0x11].as_slice()));
+    assert_eq!(wire.get(3..), Some([0xAA; 12].as_slice()));
+
+    let frame = MmdvmFrame::with_payload(Command::FM_DATA, vec![0x55; 300])?;
+    let wire = frame.to_bytes();
+    assert_eq!(wire.get(..4), Some([0xE0, 0, 49, 0x65].as_slice()));
+    assert_eq!(wire.len(), 304);
+    let (decoded, consumed) = MmdvmFrame::from_bytes(&wire)?.ok_or("missing complete frame")?;
+    assert_eq!(decoded, frame);
+    assert_eq!(consumed, 304);
+    Ok(())
+}
+
+#[test]
+fn complete_frames_leave_subsequent_bytes_with_the_caller() -> TestResult {
+    let wire = [MMDVM_FRAME_START, 3, 0, 0xAA, 0xBB];
+    let (frame, consumed) = MmdvmFrame::from_bytes(&wire)?.ok_or("missing complete frame")?;
+    assert_eq!(frame.command(), Command::GET_VERSION);
+    assert!(frame.payload().is_empty());
     assert_eq!(consumed, 3);
-    assert_eq!(parsed, frame);
+    assert_eq!(wire.get(consumed..), Some([0xAA, 0xBB].as_slice()));
     Ok(())
 }
 
 #[test]
-fn encode_decode_roundtrip_with_payload() -> TestResult {
-    let frame = MmdvmFrame::with_payload(MMDVM_DSTAR_DATA, (0..12u8).collect());
-    let wire = encode_frame(&frame)?;
-    assert_eq!(wire.len(), 15);
-    let (parsed, consumed) = decode_frame(&wire)?.ok_or("expected full frame")?;
-    assert_eq!(consumed, 15);
-    assert_eq!(parsed, frame);
-    Ok(())
-}
-
-#[test]
-fn decode_incomplete_returns_none() -> TestResult {
-    // Only start byte.
-    assert!(decode_frame(&[MMDVM_FRAME_START])?.is_none());
-    // Length claims 5, only 3 bytes present.
-    assert!(decode_frame(&[MMDVM_FRAME_START, 5, MMDVM_GET_VERSION])?.is_none());
-    // Totally empty.
-    assert!(decode_frame(&[])?.is_none());
-    Ok(())
-}
-
-#[test]
-fn decode_invalid_start_byte() {
-    let result = decode_frame(&[0xFF, 3, MMDVM_GET_VERSION]);
+fn malformed_start_and_short_lengths_are_rejected() -> TestResult {
+    let _valid = MmdvmFrame::from_bytes(&[MMDVM_FRAME_START, 3, 0])?;
+    let invalid = MmdvmFrame::from_bytes(&[0xFF, 3, 0]);
     assert!(
-        matches!(result, Err(MmdvmError::InvalidStartByte { got: 0xFF })),
-        "got {result:?}"
+        matches!(invalid, Err(MmdvmError::InvalidStartByte { got: 0xFF })),
+        "{invalid:?}"
     );
-}
-
-#[test]
-fn decode_invalid_length() {
-    let result = decode_frame(&[MMDVM_FRAME_START, 2, MMDVM_GET_VERSION]);
-    assert!(
-        matches!(result, Err(MmdvmError::InvalidLength { len: 2 })),
-        "got {result:?}"
-    );
-}
-
-#[test]
-fn encode_payload_too_large_errors() {
-    let frame = MmdvmFrame::with_payload(MMDVM_DSTAR_DATA, vec![0u8; MAX_PAYLOAD_LEN + 1]);
-    let result = encode_frame(&frame);
-    assert!(
-        matches!(
-            result,
-            Err(MmdvmError::PayloadTooLarge { len }) if len == MAX_PAYLOAD_LEN + 1
-        ),
-        "got {result:?}"
-    );
-}
-
-#[test]
-fn decode_with_trailing_data_returns_consumed() -> TestResult {
-    // Frame of length 3, followed by unrelated trailing bytes.
-    let wire = vec![MMDVM_FRAME_START, 3, MMDVM_GET_VERSION, 0xAA, 0xBB];
-    let (frame, consumed) = decode_frame(&wire)?.ok_or("expected full frame")?;
-    assert_eq!(consumed, 3);
-    assert_eq!(frame.command, MMDVM_GET_VERSION);
-    assert!(frame.payload.is_empty());
-    // Trailing bytes are untouched.
-    assert_eq!(wire.get(consumed..), Some(&[0xAA, 0xBB][..]));
-    Ok(())
-}
-
-#[test]
-fn encode_all_mode_command_bytes_roundtrip() -> TestResult {
-    // A representative selection across every protocol family.
-    let commands: &[u8] = &[
-        MMDVM_GET_VERSION,
-        MMDVM_GET_STATUS,
-        MMDVM_SET_CONFIG,
-        MMDVM_SET_MODE,
-        MMDVM_SET_FREQ,
-        MMDVM_DSTAR_HEADER,
-        MMDVM_DSTAR_DATA,
-        MMDVM_DSTAR_LOST,
-        MMDVM_DSTAR_EOT,
-        MMDVM_DMR_DATA1,
-        MMDVM_YSF_DATA,
-        MMDVM_ACK,
-        MMDVM_NAK,
-    ];
-    for &cmd in commands {
-        let frame = MmdvmFrame::with_payload(cmd, vec![cmd; 3]);
-        let wire = encode_frame(&frame)?;
-        let (parsed, consumed) = decode_frame(&wire)?.ok_or("expected full frame")?;
-        assert_eq!(
-            consumed,
-            wire.len(),
-            "consumed mismatch for command 0x{cmd:02X}"
+    for length in [1, 2] {
+        let invalid = MmdvmFrame::from_bytes(&[MMDVM_FRAME_START, length]);
+        assert!(
+            matches!(invalid, Err(MmdvmError::InvalidLength { len }) if len == length),
+            "{invalid:?}"
         );
-        assert_eq!(parsed, frame, "roundtrip failed for command 0x{cmd:02X}");
     }
     Ok(())
 }
 
 proptest! {
-    /// Any valid encoded frame decodes back to the original.
+    /// Every encodable command and payload preserves its semantic contents.
     #[test]
     fn prop_roundtrip_any_command_payload(
         command in any::<u8>(),
         payload in proptest::collection::vec(any::<u8>(), 0..=MAX_PAYLOAD_LEN),
     ) {
-        let frame = MmdvmFrame::with_payload(command, payload);
-        let wire = encode_frame(&frame).map_err(|e| TestCaseError::fail(format!("encode: {e}")))?;
-        let (parsed, consumed) = decode_frame(&wire)
-            .map_err(|e| TestCaseError::fail(format!("decode: {e}")))?
+        let frame = MmdvmFrame::with_payload(Command::from(command), payload)
+            .map_err(to_test_error)?;
+        let wire = frame.to_bytes();
+        let (parsed, consumed) = MmdvmFrame::from_bytes(&wire)
+            .map_err(to_test_error)?
             .ok_or_else(|| TestCaseError::fail("expected full frame"))?;
         prop_assert_eq!(consumed, wire.len());
         prop_assert_eq!(parsed, frame);
     }
 
-    /// Arbitrary bytes (the adversarial input a noisy serial or
-    /// Bluetooth link produces) must never panic the decoder; the
-    /// only outcomes are a frame, "need more", or a typed error.
+    /// Arbitrary input can only produce a bounded frame, an error or an incomplete result.
     #[test]
     fn prop_decode_arbitrary_bytes_never_panics(
         data in proptest::collection::vec(any::<u8>(), 0..600),
     ) {
-        if let Ok(Some((_, consumed))) = decode_frame(&data) {
+        if let Ok(Some((frame, consumed))) = MmdvmFrame::from_bytes(&data) {
             prop_assert!(consumed <= data.len());
+            prop_assert!(frame.payload().len() <= MAX_PAYLOAD_LEN);
         }
     }
 
-    /// Every strict prefix of a valid frame asks for more bytes
-    /// rather than erroring or mis-decoding: the property the
-    /// streaming reassembly path in the shell depends on.
+    /// Every strict prefix requests more bytes in both wire forms.
     #[test]
     fn prop_partial_frames_request_more_bytes(
         command in any::<u8>(),
         payload in proptest::collection::vec(any::<u8>(), 0..=MAX_PAYLOAD_LEN),
     ) {
-        let frame = MmdvmFrame::with_payload(command, payload);
-        let wire = encode_frame(&frame).map_err(|e| TestCaseError::fail(format!("encode: {e}")))?;
-        for k in 0..wire.len() {
-            let prefix = wire.get(..k)
-                .ok_or_else(|| TestCaseError::fail("prefix in bounds"))?;
-            let result = decode_frame(prefix);
-            prop_assert!(
-                matches!(result, Ok(None)),
-                "prefix of {} bytes must request more, got {:?}", k, result
-            );
+        let frame = MmdvmFrame::with_payload(Command::from(command), payload)
+            .map_err(to_test_error)?;
+        let wire = frame.to_bytes();
+        for length in 0..wire.len() {
+            let prefix = wire.get(..length).ok_or_else(|| TestCaseError::fail("prefix in bounds"))?;
+            let result = MmdvmFrame::from_bytes(prefix);
+            prop_assert!(matches!(result, Ok(None)), "prefix {length}: {result:?}");
         }
     }
+}
+
+fn to_test_error<E: std::fmt::Debug>(error: E) -> TestCaseError {
+    TestCaseError::fail(format!("{error:?}"))
 }

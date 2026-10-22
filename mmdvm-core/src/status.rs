@@ -12,6 +12,8 @@
 //!
 //! Payload layouts mirror `MMDVMHost/Modem.cpp:818-946`.
 
+use std::fmt;
+
 use crate::error::MmdvmError;
 use crate::mode::ModemMode;
 
@@ -50,19 +52,23 @@ const MIN_V2_LEN: usize = 12;
 
 /// The seven flag bits packed into the status byte.
 ///
-/// Wrapped as a newtype to avoid `clippy::struct_excessive_bools` on
-/// [`ModemStatus`]. The underlying byte is the one produced (and
-/// consumed) by the MMDVM firmware.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// Bits 0 through 6 describe TX, overflows, lockout and carrier detect.
+/// Construction explicitly discards the unassigned top bit, matching the
+/// host's tests of the seven individual masks.
+/// See the [status example](crate#parse-version-and-status-responses).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct StatusFlags(u8);
 
 impl StatusFlags {
-    /// Build a flags value from the raw status byte.
+    /// Construct an empty set with every interpreted flag clear.
     #[must_use]
-    pub const fn from_bits(bits: u8) -> Self {
-        // We mask to the seven documented bits to keep equality stable
-        // even if the firmware ever leaks stray bits in the reserved
-        // top bit.
+    pub const fn new() -> Self {
+        Self(0)
+    }
+
+    /// Preserve bits 0 through 6 and discard the unassigned bit 7.
+    #[must_use]
+    pub const fn from_bits_truncate(bits: u8) -> Self {
         Self(
             bits & (STATE_TX
                 | STATE_ADC_OVERFLOW
@@ -74,7 +80,7 @@ impl StatusFlags {
         )
     }
 
-    /// Raw status byte.
+    /// Return the seven retained status bits.
     #[must_use]
     pub const fn bits(self) -> u8 {
         self.0
@@ -123,8 +129,40 @@ impl StatusFlags {
     }
 }
 
+impl From<StatusFlags> for u8 {
+    fn from(flags: StatusFlags) -> Self {
+        flags.bits()
+    }
+}
+
+impl fmt::LowerHex for StatusFlags {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::LowerHex::fmt(&self.bits(), formatter)
+    }
+}
+impl fmt::UpperHex for StatusFlags {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::UpperHex::fmt(&self.bits(), formatter)
+    }
+}
+impl fmt::Octal for StatusFlags {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Octal::fmt(&self.bits(), formatter)
+    }
+}
+impl fmt::Binary for StatusFlags {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Binary::fmt(&self.bits(), formatter)
+    }
+}
+
 /// Parsed modem status response.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Every combination of the passive fields is representable. Parsing checks
+/// layout length, maps an unknown mode through [`ModemMode::from_byte`],
+/// and leaves diagnostic handling to the caller.
+/// See the [status example](crate#parse-version-and-status-responses).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ModemStatus {
     /// Current modem mode.
     pub mode: ModemMode,
@@ -204,9 +242,8 @@ impl ModemStatus {
                 min: MIN_V1_LEN,
             });
         }
-        // Lint-safe fetch; `get(..)` never panics.
         let mode = ModemMode::from_byte(payload.get(1).copied().unwrap_or(0));
-        let flags = StatusFlags::from_bits(payload.get(2).copied().unwrap_or(0));
+        let flags = StatusFlags::from_bits_truncate(payload.get(2).copied().unwrap_or(0));
         let dstar_space = payload.get(3).copied().unwrap_or(0);
         let dmr_space1 = payload.get(4).copied().unwrap_or(0);
         let dmr_space2 = payload.get(5).copied().unwrap_or(0);
@@ -230,7 +267,6 @@ impl ModemStatus {
             pocsag_space,
             fm_space: 0,
         };
-        log_overflow_warnings(status);
         Ok(status)
     }
 
@@ -248,7 +284,7 @@ impl ModemStatus {
             });
         }
         let mode = ModemMode::from_byte(payload.first().copied().unwrap_or(0));
-        let flags = StatusFlags::from_bits(payload.get(1).copied().unwrap_or(0));
+        let flags = StatusFlags::from_bits_truncate(payload.get(1).copied().unwrap_or(0));
         // payload[2] is unused / reserved.
         let dstar_space = payload.get(3).copied().unwrap_or(0);
         let dmr_space1 = payload.get(4).copied().unwrap_or(0);
@@ -256,9 +292,7 @@ impl ModemStatus {
         let ysf_space = payload.get(6).copied().unwrap_or(0);
         let p25_space = payload.get(7).copied().unwrap_or(0);
         let nxdn_space = payload.get(8).copied().unwrap_or(0);
-        // payload[9] is reserved; fm(10) and pocsag(11) are inside
-        // the guaranteed minimum length, so the unwrap_or(0) is
-        // lint-safe fetch only, never a real default.
+        // Byte 9 is reserved; FM and POCSAG counts are required by this layout.
         let fm_space = payload.get(10).copied().unwrap_or(0);
         let pocsag_space = payload.get(11).copied().unwrap_or(0);
 
@@ -274,28 +308,7 @@ impl ModemStatus {
             pocsag_space,
             fm_space,
         };
-        log_overflow_warnings(status);
         Ok(status)
-    }
-}
-
-/// Emit a `tracing::warn!` event for each overflow flag that's set,
-/// mirroring the `LogError` calls in
-/// `MMDVMHost/Modem.cpp:826-837,883-894`. Keeping the logging in
-/// the sans-io core is fine because `tracing` is a passive facade:
-/// no subscriber means no I/O.
-fn log_overflow_warnings(status: ModemStatus) {
-    if status.adc_overflow() {
-        tracing::warn!("MMDVM ADC levels have overflowed");
-    }
-    if status.rx_overflow() {
-        tracing::warn!("MMDVM RX buffer has overflowed");
-    }
-    if status.tx_overflow() {
-        tracing::warn!("MMDVM TX buffer has overflowed");
-    }
-    if status.dac_overflow() {
-        tracing::warn!("MMDVM DAC levels have overflowed");
     }
 }
 
@@ -378,7 +391,7 @@ mod tests {
 
     #[test]
     fn flags_all_bits_detected() {
-        let f = StatusFlags::from_bits(0x7F);
+        let f = StatusFlags::from_bits_truncate(0x7F);
         assert!(f.tx());
         assert!(f.adc_overflow());
         assert!(f.rx_overflow());
@@ -390,8 +403,7 @@ mod tests {
 
     #[test]
     fn flags_reserved_bit_masked_off() {
-        // Bit 7 (0x80) is reserved: from_bits must clear it.
-        let f = StatusFlags::from_bits(0xFF);
+        let f = StatusFlags::from_bits_truncate(0xFF);
         assert_eq!(f.bits(), 0x7F);
     }
 }
