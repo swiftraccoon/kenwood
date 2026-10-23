@@ -1738,7 +1738,8 @@ async fn run_controller(
                 let journal_result = lock_aprs_store(&aprs).begin_start(config);
                 let mut kiss = match radio.into_kiss_session() {
                     Ok(kiss) => kiss,
-                    Err((returned_radio, error)) => {
+                    Err(failure) => {
+                        let (returned_radio, error) = *failure;
                         radio = returned_radio;
                         restore_cat_after_kiss_return = true;
                         let detail = format!("could not enter KISS mode: {error}");
@@ -1764,7 +1765,8 @@ async fn run_controller(
                             deferred_reply = Some(DeferredReply::FailedAprsStart { reply, detail });
                             continue;
                         }
-                        Err((_kiss, exit_error)) => {
+                        Err(failure) => {
+                            let (_kiss, exit_error) = *failure;
                             let combined =
                                 format!("{detail}; KISS Return also failed: {exit_error}");
                             lock_aprs_store(&aprs).mark_failed(combined.clone());
@@ -1792,7 +1794,8 @@ async fn run_controller(
                             deferred_reply = Some(DeferredReply::AbandonedAprsStart);
                             continue;
                         }
-                        Err((_kiss, error)) => {
+                        Err(failure) => {
+                            let (_kiss, error) = *failure;
                             lock_aprs_store(&aprs).mark_failed(format!(
                                 "the APRS start caller went away and KISS Return failed: {error}"
                             ));
@@ -1811,7 +1814,8 @@ async fn run_controller(
                                 restore_cat_after_kiss_return = true;
                                 deferred_reply = Some(DeferredReply::StopAprs { reply });
                             }
-                            Err((_kiss, error)) => {
+                            Err(failure) => {
+                                let (_kiss, error) = *failure;
                                 let detail = format!("KISS Return failed: {error}");
                                 lock_aprs_store(&aprs).mark_failed(detail.clone());
                                 drop(reply.send(Err(AutomationError::AprsOperation { detail })));
@@ -1832,9 +1836,12 @@ async fn run_controller(
                                         detail: error.to_string(),
                                     })
                             }
-                            Err((_kiss, error)) => Err(AutomationError::Shutdown {
-                                detail: format!("KISS Return failed during shutdown: {error}"),
-                            }),
+                            Err(failure) => {
+                                let (_kiss, error) = *failure;
+                                Err(AutomationError::Shutdown {
+                                    detail: format!("KISS Return failed during shutdown: {error}"),
+                                })
+                            }
                         };
                         if let Some(reply) = reply {
                             drop(reply.send(result));
@@ -2505,7 +2512,7 @@ fn remote_screen(snapshot: &AutomationSnapshot, lease_id: ScreenLeaseId) -> Remo
 fn render_rgba8888(frame: &kenwood_thd75::screen::ScreenFrame) -> Vec<u8> {
     let rgb888 = frame.to_rgb888();
     let mut output = Vec::with_capacity(SCREEN_WIDTH * SCREEN_HEIGHT * 4);
-    for pixel in rgb888.chunks_exact(3) {
+    for pixel in rgb888.as_chunks::<3>().0 {
         output.extend_from_slice(pixel);
         output.push(u8::MAX);
     }
@@ -3653,13 +3660,13 @@ mod tests {
         let kiss = radio
             .enter_kiss(TncDataBand::A)
             .await
-            .map_err(|(_, error)| error)?;
+            .map_err(|failure| failure.1)?;
         // Take the unproven hatch deliberately: the point of this test
         // is that the radio itself stays fail-closed until restored.
         let mut radio = kiss
             .exit()
             .await
-            .map_err(|(_, error)| error)?
+            .map_err(|failure| failure.1)?
             .into_radio_unproven();
 
         let direct_qualification = radio.qualify_automation().await;
@@ -3690,11 +3697,11 @@ mod tests {
         let kiss = radio
             .enter_kiss(TncDataBand::A)
             .await
-            .map_err(|(_, error)| error)?;
-        let desynced = kiss.exit().await.map_err(|(_, error)| error)?;
+            .map_err(|failure| failure.1)?;
+        let desynced = kiss.exit().await.map_err(|failure| failure.1)?;
         let mut radio = match desynced.restore().await {
             Ok(radio) => radio,
-            Err((_desynced, error)) => return Err(error.into()),
+            Err(failure) => return Err(failure.1.into()),
         };
         assert_eq!(radio.identify().await?.model, RadioModel::ThD75);
         Ok(())

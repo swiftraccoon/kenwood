@@ -321,6 +321,7 @@ impl BluetoothByteTransport {
         not(target_os = "macos"),
         expect(
             clippy::unused_async,
+            clippy::unused_async_trait_impl,
             reason = "UniFFI keeps byte-link opening asynchronous on every target, while unsupported platforms return immediately"
         )
     )]
@@ -389,6 +390,7 @@ impl BluetoothByteTransport {
         not(target_os = "macos"),
         expect(
             clippy::unused_async,
+            clippy::unused_async_trait_impl,
             reason = "UniFFI keeps byte-link writes asynchronous on every target, while unsupported platforms return immediately"
         )
     )]
@@ -430,6 +432,7 @@ impl BluetoothByteTransport {
         not(target_os = "macos"),
         expect(
             clippy::unused_async,
+            clippy::unused_async_trait_impl,
             reason = "UniFFI keeps byte-link reads asynchronous on every target, while unsupported platforms return immediately"
         )
     )]
@@ -489,6 +492,7 @@ impl BluetoothByteTransport {
         not(target_os = "macos"),
         expect(
             clippy::unused_async,
+            clippy::unused_async_trait_impl,
             reason = "UniFFI keeps byte-link closure asynchronous on every target, while unsupported platforms only clear local state"
         )
     )]
@@ -1031,7 +1035,8 @@ async fn recover_and_qualify_serial<T: Transport>(
     }
     let transport = match radio.into_raw_protocol_session() {
         Ok(transport) => transport,
-        Err((radio, error)) => {
+        Err(failure) => {
+            let (radio, error) = *failure;
             drop(radio.disconnect().await);
             return Err(BluetoothLinkError::CatIdentityUnavailable {
                 detail: format!("CAT identity left an unsafe raw boundary: {error}"),
