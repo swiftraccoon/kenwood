@@ -33,7 +33,7 @@ fn complete_frames_leave_subsequent_bytes_with_the_caller() -> TestResult {
     let wire = [MMDVM_FRAME_START, 3, 0, 0xAA, 0xBB];
     let (frame, consumed) = MmdvmFrame::from_bytes(&wire)?.ok_or("missing complete frame")?;
     assert_eq!(frame.command(), Command::GET_VERSION);
-    assert!(frame.payload().is_empty());
+    assert_eq!(frame.payload(), []);
     assert_eq!(consumed, 3);
     assert_eq!(wire.get(consumed..), Some([0xAA, 0xBB].as_slice()));
     Ok(())
