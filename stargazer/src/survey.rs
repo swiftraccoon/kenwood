@@ -588,7 +588,7 @@ fn append_bytes(
         let _position = file.seek(io::SeekFrom::End(-1)).map_err(archive_io(path))?;
         let mut tail = [0];
         file.read_exact(&mut tail).map_err(archive_io(path))?;
-        if tail != [b'\n'] {
+        if tail != *b"\n" {
             return Err(ArchiveError::Unterminated(path.to_owned()));
         }
     }

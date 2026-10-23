@@ -55,7 +55,13 @@ impl<'a> FrameArchive<'a> {
     #[must_use]
     pub fn iter(self) -> FrameRecords<'a> {
         FrameRecords {
-            chunks: self.bytes.get(16..).unwrap_or_default().chunks_exact(13),
+            chunks: self
+                .bytes
+                .get(16..)
+                .unwrap_or_default()
+                .as_chunks::<13>()
+                .0
+                .iter(),
         }
     }
 }
@@ -89,7 +95,7 @@ impl<'a> IntoIterator for &FrameArchive<'a> {
 /// Borrowed, exact-size iterator over validated 13-byte frame records.
 #[derive(Debug, Clone)]
 pub struct FrameRecords<'a> {
-    chunks: std::slice::ChunksExact<'a, u8>,
+    chunks: std::slice::Iter<'a, [u8; 13]>,
 }
 impl Iterator for FrameRecords<'_> {
     type Item = FrameRecord;

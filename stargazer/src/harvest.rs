@@ -387,7 +387,7 @@ fn percent_decode(s: &str) -> String {
             i += 1;
         }
     }
-    String::from_utf8_lossy(&out).into_owned()
+    String::from_utf8_lossy_owned(out)
 }
 
 /// True when `name` is a single safe path component: no directory
@@ -1837,7 +1837,7 @@ mod tests {
         )?];
         let plan = plan(&p, &[], Module::C, &BTreeSet::new());
         assert_eq!(plan.published_only, 0, "other module is out of scope");
-        assert!(plan.items.is_empty());
+        assert_eq!(plan.items, Vec::<FetchItem>::new());
         Ok(())
     }
 
@@ -1852,7 +1852,7 @@ mod tests {
         )?];
         let plan = plan(&[], &l, Module::C, &BTreeSet::new());
         assert_eq!(plan.local_only, 1);
-        assert!(plan.items.is_empty());
+        assert_eq!(plan.items, Vec::<FetchItem>::new());
         Ok(())
     }
 
@@ -2027,14 +2027,14 @@ mod tests {
                 const { NonZeroUsize::new(4096).unwrap() },
             )?;
             assert_eq!(loaded.skipped, 1, "{stream}");
-            assert!(loaded.recordings.is_empty());
+            assert_eq!(loaded.recordings, Vec::<LocalRecording>::new());
         }
         std::fs::write(&path, [b'x'; 33])?;
         let maximum = NonZeroUsize::new(32).ok_or("limit")?;
         assert!(read_sidecar(&path, maximum).is_err());
         let loaded = LoadedLocal::from_directory(directory.path(), maximum)?;
         assert_eq!(loaded.skipped, 1);
-        assert!(loaded.recordings.is_empty());
+        assert_eq!(loaded.recordings, Vec::<LocalRecording>::new());
         assert!(parse_published_name("REF030-C--20260711-180000.000--W1AW--0000.mp3").is_none());
         Ok(())
     }

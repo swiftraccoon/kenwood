@@ -700,11 +700,11 @@ fn print_harvest_run(rec: &stargazer::harvest::RunRecord) {
         println!("{} {}: nothing published", rec.target, rec.date);
         return;
     }
-    let pct = if rec.published_tx > 0 {
-        rec.matched.saturating_mul(100) / rec.published_tx
-    } else {
-        0
-    };
+    let pct = rec
+        .matched
+        .saturating_mul(100)
+        .checked_div(rec.published_tx)
+        .unwrap_or(0);
     let action = if rec.dry_run {
         format!("dry run, would fetch {}", rec.planned)
     } else {

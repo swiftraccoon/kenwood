@@ -574,7 +574,7 @@ async fn serve_client(
     let mut bytes = Vec::with_capacity(MAX_COMMAND_BYTES);
     let mut byte = [0];
     loop {
-        if stream.read(&mut byte).await? == 0 || byte == [b'\n'] {
+        if stream.read(&mut byte).await? == 0 || byte == *b"\n" {
             break;
         }
         if bytes.len() == MAX_COMMAND_BYTES {

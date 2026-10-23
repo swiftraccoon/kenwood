@@ -149,7 +149,7 @@ mod tests {
     #[test]
     fn empty_stream_is_empty_audio() -> Result<(), Box<dyn std::error::Error>> {
         let out = DecodedAudio::from_frames(&[])?;
-        assert!(out.pcm.is_empty());
+        assert_eq!(out.pcm, Vec::<i16>::new());
         assert_eq!(out.concealed_frames, 0);
         Ok(())
     }
