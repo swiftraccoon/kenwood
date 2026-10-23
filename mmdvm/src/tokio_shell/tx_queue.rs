@@ -208,7 +208,7 @@ mod tests {
         assert!(q.pop_if_space_allows(1).is_none());
         let eot = q.pop_if_space_allows(2).ok_or("expected eot")?;
         assert_eq!(eot.command, Command::DSTAR_EOT);
-        assert!(eot.payload.is_empty());
+        assert_eq!(eot.payload, Vec::<u8>::new());
         Ok(())
     }
 

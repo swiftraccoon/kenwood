@@ -2,8 +2,10 @@
 
 use std::cell::Cell;
 use std::collections::VecDeque;
+use std::future::{poll_fn, ready};
 use std::io;
 use std::num::NonZeroU32;
+use std::task::Poll;
 
 use kenwood_transport::MockTransport;
 use mmdvm_core::ModemMode;
@@ -73,9 +75,11 @@ impl Transport for TimedTransport {
         self.inner.read(buffer).await
     }
 
-    async fn close(&mut self) -> Result<(), TransportError> {
-        self.controls.push("close");
-        Ok(())
+    fn close(&mut self) -> impl Future<Output = Result<(), TransportError>> + Send {
+        poll_fn(move |_context| {
+            self.controls.push("close");
+            Poll::Ready(Ok(()))
+        })
     }
 
     fn set_baud_rate(&mut self, _baud: NonZeroU32) -> Result<(), TransportError> {
@@ -83,9 +87,11 @@ impl Transport for TimedTransport {
         Ok(())
     }
 
-    async fn reopen(&mut self) -> Result<(), TransportError> {
-        self.controls.push("reopen");
-        Ok(())
+    fn reopen(&mut self) -> impl Future<Output = Result<(), TransportError>> + Send {
+        poll_fn(move |_context| {
+            self.controls.push("reopen");
+            Poll::Ready(Ok(()))
+        })
     }
 }
 
@@ -205,7 +211,7 @@ async fn cancelled_before_version_sends_nothing() {
     let mut transport = MockTransport::new();
     let result = probe_diagnostics_until(&mut transport, BUDGET, || true).await;
     assert!(matches!(result, Err(ProbeError::Cancelled)));
-    assert!(transport.writes().is_empty());
+    assert_eq!(transport.writes(), Vec::<Vec<u8>>::new());
 }
 
 #[tokio::test]
@@ -264,7 +270,7 @@ async fn invalid_timeout_does_not_send_either_query() {
         let mut transport = MockTransport::new();
         let result = probe_diagnostics(&mut transport, timeout).await;
         assert!(matches!(result, Err(ProbeError::InvalidTimeout { .. })));
-        assert!(transport.writes().is_empty());
+        assert_eq!(transport.writes(), Vec::<Vec<u8>>::new());
     }
 }
 
@@ -277,7 +283,7 @@ async fn both_writes_consume_the_same_budget_without_control_operations() -> Tes
     assert!(matches!(report.status, Err(ProbeError::Timeout { .. })));
     assert_eq!(started.elapsed(), BUDGET);
     assert_eq!(transport.writes, [VERSION_REQUEST, STATUS_REQUEST]);
-    assert!(transport.controls.is_empty());
+    assert_eq!(transport.controls, Vec::<&str>::new());
     transport.inner.assert_complete();
     Ok(())
 }
@@ -294,7 +300,7 @@ async fn failed_status_write_preserves_error_and_version_without_retries() -> Te
             && error.to_string() == "scripted status write failure"
     ));
     assert_eq!(transport.writes, [VERSION_REQUEST, STATUS_REQUEST]);
-    assert!(transport.controls.is_empty());
+    assert_eq!(transport.controls, Vec::<&str>::new());
     transport.inner.assert_complete();
     Ok(())
 }
@@ -308,7 +314,7 @@ async fn pending_status_write_expires_at_original_deadline() -> TestResult {
     assert!(matches!(report.status, Err(ProbeError::Timeout { .. })));
     assert_eq!(started.elapsed(), BUDGET);
     assert_eq!(transport.writes, [VERSION_REQUEST, STATUS_REQUEST]);
-    assert!(transport.controls.is_empty());
+    assert_eq!(transport.controls, Vec::<&str>::new());
     transport.inner.assert_complete();
     Ok(())
 }
@@ -321,7 +327,7 @@ async fn dropping_during_status_write_does_not_emit_recovery_traffic() {
         tokio::time::timeout(cancel_after, probe_diagnostics(&mut transport, BUDGET)).await;
     assert!(result.is_err(), "the pending probe must be cancelled");
     assert_eq!(transport.writes, [VERSION_REQUEST, STATUS_REQUEST]);
-    assert!(transport.controls.is_empty());
+    assert_eq!(transport.controls, Vec::<&str>::new());
     transport.inner.assert_complete();
 }
 
@@ -473,33 +479,40 @@ impl ReadyNoiseTransport {
 }
 
 impl Transport for ReadyNoiseTransport {
-    async fn write(&mut self, bytes: &[u8]) -> Result<(), TransportError> {
-        self.writes.push(bytes.to_vec());
-        Ok(())
+    fn write(&mut self, bytes: &[u8]) -> impl Future<Output = Result<(), TransportError>> + Send {
+        poll_fn(move |_context| {
+            self.writes.push(bytes.to_vec());
+            Poll::Ready(Ok(()))
+        })
     }
 
-    async fn read(&mut self, buffer: &mut [u8]) -> Result<usize, TransportError> {
-        let Some(target) = buffer.first_mut() else {
-            return Ok(0);
-        };
-        if let Some(byte) = self.version.pop_front() {
-            *target = byte;
-            return Ok(1);
-        }
-        if self.remaining_noise_reads == 0 {
-            return Ok(0);
-        }
-        // Deliberately synchronous: timeout futures must not rely on a Pending
-        // return to notice that immediately available input exhausted the budget.
-        std::thread::sleep(Duration::from_millis(10));
-        self.remaining_noise_reads -= 1;
-        self.noise_reads += 1;
-        *target = b'x';
-        Ok(1)
+    fn read(
+        &mut self,
+        buffer: &mut [u8],
+    ) -> impl Future<Output = Result<usize, TransportError>> + Send {
+        poll_fn(move |_context| {
+            let Some(target) = buffer.first_mut() else {
+                return Poll::Ready(Ok(0));
+            };
+            if let Some(byte) = self.version.pop_front() {
+                *target = byte;
+                return Poll::Ready(Ok(1));
+            }
+            if self.remaining_noise_reads == 0 {
+                return Poll::Ready(Ok(0));
+            }
+            // Deliberately synchronous: timeout futures must not rely on a Pending
+            // return to notice that immediately available input exhausted the budget.
+            std::thread::sleep(Duration::from_millis(10));
+            self.remaining_noise_reads -= 1;
+            self.noise_reads += 1;
+            *target = b'x';
+            Poll::Ready(Ok(1))
+        })
     }
 
-    async fn close(&mut self) -> Result<(), TransportError> {
-        Ok(())
+    fn close(&mut self) -> impl Future<Output = Result<(), TransportError>> + Send {
+        ready(Ok(()))
     }
 }
 

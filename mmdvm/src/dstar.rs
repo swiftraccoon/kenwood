@@ -1822,7 +1822,7 @@ mod tests {
         assert!(runtime.current_header().is_none());
         assert!(!runtime.echo_active);
         assert!(runtime.echo_header.is_none());
-        assert!(runtime.echo_frames.is_empty());
+        assert_eq!(runtime.echo_frames, Vec::<VoiceFrame>::new());
         assert_eq!(runtime.slow_data_frame_index, 0);
         assert!(matches!(
             runtime.pending_events.front(),
@@ -1866,7 +1866,7 @@ mod tests {
         for _ in 0..MAX_ECHO_RECORDING_FRAMES {
             runtime.handle_voice_data(frame);
         }
-        assert!(runtime.echo_frames.is_empty());
+        assert_eq!(runtime.echo_frames, Vec::<VoiceFrame>::new());
         assert_eq!(runtime.pending_events.len(), 1, "abort is emitted once");
         assert!(matches!(
             runtime.on_eot().await?,
@@ -2076,7 +2076,7 @@ mod tests {
                     my_suffix: Suffix::from_wire_bytes(*b"    "),
                 });
 
-                assert!(gateway.last_heard().is_empty());
+                assert_eq!(gateway.last_heard(), []);
                 Ok(())
             })
             .await
@@ -2308,7 +2308,7 @@ mod tests {
                 assert_eq!(gateway.current_header(), Some(&second));
                 assert!(!gateway.echo_active);
                 assert!(gateway.echo_header.is_none());
-                assert!(gateway.echo_frames.is_empty());
+                assert_eq!(gateway.echo_frames, Vec::<VoiceFrame>::new());
                 assert_eq!(gateway.slow_data_frame_index, 0);
                 Ok(())
             })
@@ -2340,7 +2340,7 @@ mod tests {
                 assert!(gateway.current_header().is_none());
                 assert!(!gateway.echo_active);
                 assert!(gateway.echo_header.is_none());
-                assert!(gateway.echo_frames.is_empty());
+                assert_eq!(gateway.echo_frames, Vec::<VoiceFrame>::new());
                 assert_eq!(gateway.slow_data_frame_index, 0);
                 Ok(())
             })
@@ -2463,7 +2463,7 @@ mod tests {
                 assert!(!gateway.is_receiving());
                 assert!(gateway.current_header().is_none());
                 assert!(!gateway.echo_active);
-                assert!(gateway.echo_frames.is_empty());
+                assert_eq!(gateway.echo_frames, Vec::<VoiceFrame>::new());
                 assert_eq!(gateway.slow_data_frame_index, 0);
                 Ok(())
             })

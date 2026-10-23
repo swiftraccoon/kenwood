@@ -358,8 +358,10 @@ impl Deadline {
 
 #[cfg(test)]
 mod tests {
+    use std::future::poll_fn;
     use std::io;
     use std::num::NonZeroU32;
+    use std::task::Poll;
 
     use kenwood_transport::MockTransport;
 
@@ -420,20 +422,27 @@ mod tests {
             }
         }
 
-        async fn read(&mut self, buffer: &mut [u8]) -> Result<usize, TransportError> {
-            self.reads += 1;
-            match self.read_behavior {
-                ReadBehavior::InvalidCount => Ok(buffer.len() + 1),
-                ReadBehavior::Fail => Err(TransportError::Read(io::Error::new(
-                    io::ErrorKind::ConnectionReset,
-                    "scripted probe read failure",
-                ))),
-            }
+        fn read(
+            &mut self,
+            buffer: &mut [u8],
+        ) -> impl Future<Output = Result<usize, TransportError>> + Send {
+            poll_fn(move |_context| {
+                self.reads += 1;
+                Poll::Ready(match self.read_behavior {
+                    ReadBehavior::InvalidCount => Ok(buffer.len() + 1),
+                    ReadBehavior::Fail => Err(TransportError::Read(io::Error::new(
+                        io::ErrorKind::ConnectionReset,
+                        "scripted probe read failure",
+                    ))),
+                })
+            })
         }
 
-        async fn close(&mut self) -> Result<(), TransportError> {
-            self.controls.push("close");
-            Ok(())
+        fn close(&mut self) -> impl Future<Output = Result<(), TransportError>> + Send {
+            poll_fn(move |_context| {
+                self.controls.push("close");
+                Poll::Ready(Ok(()))
+            })
         }
 
         fn set_baud_rate(&mut self, _baud: NonZeroU32) -> Result<(), TransportError> {
@@ -441,9 +450,11 @@ mod tests {
             Ok(())
         }
 
-        async fn reopen(&mut self) -> Result<(), TransportError> {
-            self.controls.push("reopen");
-            Ok(())
+        fn reopen(&mut self) -> impl Future<Output = Result<(), TransportError>> + Send {
+            poll_fn(move |_context| {
+                self.controls.push("reopen");
+                Poll::Ready(Ok(()))
+            })
         }
     }
 
@@ -521,7 +532,7 @@ mod tests {
             let mut transport = MockTransport::new();
             let result = probe_version(&mut transport, timeout).await;
             assert!(matches!(result, Err(ProbeError::InvalidTimeout { .. })));
-            assert!(transport.writes().is_empty());
+            assert_eq!(transport.writes(), Vec::<Vec<u8>>::new());
             transport.assert_complete();
         }
     }
@@ -564,7 +575,7 @@ mod tests {
         ));
         assert_eq!(transport.writes, [REQUEST]);
         assert_eq!(transport.reads, 1);
-        assert!(transport.controls.is_empty());
+        assert_eq!(transport.controls, Vec::<&str>::new());
     }
 
     #[tokio::test]
@@ -577,7 +588,7 @@ mod tests {
         );
         assert_eq!(transport.writes, [REQUEST]);
         assert_eq!(transport.reads, 0);
-        assert!(transport.controls.is_empty());
+        assert_eq!(transport.controls, Vec::<&str>::new());
     }
 
     #[tokio::test]
@@ -590,7 +601,7 @@ mod tests {
         );
         assert_eq!(transport.writes, [REQUEST]);
         assert_eq!(transport.reads, 1);
-        assert!(transport.controls.is_empty());
+        assert_eq!(transport.controls, Vec::<&str>::new());
     }
 
     #[tokio::test(start_paused = true)]
@@ -602,7 +613,7 @@ mod tests {
         assert_eq!(started.elapsed(), BUDGET);
         assert_eq!(transport.writes, [REQUEST]);
         assert_eq!(transport.reads, 0);
-        assert!(transport.controls.is_empty());
+        assert_eq!(transport.controls, Vec::<&str>::new());
     }
 
     #[tokio::test(start_paused = true)]
@@ -619,7 +630,7 @@ mod tests {
         assert_eq!(started.elapsed(), cancellation);
         assert_eq!(transport.writes, [REQUEST]);
         assert_eq!(transport.reads, 0);
-        assert!(transport.controls.is_empty());
+        assert_eq!(transport.controls, Vec::<&str>::new());
     }
 
     #[tokio::test]
