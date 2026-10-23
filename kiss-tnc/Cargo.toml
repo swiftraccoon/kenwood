@@ -8,7 +8,7 @@ keywords = ["kiss", "ax25", "tnc", "ham-radio", "amateur-radio"]
 license = "GPL-2.0-or-later"
 publish = false
 repository = "https://github.com/swiftraccoon/kenwood"
-rust-version = "1.94"
+rust-version = "1.99"
 description = "KISS TNC (Terminal Node Controller) wire protocol codec"
 
 [dependencies]
