@@ -108,11 +108,11 @@ fn row(
                 .open_url(egui::OpenUrl::new_tab(crate::ui::format::qrz_url(
                     &station.callsign,
                 )));
-            ui.close_menu();
+            ui.close();
         }
         if ui.button("Copy callsign").clicked() {
             ui.ctx().copy_text(station.callsign.clone());
-            ui.close_menu();
+            ui.close();
         }
     });
 }

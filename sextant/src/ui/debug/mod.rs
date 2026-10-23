@@ -3,24 +3,24 @@
 
 //! Debug page, the engineering surface: event log and tools.
 
-pub(crate) mod log;
-pub(crate) mod tools;
-
 use eframe::egui;
 
 use crate::app::App;
 
+pub(crate) mod log;
+pub(crate) mod tools;
+
 /// Render the debug page: tools on the right, log filling the rest.
-pub(crate) fn show(app: &mut App, ctx: &egui::Context) {
-    egui::SidePanel::right("debug_tools")
+pub(crate) fn show(app: &mut App, ui: &mut egui::Ui) {
+    egui::Panel::right("debug_tools")
         .resizable(true)
-        .default_width(300.0)
-        .show(ctx, |ui| {
+        .default_size(300.0)
+        .show(ui, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 tools::show(app, ui);
             });
         });
-    egui::CentralPanel::default().show(ctx, |ui| {
+    egui::CentralPanel::default().show(ui, |ui| {
         log::show(app, ui);
     });
 }

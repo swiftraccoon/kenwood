@@ -873,26 +873,25 @@ impl App {
         TxPosition::new(latitude, longitude, symbol, &self.tx_gps.comment).ok()
     }
 
-    /// Operator page: interim composition re-homing the existing
-    /// panels until the deck components land.
-    fn show_operator_page(&mut self, ctx: &egui::Context) {
-        let _unused = egui::TopBottomPanel::bottom("tx_strip")
+    /// Operator page with the transmit strip below the station deck.
+    fn show_operator_page(&mut self, ui: &mut egui::Ui) {
+        let _unused = egui::Panel::bottom("tx_strip")
             .frame(
-                egui::Frame::none()
+                egui::Frame::NONE
                     .fill(crate::theme::BG_INSET)
-                    .inner_margin(egui::Margin::symmetric(16.0, 10.0)),
+                    .inner_margin(egui::Margin::symmetric(16, 10)),
             )
-            .show(ctx, |ui| {
+            .show(ui, |ui| {
                 ui::operator::tx_strip::show(self, ui);
             });
-        let _unused = egui::CentralPanel::default().show(ctx, |ui| {
+        let _unused = egui::CentralPanel::default().show(ui, |ui| {
             ui::operator::show_deck(self, ui);
         });
     }
 
     /// Debug page: event log + engineering tools.
-    fn show_debug_page(&mut self, ctx: &egui::Context) {
-        ui::debug::show(self, ctx);
+    fn show_debug_page(&mut self, ui: &mut egui::Ui) {
+        ui::debug::show(self, ui);
     }
 
     fn build_connect_config(&self) -> Result<ConnectConfig, String> {
@@ -973,38 +972,41 @@ impl eframe::App for App {
         }
     }
 
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_events();
         self.drain_audio_status();
-        self.handle_ptt_keybinding(ctx);
 
-        let _unused = egui::TopBottomPanel::top("header")
+        // Continue observing the worker while the application window is hidden.
+        ctx.request_repaint_after(std::time::Duration::from_millis(50));
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        self.handle_ptt_keybinding(&ctx);
+
+        let _unused = egui::Panel::top("header")
             .frame(
-                egui::Frame::none()
+                egui::Frame::NONE
                     .fill(crate::theme::BG_WINDOW)
-                    .inner_margin(egui::Margin::symmetric(16.0, 10.0)),
+                    .inner_margin(egui::Margin::symmetric(16, 10)),
             )
-            .show(ctx, |ui| {
+            .show(ui, |ui| {
                 ui::header(self, ui);
             });
         if self.last_error.is_some() {
-            let _unused = egui::TopBottomPanel::top("error_strip")
-                .frame(egui::Frame::none())
-                .show(ctx, |ui| {
+            let _unused = egui::Panel::top("error_strip")
+                .frame(egui::Frame::NONE)
+                .show(ui, |ui| {
                     ui::error_strip(self, ui);
                 });
         }
         match self.page {
-            ui::Page::Operator => self.show_operator_page(ctx),
-            ui::Page::Debug => self.show_debug_page(ctx),
+            ui::Page::Operator => self.show_operator_page(ui),
+            ui::Page::Debug => self.show_debug_page(ui),
         }
         // Overlays draw last so they sit above both pages.
-        ui::operator::connect_sheet::show(self, ctx);
-        ui::settings_popup::show(self, ctx);
-
-        // Repaint frequently so log lines and voice events appear
-        // within a few frames of arrival.
-        ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        ui::operator::connect_sheet::show(self, &ctx);
+        ui::settings_popup::show(self, &ctx);
     }
 }
 
@@ -1046,13 +1048,13 @@ mod tests {
             super::ptt_command(&context, true, false),
             Some(AudioCommand::StartTx)
         ));
-        let _output = context.end_pass();
+        context.end_pass().textures_delta.clear();
 
         context.begin_pass(egui::RawInput {
             events: vec![key(false)],
             ..Default::default()
         });
-        context.memory_mut(|memory| memory.request_focus(egui::Id::new("callsign")));
+        context.memory_mut(|memory| memory.request_focus(egui::Id::unique("callsign")));
         assert!(
             context.memory(|memory| memory.focused().is_some()),
             "test must exercise focused input"
@@ -1064,18 +1066,18 @@ mod tests {
             ),
             "focused input swallowed the stop request"
         );
-        let _output = context.end_pass();
+        context.end_pass().textures_delta.clear();
 
         context.begin_pass(egui::RawInput {
             events: vec![key(true)],
             ..Default::default()
         });
-        context.memory_mut(|memory| memory.request_focus(egui::Id::new("callsign")));
+        context.memory_mut(|memory| memory.request_focus(egui::Id::unique("callsign")));
         assert!(
             super::ptt_command(&context, true, false).is_none(),
             "typing a space started transmission"
         );
-        let _output = context.end_pass();
+        context.end_pass().textures_delta.clear();
     }
 
     #[test]

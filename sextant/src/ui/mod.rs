@@ -13,7 +13,7 @@
 
 //! egui front-end panels.
 //!
-//! `App::update` composes the dashboard from these per-panel `show`
+//! `App::ui` composes the dashboard from these per-panel `show`
 //! functions. Each panel is pure presentation: it reads `App` state
 //! and calls `App` action methods: no async, no I/O.
 
@@ -194,9 +194,9 @@ pub(crate) fn error_strip(app: &mut App, ui: &mut egui::Ui) {
     let Some(err) = app.last_error.clone() else {
         return;
     };
-    egui::Frame::none()
+    egui::Frame::NONE
         .fill(crate::theme::err_strip_bg())
-        .inner_margin(egui::Margin::symmetric(12.0, 6.0))
+        .inner_margin(egui::Margin::symmetric(12, 6))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.colored_label(crate::theme::ERR, &err);

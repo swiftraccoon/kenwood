@@ -8,7 +8,7 @@
 //! marks active outgoing audio, and [`OK`] green marks connection state and meters.
 
 use eframe::egui::{
-    self, Color32, FontData, FontDefinitions, FontFamily, FontId, Margin, Rounding, Stroke,
+    self, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Margin, Stroke,
     TextStyle, Vec2,
 };
 
@@ -60,7 +60,7 @@ pub(crate) fn family_mono_medium() -> FontFamily {
 /// startup from `App::new`.
 pub(crate) fn apply(ctx: &egui::Context) {
     ctx.set_fonts(font_definitions());
-    ctx.set_style(style());
+    ctx.set_global_style(style());
 }
 
 /// Small uppercase section label ("NOW RECEIVING", "HEARD").
@@ -78,10 +78,10 @@ pub(crate) fn level_meter(ui: &mut egui::Ui, fraction: f32, color: Color32) {
     let desired = Vec2::new(ui.available_width().max(40.0), 4.0);
     let (rect, _response) = ui.allocate_exact_size(desired, egui::Sense::hover());
     let painter = ui.painter();
-    let _track = painter.rect_filled(rect, Rounding::same(2.0), HAIRLINE);
+    let _track = painter.rect_filled(rect, CornerRadius::same(2), HAIRLINE);
     let mut fill = rect;
     fill.set_width(rect.width() * fraction.clamp(0.0, 1.0));
-    let _fill = painter.rect_filled(fill, Rounding::same(2.0), color);
+    let _fill = painter.rect_filled(fill, CornerRadius::same(2), color);
 }
 
 /// Font stack: `Inter` for UI text, `JetBrains Mono` for data, with
@@ -115,7 +115,7 @@ fn font_definitions() -> FontDefinitions {
     for (name, bytes) in faces {
         let _prev = fonts
             .font_data
-            .insert((*name).to_owned(), FontData::from_static(bytes));
+            .insert((*name).to_owned(), FontData::from_static(bytes).into());
     }
 
     let stack = |first: &str, fallback: &[String]| -> Vec<String> {
@@ -152,7 +152,7 @@ fn style() -> egui::Style {
     v.window_fill = BG_WINDOW;
     v.extreme_bg_color = BG_INSET;
     v.window_stroke = Stroke::new(1.0_f32, BORDER);
-    v.window_rounding = Rounding::same(12.0);
+    v.window_corner_radius = CornerRadius::same(12);
     v.hyperlink_color = INFO;
     v.error_fg_color = ERR;
     v.warn_fg_color = LIVE;
@@ -180,13 +180,13 @@ fn style() -> egui::Style {
         &mut v.widgets.active,
         &mut v.widgets.open,
     ] {
-        w.rounding = Rounding::same(8.0);
+        w.corner_radius = CornerRadius::same(8);
     }
 
     style.spacing.item_spacing = Vec2::new(8.0, 8.0);
     style.spacing.button_padding = Vec2::new(14.0, 7.0);
-    style.spacing.menu_margin = Margin::same(12.0);
-    style.spacing.window_margin = Margin::same(16.0);
+    style.spacing.menu_margin = Margin::same(12);
+    style.spacing.window_margin = Margin::same(16);
 
     let _prev = style
         .text_styles

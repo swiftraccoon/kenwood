@@ -21,13 +21,13 @@ pub(crate) enum Direction {
 pub(crate) enum DeviceError {
     Missing(Direction),
     NamedMissing { direction: Direction, name: String },
-    Enumerate(cpal::DevicesError),
-    Name(cpal::DeviceNameError),
-    Configuration(cpal::DefaultStreamConfigError),
+    Enumerate(cpal::Error),
+    Name(cpal::Error),
+    Configuration(cpal::Error),
     Format(Direction, cpal::SampleFormat),
     Geometry { channels: u16, rate: u32 },
-    Build(cpal::BuildStreamError),
-    Play(cpal::PlayStreamError),
+    Build(cpal::Error),
+    Play(cpal::Error),
     Resampler(rubato::ResamplerConstructionError),
 }
 
@@ -59,11 +59,11 @@ impl fmt::Display for DeviceError {
 impl Error for DeviceError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::Enumerate(error) => Some(error),
-            Self::Name(error) => Some(error),
-            Self::Configuration(error) => Some(error),
-            Self::Build(error) => Some(error),
-            Self::Play(error) => Some(error),
+            Self::Enumerate(error)
+            | Self::Name(error)
+            | Self::Configuration(error)
+            | Self::Build(error)
+            | Self::Play(error) => Some(error),
             Self::Resampler(error) => Some(error),
             Self::Missing(_)
             | Self::NamedMissing { .. }
@@ -95,7 +95,7 @@ pub(crate) enum AudioError {
     /// Hardware capture samples exceeded the bounded microphone ring.
     CaptureOverflow(u64),
     /// The device backend reported a running-stream failure.
-    Stream(cpal::StreamError),
+    Stream(cpal::Error),
     /// More errors arrived than the bounded presentation queue could retain.
     DiagnosticOverflow(u64),
     /// A file could not be opened or decoded.

@@ -21,8 +21,8 @@ pub(crate) fn show(app: &mut App, ctx: &egui::Context) {
         return;
     };
     // Dimmed backdrop that swallows clicks behind the sheet.
-    let screen = ctx.screen_rect();
-    let _area = egui::Area::new(egui::Id::new("sheet_backdrop"))
+    let screen = ctx.content_rect();
+    let _area = egui::Area::new(egui::Id::unique("sheet_backdrop"))
         .order(egui::Order::Middle)
         .fixed_pos(screen.min)
         .show(ctx, |ui| {

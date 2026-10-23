@@ -8,7 +8,7 @@ Desktop egui D-STAR reflector client. No radio hardware.
 
 ## Rules
 
-- The audio worker runs on a dedicated `std::thread` so the tokio runtime never owns a `cpal::Stream`, which is `!Send` on some platforms.
+- The audio worker runs on a dedicated `std::thread`; device setup, sample processing and stream teardown stay separate from the tokio session tasks.
 - Resampling is `rubato`'s windowed sinc, which bandlimits as it resamples: there is no separate anti-alias filter to add.
 - All colors come from `theme.rs` constants; never inline `Color32::from_rgb` in a panel. `LIVE` amber marks received activity and navigation accents, `TX` red marks active outgoing audio, and `OK` green marks connection state and meters. UI state describes the local UDP/audio path; it cannot establish RF transmission.
 - Stop, recording-stop, playback-stop and session termination use their independent control registers. Never route terminal requests through a bounded ordinary-command queue.

@@ -3,10 +3,10 @@
 
 //! Audio I/O: mic capture / speaker playback / AMBE codec plumbing.
 //!
-//! Runs on a dedicated `std::thread` so the tokio runtime never owns
-//! a `cpal::Stream` (streams are `!Send` on some platforms). The
-//! thread opens the default input and output devices at whatever
-//! native config cpal reports, sets up lock-free ring buffers for
+//! Runs device setup, sample processing and stream teardown on a dedicated
+//! `std::thread`, separate from the tokio session tasks. The thread opens
+//! the default input and output devices, selects a supported native
+//! configuration, sets up lock-free ring buffers for
 //! each direction, and processes audio in its main loop:
 //!
 //! - RX: pull incoming [`VoiceFrame`]s from the command channel,
@@ -25,6 +25,7 @@
 //! is needed. The input / output devices and the recording /
 //! playback paths are all driven from here.
 
+use std::cmp::Reverse;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -41,8 +42,11 @@ use mbelib_rs::enhance_live::{LiveWaveEnhancer, LiveWaveStream};
 use mbelib_rs::{AmbeDecoder, AmbeEncoder, PcmError, PcmFrame, PcmSamples};
 use ringbuf::HeapRb;
 use ringbuf::traits::{Consumer, Observer, Producer, Split};
+use rubato::audioadapter::Adapter as _;
+use rubato::audioadapter_buffers::direct::SequentialSlice;
 use rubato::{
-    Resampler as _, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction,
+    Async, FixedAsync, Resampler as _, SincInterpolationParameters, SincInterpolationType,
+    WindowFunction,
 };
 use tokio::sync::mpsc as tokio_mpsc;
 use tracing::{error, info, warn};
@@ -1786,12 +1790,22 @@ fn enumerate_devices() -> Result<DeviceNames, DeviceError> {
     let inputs = host
         .input_devices()
         .map_err(DeviceError::Enumerate)?
-        .map(|device| device.name().map_err(DeviceError::Name))
+        .map(|device| {
+            device
+                .description()
+                .map(|description| description.name().to_owned())
+                .map_err(DeviceError::Name)
+        })
         .collect::<Result<Vec<_>, _>>()?;
     let outputs = host
         .output_devices()
         .map_err(DeviceError::Enumerate)?
-        .map(|device| device.name().map_err(DeviceError::Name))
+        .map(|device| {
+            device
+                .description()
+                .map(|description| description.name().to_owned())
+                .map_err(DeviceError::Name)
+        })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(DeviceNames { inputs, outputs })
 }
@@ -1810,7 +1824,7 @@ fn pick_device(
         }
         .map_err(DeviceError::Enumerate)?;
         for device in devices {
-            if device.name().map_err(DeviceError::Name)? == want {
+            if device.description().map_err(DeviceError::Name)?.name() == want {
                 return Ok(device);
             }
         }
@@ -1825,6 +1839,77 @@ fn pick_device(
         host.default_output_device()
     };
     device.ok_or(DeviceError::Missing(direction))
+}
+
+/// Retain the backend default when its format is supported; otherwise select
+/// an advertised F32, I16 or U16 configuration within the audio pipeline bounds.
+fn stream_configuration(
+    device: &cpal::Device,
+    direction: Direction,
+) -> Result<cpal::SupportedStreamConfig, DeviceError> {
+    let default = match direction {
+        Direction::Input => device.default_input_config(),
+        Direction::Output => device.default_output_config(),
+    }
+    .map_err(DeviceError::Configuration)?;
+    if audio_format_priority(default.sample_format()) != 0 {
+        return Ok(default);
+    }
+
+    let selected = match direction {
+        Direction::Input => select_supported_configuration(
+            &default,
+            device
+                .supported_input_configs()
+                .map_err(DeviceError::Configuration)?,
+        ),
+        Direction::Output => select_supported_configuration(
+            &default,
+            device
+                .supported_output_configs()
+                .map_err(DeviceError::Configuration)?,
+        ),
+    };
+    selected.ok_or_else(|| DeviceError::Format(direction, default.sample_format()))
+}
+
+/// Prefer F32, then I16 and U16, retaining the default channel count and rate
+/// where the advertised range permits them.
+fn select_supported_configuration(
+    default: &cpal::SupportedStreamConfig,
+    alternatives: impl IntoIterator<Item = cpal::SupportedStreamConfigRange>,
+) -> Option<cpal::SupportedStreamConfig> {
+    alternatives
+        .into_iter()
+        .filter_map(|range| {
+            if audio_format_priority(range.sample_format()) == 0
+                || !(1..=8).contains(&range.channels())
+            {
+                return None;
+            }
+            let minimum = range.min_sample_rate().max(8_000);
+            let maximum = range.max_sample_rate().min(192_000);
+            if minimum > maximum {
+                return None;
+            }
+            range.try_with_sample_rate(default.sample_rate().clamp(minimum, maximum))
+        })
+        .max_by_key(|configuration| {
+            (
+                audio_format_priority(configuration.sample_format()),
+                configuration.channels() == default.channels(),
+                Reverse(configuration.sample_rate().abs_diff(default.sample_rate())),
+            )
+        })
+}
+
+const fn audio_format_priority(format: SampleFormat) -> u8 {
+    match format {
+        SampleFormat::F32 => 3,
+        SampleFormat::I16 => 2,
+        SampleFormat::U16 => 1,
+        _ => 0,
+    }
 }
 
 impl AudioIo {
@@ -1843,17 +1928,13 @@ impl AudioIo {
         let input_device = pick_device(&host, input_name, Direction::Input)?;
         let output_device = pick_device(&host, output_name, Direction::Output)?;
 
-        let input_cfg = input_device
-            .default_input_config()
-            .map_err(DeviceError::Configuration)?;
-        let output_cfg = output_device
-            .default_output_config()
-            .map_err(DeviceError::Configuration)?;
+        let input_cfg = stream_configuration(&input_device, Direction::Input)?;
+        let output_cfg = stream_configuration(&output_device, Direction::Output)?;
 
         let input_channels = input_cfg.channels();
         let output_channels = output_cfg.channels();
-        let input_rate = input_cfg.sample_rate().0;
-        let output_rate = output_cfg.sample_rate().0;
+        let input_rate = input_cfg.sample_rate();
+        let output_rate = output_cfg.sample_rate();
         for (channels, rate) in [(input_channels, input_rate), (output_channels, output_rate)] {
             if !(1..=8).contains(&channels) || !(8000..=192_000).contains(&rate) {
                 return Err(DeviceError::Geometry { channels, rate });
@@ -1948,15 +2029,15 @@ fn push_speaker_samples(speaker: &mut ringbuf::HeapProd<f32>, samples: &[f32]) -
     0
 }
 
-/// Sinc resampler for one mono direction, wrapping `rubato::SincFixedIn`.
+/// Sinc resampler for one mono direction, using fixed input chunks.
 ///
-/// `SincFixedIn` consumes a fixed input chunk and bandlimits with its
+/// `rubato::Async` consumes a fixed input chunk and bandlimits with its
 /// own windowed-sinc filter, so it resamples and anti-aliases in
 /// one step. Both directions resample fixed-size
 /// frames (160 samples at 8 kHz on RX, one HW-rate frame on TX),
-/// which is exactly the fixed-input contract `SincFixedIn` wants.
+/// selected by `FixedAsync::Input`.
 struct Resampler {
-    inner: SincFixedIn<f32>,
+    inner: Async<f32>,
 }
 
 impl Resampler {
@@ -1969,13 +2050,13 @@ impl Resampler {
     ) -> Result<Self, rubato::ResamplerConstructionError> {
         let params = SincInterpolationParameters {
             sinc_len: 128,
-            f_cutoff: 0.95,
+            f_cutoff: Some(0.95),
             interpolation: SincInterpolationType::Linear,
             oversampling_factor: 128,
             window: WindowFunction::BlackmanHarris2,
         };
         let ratio = f64::from(out_rate) / f64::from(in_rate);
-        let inner = SincFixedIn::new(ratio, 1.0, params, chunk, 1)?;
+        let inner = Async::new_sinc(ratio, 1.0, &params, chunk, 1, FixedAsync::Input)?;
         Ok(Self { inner })
     }
 
@@ -1983,19 +2064,20 @@ impl Resampler {
     /// `chunk` the resampler was built with. Returns the original processing
     /// failure or an output-channel mismatch if the mono contract is broken.
     fn process(&mut self, input: &[f32]) -> Result<Vec<f32>, rubato::ResampleError> {
-        let mut output = self.inner.process(&[input], None)?;
-        if output.len() != 1 {
+        let buffer = SequentialSlice::new(input, 1, input.len()).map_err(|_| {
+            rubato::ResampleError::InsufficientInputBufferSize {
+                expected: self.inner.input_frames_next(),
+                actual: input.len(),
+            }
+        })?;
+        let output = self.inner.process(&buffer, None)?;
+        if output.channels() != 1 {
             return Err(rubato::ResampleError::WrongNumberOfOutputChannels {
                 expected: 1,
-                actual: output.len(),
+                actual: output.channels(),
             });
         }
-        output
-            .pop()
-            .ok_or(rubato::ResampleError::WrongNumberOfOutputChannels {
-                expected: 1,
-                actual: 0,
-            })
+        Ok(output.take_data())
     }
 }
 
@@ -2024,7 +2106,7 @@ fn build_input_stream(
     match cfg.sample_format() {
         SampleFormat::F32 => device
             .build_input_stream(
-                &stream_cfg,
+                stream_cfg,
                 move |data: &[f32], _: &cpal::InputCallbackInfo| {
                     write_mono(data, channels, &mut mic_prod, &capture_lost);
                 },
@@ -2034,7 +2116,7 @@ fn build_input_stream(
             .map_err(DeviceError::Build),
         SampleFormat::I16 => device
             .build_input_stream(
-                &stream_cfg,
+                stream_cfg,
                 move |data: &[i16], _: &cpal::InputCallbackInfo| {
                     for chunk in data.chunks(channels as usize) {
                         let sum: f32 = chunk.iter().map(|&s| f32::from(s) / 32768.0).sum();
@@ -2057,7 +2139,7 @@ fn build_input_stream(
             .map_err(DeviceError::Build),
         SampleFormat::U16 => device
             .build_input_stream(
-                &stream_cfg,
+                stream_cfg,
                 move |data: &[u16], _: &cpal::InputCallbackInfo| {
                     for chunk in data.chunks(channels as usize) {
                         let sum: f32 = chunk
@@ -2097,7 +2179,7 @@ fn build_output_stream(
     match cfg.sample_format() {
         SampleFormat::F32 => device
             .build_output_stream(
-                &stream_cfg,
+                stream_cfg,
                 move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
                     fill_stereo_from_mono_f32(data, channels, &mut speaker_cons);
                 },
@@ -2107,7 +2189,7 @@ fn build_output_stream(
             .map_err(DeviceError::Build),
         SampleFormat::I16 => device
             .build_output_stream(
-                &stream_cfg,
+                stream_cfg,
                 move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
                     for chunk in data.chunks_mut(channels as usize) {
                         let s = speaker_cons.try_pop().unwrap_or(0.0);
@@ -2129,7 +2211,7 @@ fn build_output_stream(
             .map_err(DeviceError::Build),
         SampleFormat::U16 => device
             .build_output_stream(
-                &stream_cfg,
+                stream_cfg,
                 move |data: &mut [u16], _: &cpal::OutputCallbackInfo| {
                     for chunk in data.chunks_mut(channels as usize) {
                         let s = speaker_cons.try_pop().unwrap_or(0.0);
@@ -2190,7 +2272,10 @@ fn fill_stereo_from_mono_f32(
 
 #[cfg(test)]
 mod tests {
-    use super::{AudioMailbox, AudioWorker, FramePacer, PcmSamples, Resampler, captured_pcm_frame};
+    use super::{
+        AudioMailbox, AudioWorker, FramePacer, PcmSamples, Resampler, SampleFormat,
+        captured_pcm_frame, select_supported_configuration,
+    };
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
 
@@ -2486,6 +2571,69 @@ mod tests {
         let stalled = start + std::time::Duration::from_secs(10);
         assert!(pacer.take(stalled), "a stalled source did not resume");
         assert!(!pacer.take(stalled), "a stalled source burst to catch up");
+    }
+
+    #[test]
+    fn supported_formats_remain_available_when_backend_prefers_i32() -> TestResult {
+        let default = cpal::SupportedStreamConfig::new(
+            2,
+            48_000,
+            cpal::SupportedBufferSize::Unknown,
+            SampleFormat::I32,
+        );
+        let range = |channels, minimum, maximum, format| {
+            cpal::SupportedStreamConfigRange::new(
+                channels,
+                minimum,
+                maximum,
+                cpal::SupportedBufferSize::Unknown,
+                format,
+            )
+        };
+        let selected = select_supported_configuration(
+            &default,
+            [
+                range(2, 8_000, 192_000, SampleFormat::I32),
+                range(2, 44_100, 48_000, SampleFormat::I16),
+                range(2, 44_100, 48_000, SampleFormat::U16),
+            ],
+        )
+        .ok_or("the supported I16 configuration was lost")?;
+        assert_eq!(selected.sample_format(), SampleFormat::I16);
+        assert_eq!(selected.channels(), 2);
+        assert_eq!(selected.sample_rate(), 48_000);
+        assert!(
+            select_supported_configuration(
+                &default,
+                [
+                    range(9, 8_000, 48_000, SampleFormat::F32),
+                    range(2, 1_000, 7_999, SampleFormat::I16),
+                    range(2, 8_000, 48_000, SampleFormat::I32),
+                ],
+            )
+            .is_none(),
+            "unsupported formats and geometry must not reach stream construction"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn short_resampler_input_preserves_the_next_valid_output() -> TestResult {
+        let mut resampler = Resampler::new(48_000, 8_000, 960)?;
+        let invalid = resampler.process(&[0.25; 959]);
+        assert!(
+            matches!(
+                invalid,
+                Err(rubato::ResampleError::InsufficientInputBufferSize { .. })
+            ),
+            "short input was accepted: {invalid:?}"
+        );
+        let mut fresh = Resampler::new(48_000, 8_000, 960)?;
+        assert_eq!(
+            resampler.process(&[0.25; 960])?,
+            fresh.process(&[0.25; 960])?
+        );
+        Ok(())
     }
 
     /// rubato's sinc resampler must not alias: a 6500 Hz tone
