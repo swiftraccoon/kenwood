@@ -19,16 +19,16 @@ kenwood-transport = { path = "../kenwood-transport", default-features = false, f
 ] }
 # Bounded MMDVM GET_VERSION probing on the modem link after Terminal entry.
 mmdvm = { path = "../mmdvm", default-features = false, features = ["probe"] }
-thiserror = "2"
-tokio = { version = "1", features = ["rt", "macros", "time"] }
-tokio-serial = "5"
-tracing = "0.1"
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["rt", "macros", "time"] }
+tokio-serial = "5.5.0"
+tracing = "0.1.44"
 
 [dev-dependencies]
 # Typed access to the committed manifest for the registry agreement test.
 mcp-d75-extract = { path = "../mcp-d75-extract" }
 # Property-based round trips of the value types, CAT echoes and codecs.
-proptest = "1"
+proptest = "1.12.0"
 
 [lints]
 workspace = true

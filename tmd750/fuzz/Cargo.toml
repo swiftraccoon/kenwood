@@ -14,7 +14,7 @@ description = "Fuzz targets for the Kenwood TM-D750 protocol library"
 cargo-fuzz = true
 
 [dependencies]
-libfuzzer-sys = "0.4"
+libfuzzer-sys = "0.4.13"
 
 [dependencies.kenwood-tmd750]
 path = ".."
