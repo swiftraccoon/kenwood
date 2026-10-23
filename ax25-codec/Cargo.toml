@@ -8,7 +8,7 @@ keywords = ["ax25", "ham-radio", "packet-radio", "amateur-radio"]
 license = "GPL-2.0-or-later"
 publish = false
 repository = "https://github.com/swiftraccoon/kenwood"
-rust-version = "1.94"
+rust-version = "1.99"
 description = "AX.25 v2.2 frame encode/decode codec"
 
 [dependencies]

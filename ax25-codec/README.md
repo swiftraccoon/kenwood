@@ -1,6 +1,6 @@
 # ax25-codec
 
-AX.25 modulo-8 frame encoding and decoding for Rust 1.94 and later.
+AX.25 modulo-8 frame encoding and decoding for Rust 1.99 and later.
 The crate uses `no_std` plus `alloc` and performs no I/O or clock reads.
 
 ## Scope
