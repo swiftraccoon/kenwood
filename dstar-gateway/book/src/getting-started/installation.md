@@ -9,7 +9,7 @@ dstar-gateway-core = { git = "https://github.com/swiftraccoon/kenwood", rev = "<
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros"] }
 ```
 
-The executable baseline is Rust 1.94.0 and edition 2024. The core dependency
+The executable baseline is Rust 1.99.1 and edition 2024. The core dependency
 provides Session, protocol/state markers and checked transmit values; the
 client shell supplies the network driver.
 

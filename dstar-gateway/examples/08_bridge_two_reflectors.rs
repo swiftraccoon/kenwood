@@ -182,14 +182,12 @@ async fn forward(
                 tx.send_voice(*stream_id, index, outgoing).await?;
             }
         }
-        Event::VoiceEnd { stream_id, .. } => {
+        Event::VoiceEnd { stream_id, .. } if *tx_stream == Some(*stream_id) => {
             // If a matching header is cached, emit an EOT on the
             // TX side. Seq on EOT is advisory: MMDVMHost uses 0 in
             // the common case, which the core codec accepts.
-            if *tx_stream == Some(*stream_id) {
-                tx.send_eot(*stream_id, FrameSequence::ZERO).await?;
-                *tx_stream = None;
-            }
+            tx.send_eot(*stream_id, FrameSequence::ZERO).await?;
+            *tx_stream = None;
         }
         _ => {}
     }
