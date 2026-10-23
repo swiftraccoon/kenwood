@@ -840,7 +840,7 @@ fn sha256_bytes(bytes: &[u8]) -> BackupResult<String> {
         0x1f83_d9ab,
         0x5be0_cd19,
     ];
-    for block in padded.chunks_exact(64) {
+    for block in padded.as_chunks::<64>().0 {
         sha256_compress(&mut state, block)?;
     }
 
@@ -859,17 +859,14 @@ fn sha256_compress(state: &mut [u32; 8], block: &[u8]) -> BackupResult<()> {
     }
 
     let mut schedule = [0_u32; 64];
-    let words = block.chunks_exact(4);
-    if !words.remainder().is_empty() {
+    let (words, remainder) = block.as_chunks::<4>();
+    if !remainder.is_empty() {
         return Err(invalid_input(
             "internal SHA-256 word split left trailing bytes",
         ));
     }
     for (slot, word) in schedule.iter_mut().take(16).zip(words) {
-        let [a, b, c, d] = word else {
-            return Err(invalid_input("internal SHA-256 word has the wrong length"));
-        };
-        *slot = u32::from_be_bytes([*a, *b, *c, *d]);
+        *slot = u32::from_be_bytes(*word);
     }
 
     for index in 16..64 {

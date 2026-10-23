@@ -6147,11 +6147,11 @@ mod macos {
             0x1f83_d9ab,
             0x5be0_cd19,
         ];
-        for block in padded.chunks_exact(64) {
+        for block in padded.as_chunks::<64>().0 {
             sha256_compress(&mut state, block)?;
         }
         let mut digest = [0_u8; 32];
-        for (chunk, word) in digest.chunks_exact_mut(4).zip(state) {
+        for (chunk, word) in digest.as_chunks_mut::<4>().0.iter_mut().zip(state) {
             chunk.copy_from_slice(&word.to_be_bytes());
         }
         Ok(digest)
@@ -6164,17 +6164,14 @@ mod macos {
             ));
         }
         let mut schedule = [0_u32; 64];
-        let words = block.chunks_exact(4);
-        if !words.remainder().is_empty() {
+        let (words, remainder) = block.as_chunks::<4>();
+        if !remainder.is_empty() {
             return Err(invalid_input(
                 "internal SHA-256 word split left trailing bytes",
             ));
         }
         for (slot, word) in schedule.iter_mut().take(16).zip(words) {
-            let [a, b, c, d] = word else {
-                return Err(invalid_input("internal SHA-256 word has the wrong length"));
-            };
-            *slot = u32::from_be_bytes([*a, *b, *c, *d]);
+            *slot = u32::from_be_bytes(*word);
         }
         for index in 16..64 {
             let word_15 = sha256_schedule_word(&schedule, index - 15)?;
@@ -6260,14 +6257,8 @@ mod macos {
 
     fn hex_sha256(digest: &[u8; 32]) -> AuditResult<String> {
         let mut hex = String::with_capacity(digest.len() * 2);
-        for word in digest.chunks_exact(4) {
-            let [a, b, c, d] = word else {
-                return Err(invalid_input("internal SHA-256 digest word is incomplete"));
-            };
-            std::fmt::write(
-                &mut hex,
-                format_args!("{:08x}", u32::from_be_bytes([*a, *b, *c, *d])),
-            )?;
+        for word in digest.as_chunks::<4>().0 {
+            std::fmt::write(&mut hex, format_args!("{:08x}", u32::from_be_bytes(*word)))?;
         }
         Ok(hex)
     }
@@ -7368,7 +7359,7 @@ mod macos {
         text.strip_prefix("**")?.strip_suffix("**")
     }
 
-    fn is_menu_number(text: &str) -> bool {
+    const fn is_menu_number(text: &str) -> bool {
         matches!(text.as_bytes(), [a, b, c] if a.is_ascii_digit() && b.is_ascii_digit() && is_menu_number_suffix(*c))
     }
 
@@ -7981,15 +7972,19 @@ mod macos {
         let baseline_bytes = baseline.frame.rgb565_le();
         let candidate_bytes = screen.frame.rgb565_le();
         let full_differing_pixels = baseline_bytes
-            .chunks_exact(2)
-            .zip(candidate_bytes.chunks_exact(2))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .zip(candidate_bytes.as_chunks::<2>().0)
             .filter(|(expected, actual)| expected != actual)
             .count();
         let baseline_masked = masked_home_bytes(&baseline.frame);
         let candidate_masked = masked_home_bytes(&screen.frame);
         let masked_differing_pixels = baseline_masked
-            .chunks_exact(2)
-            .zip(candidate_masked.chunks_exact(2))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .zip(candidate_masked.as_chunks::<2>().0)
             .filter(|(expected, actual)| expected != actual)
             .count();
         if baseline_masked.len() != HOME_MASK_INCLUDED_PIXELS * 2
@@ -8035,7 +8030,7 @@ mod macos {
         let row_bytes = SCREEN_WIDTH * 2;
         let mut bytes = Vec::with_capacity(HOME_MASK_INCLUDED_PIXELS * 2);
         for (y, row) in frame.rgb565_le().chunks_exact(row_bytes).enumerate() {
-            for (x, pixel) in row.chunks_exact(2).enumerate() {
+            for (x, pixel) in row.as_chunks::<2>().0.iter().enumerate() {
                 if !home_pixel_is_masked(x, y) {
                     bytes.extend_from_slice(pixel);
                 }
@@ -8345,7 +8340,7 @@ mod macos {
         }
     }
 
-    fn is_menu_locator(text: &str) -> bool {
+    const fn is_menu_locator(text: &str) -> bool {
         matches!(text.as_bytes(), [a, b, c] if a.is_ascii_digit() && b.is_ascii_digit() && (*c == b'-' || is_menu_number_suffix(*c)))
     }
 

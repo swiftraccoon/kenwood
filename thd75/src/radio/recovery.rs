@@ -33,14 +33,14 @@ impl<T: Transport> DesyncedRadio<T> {
     ///
     /// # Errors
     ///
-    /// Returns the wrapper back with the recovery error; the radio's
+    /// Returns the wrapper and recovery error in a boxed pair; the radio's
     /// internal state still marks recovery as required, so a retry or
     /// [`Radio::reconnect`] remains possible via
     /// [`Self::into_radio_unproven`].
-    pub async fn restore(mut self) -> Result<Radio<T>, (Self, Error)> {
+    pub async fn restore(mut self) -> Result<Radio<T>, Box<(Self, Error)>> {
         match self.0.restore_cat_after_mode_exit().await {
             Ok(()) => Ok(self.0),
-            Err(error) => Err((self, error)),
+            Err(error) => Err(Box::new((self, error))),
         }
     }
 

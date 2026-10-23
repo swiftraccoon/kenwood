@@ -424,12 +424,14 @@ impl<T: Transport> Radio<T> {
     ///     .await
     /// {
     ///     Ok(radio) => { /* hand the MMDVM-proved radio to DstarGateway */ drop(radio); }
-    ///     Err((Some(radio), error)) => {
-    ///         // Preflight failure: the radio is still usable for CAT.
-    ///         drop(radio.disconnect().await);
+    ///     Err(failure) => {
+    ///         let (radio, error) = *failure;
+    ///         if let Some(radio) = radio {
+    ///             // Preflight failure: the radio is still usable for CAT.
+    ///             drop(radio.disconnect().await);
+    ///         }
     ///         return Err(error.into());
     ///     }
-    ///     Err((None, error)) => return Err(error.into()),
     /// }
     /// # Ok(())
     /// # }
@@ -437,6 +439,7 @@ impl<T: Transport> Radio<T> {
     ///
     /// # Errors
     ///
+    /// Returns a boxed pair of the optional radio and error.
     /// A completed schema rejection before MCP entry returns the radio
     /// (`Some`) only while its CAT boundary remains proved. A failed or
     /// malformed identity exchange closes the connection and returns `None`,
@@ -447,25 +450,25 @@ impl<T: Transport> Radio<T> {
         mut self,
         interface: PcOutputInterface,
         transition: TerminalModeTransition,
-    ) -> Result<Self, (Option<Self>, Error)> {
+    ) -> Result<Self, Box<(Option<Self>, Error)>> {
         if tokio::time::Instant::now()
             .checked_add(transition.window())
             .is_none()
         {
-            return Err((
+            return Err(Box::new((
                 Some(self),
                 crate::error::ValidationError::UnrepresentableDuration {
                     duration: transition.window(),
                 }
                 .into(),
-            ));
+            )));
         }
         if let Err(error) = self.verify_mcp_schema_target().await {
             if self.cat_recovery_required() || error.requires_recovery() {
                 drop(self.disconnect().await);
-                return Err((None, error));
+                return Err(Box::new((None, error)));
             }
-            return Err((Some(self), error));
+            return Err(Box::new((Some(self), error)));
         }
 
         match self
@@ -491,19 +494,19 @@ impl<T: Transport> Radio<T> {
                 // The page operation may have landed even though it errored.
                 // Never hand this handle back for ordinary CAT.
                 drop(self.disconnect().await);
-                return Err((None, error));
+                return Err(Box::new((None, error)));
             }
         }
 
         let Some(deadline) = tokio::time::Instant::now().checked_add(transition.window()) else {
             drop(self.disconnect().await);
-            return Err((
+            return Err(Box::new((
                 None,
                 crate::error::ValidationError::UnrepresentableDuration {
                     duration: transition.window(),
                 }
                 .into(),
-            ));
+            )));
         };
         loop {
             // Inner scope: the pinned step future borrows `self`, and the
@@ -536,12 +539,12 @@ impl<T: Transport> Radio<T> {
         }
 
         drop(self.disconnect().await);
-        Err((
+        Err(Box::new((
             None,
             Error::TerminalModeNotEngaged {
                 window: transition.window(),
             },
-        ))
+        )))
     }
 }
 
@@ -619,11 +622,13 @@ mod tests {
         let result = radio
             .enter_reflector_terminal_mode(PcOutputInterface::Usb, policy)
             .await;
-        let Err((Some(radio), error)) = result else {
+        let Err(failure) = result else {
             return Err(
                 "an unrepresentable transition did not preserve its untouched radio".into(),
             );
         };
+        let (radio, error) = *failure;
+        let radio = radio.ok_or("preflight failure did not retain the untouched radio")?;
         assert!(
             matches!(
                 error,
@@ -633,8 +638,9 @@ mod tests {
             ),
             "{error:?}"
         );
-        assert!(
-            radio.transport.writes().is_empty(),
+        assert_eq!(
+            radio.transport.writes(),
+            Vec::<Vec<u8>>::new(),
             "preflight must precede persistent writes and identity traffic"
         );
         radio.transport.assert_complete();
@@ -743,9 +749,10 @@ mod tests {
         let result = radio
             .enter_reflector_terminal_mode(PcOutputInterface::Bluetooth, transition)
             .await;
-        let Err((returned, error)) = result else {
+        let Err(failure) = result else {
             return Err("an unanswered transition window must fail".into());
         };
+        let (returned, error) = *failure;
         assert!(
             returned.is_none(),
             "after the terminal-mode update the radio must never be handed back for CAT"
@@ -770,9 +777,10 @@ mod tests {
                 TerminalModeTransition::RECOMMENDED,
             )
             .await;
-        let Err((returned, error)) = result else {
+        let Err(failure) = result else {
             return Err("an unqualified schema target must be refused".into());
         };
+        let (returned, error) = *failure;
         let radio = returned.ok_or("a preflight failure must return the radio")?;
         assert!(
             matches!(error, Error::McpUnsupportedSchemaTarget { .. }),
@@ -794,9 +802,10 @@ mod tests {
                 TerminalModeTransition::RECOMMENDED,
             )
             .await;
-        let Err((returned, error)) = result else {
+        let Err(failure) = result else {
             return Err("an unanswered identity exchange must fail".into());
         };
+        let (returned, error) = *failure;
         assert!(
             returned.is_none(),
             "a timed-out CAT identity exchange must not return a poisoned handle"
@@ -954,8 +963,8 @@ mod tests {
                 )
                 .into());
             };
-            assert!(possibly_written_pages.is_empty());
-            assert!(verified_written_pages.is_empty());
+            assert_eq!(possibly_written_pages, []);
+            assert_eq!(verified_written_pages, []);
             assert!(matches!(
                 *source,
                 Error::InvalidTncDataBand { actual } if actual == invalid_band

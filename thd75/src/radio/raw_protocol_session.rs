@@ -46,30 +46,26 @@ impl<T: Transport> Radio<T> {
     ///
     /// # Errors
     ///
-    /// Returns the original `Radio` with the error when its current CAT state
-    /// is not a safe raw-protocol boundary.
-    #[expect(
-        clippy::result_large_err,
-        reason = "entry errors must preserve the caller's selected transport inside Radio"
-    )]
-    pub fn into_raw_protocol_session(self) -> Result<RawProtocolSession<T>, (Self, Error)> {
+    /// Returns the original `Radio` and error in a boxed pair when its current
+    /// CAT state is not a safe raw-protocol boundary.
+    pub fn into_raw_protocol_session(self) -> Result<RawProtocolSession<T>, Box<(Self, Error)>> {
         if let Err(error) = self.require_cat_ready() {
-            return Err((self, error));
+            return Err(Box::new((self, error)));
         }
         if self.mcp_phase != McpPhase::Inactive {
-            return Err((self, Error::McpInterrupted));
+            return Err(Box::new((self, Error::McpInterrupted)));
         }
         if self.desynced {
-            return Err((
+            return Err(Box::new((
                 self,
                 unclean_cat_boundary("a synchronized CAT stream", b"stream is desynchronized"),
-            ));
+            )));
         }
         if !self.codec.is_empty() {
-            return Err((
+            return Err(Box::new((
                 self,
                 unclean_cat_boundary("an empty CAT codec", b"codec contains buffered bytes"),
-            ));
+            )));
         }
 
         tracing::info!("transferring radio transport to exclusive raw-protocol session");
@@ -100,20 +96,20 @@ impl<T: Transport> RawProtocolSession<T> {
     ///
     /// # Errors
     ///
-    /// Returns this session alongside a transport or protocol error, retaining
-    /// `T` so the caller can retry recovery or disconnect it.
-    pub async fn restore_cat(mut self) -> Result<Radio<T>, (Self, Error)> {
+    /// Returns this session and a transport or protocol error in a boxed pair,
+    /// retaining `T` so the caller can retry recovery or disconnect it.
+    pub async fn restore_cat(mut self) -> Result<Radio<T>, Box<(Self, Error)>> {
         if let Err(error) = self.transport.close().await {
             tracing::debug!(%error, "close before raw-protocol recovery failed");
         }
         if let Err(error) = self.transport.reopen().await {
-            return Err((self, Error::Transport(error)));
+            return Err(Box::new((self, Error::Transport(error))));
         }
 
         let mut radio = Radio::from_transport(self.transport);
         match radio.prove_reopened_thd75_identity().await {
             Ok(()) => Ok(radio),
-            Err(error) => Err((Self::from_failed_radio(radio), error)),
+            Err(error) => Err(Box::new((Self::from_failed_radio(radio), error))),
         }
     }
 
@@ -175,7 +171,7 @@ mod tests {
         let radio = Radio::new(transport);
         let mut raw = radio
             .into_raw_protocol_session()
-            .map_err(|(_, error)| error)?;
+            .map_err(|failure| failure.1)?;
 
         raw.write(b"probe").await?;
         let mut buffer = [0_u8; 16];
@@ -197,9 +193,9 @@ mod tests {
         let radio = Radio::new(transport);
         let raw = radio
             .into_raw_protocol_session()
-            .map_err(|(_, error)| error)?;
+            .map_err(|failure| failure.1)?;
 
-        let mut radio = raw.restore_cat().await.map_err(|(_, error)| error)?;
+        let mut radio = raw.restore_cat().await.map_err(|failure| failure.1)?;
         assert_eq!(
             radio.identify().await?.model,
             RadioModel::ThD75,
@@ -223,16 +219,17 @@ mod tests {
         let radio = Radio::new(transport);
         let raw = radio
             .into_raw_protocol_session()
-            .map_err(|(_, error)| error)?;
+            .map_err(|failure| failure.1)?;
 
-        let Err((raw, error)) = raw.restore_cat().await else {
+        let Err(failure) = raw.restore_cat().await else {
             return Err("wrong identity unexpectedly restored CAT capability".into());
         };
+        let (raw, error) = *failure;
         assert!(
             matches!(error, Error::Protocol(_)),
             "wrong identity must surface as a protocol error: {error:?}"
         );
-        let radio = raw.restore_cat().await.map_err(|(_, error)| error)?;
+        let radio = raw.restore_cat().await.map_err(|failure| failure.1)?;
         radio.transport.assert_complete();
         Ok(())
     }
@@ -241,9 +238,10 @@ mod tests {
     async fn entry_refuses_desynchronized_or_buffered_cat_state() -> TestResult {
         let mut desynchronized = Radio::new(MockTransport::new());
         desynchronized.desynced = true;
-        let Err((_radio, error)) = desynchronized.into_raw_protocol_session() else {
+        let Err(failure) = desynchronized.into_raw_protocol_session() else {
             return Err("desynchronized CAT unexpectedly entered a raw session".into());
         };
+        let (_radio, error) = *failure;
         assert!(
             matches!(error, Error::Protocol(_)),
             "desynchronized CAT rejection must be precise: {error:?}"
@@ -251,9 +249,10 @@ mod tests {
 
         let mut buffered = Radio::new(MockTransport::new());
         buffered.codec.feed(b"partial")?;
-        let Err((_radio, error)) = buffered.into_raw_protocol_session() else {
+        let Err(failure) = buffered.into_raw_protocol_session() else {
             return Err("buffered CAT unexpectedly entered a raw session".into());
         };
+        let (_radio, error) = *failure;
         assert!(
             matches!(error, Error::Protocol(_)),
             "buffered CAT rejection must be precise: {error:?}"

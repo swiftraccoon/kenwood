@@ -90,7 +90,8 @@ fn make_synthetic_d75() -> Result<Vec<u8>, BoxErr> {
     let flags = data
         .get_mut(CH_FLAGS_OFFSET..CH_FLAGS_OFFSET + MAX_CHANNELS * 4)
         .ok_or("synthetic channel flag table is out of bounds")?
-        .chunks_exact_mut(4);
+        .as_chunks_mut::<4>()
+        .0;
     for flag in flags {
         *flag
             .first_mut()

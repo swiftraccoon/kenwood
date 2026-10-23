@@ -64,38 +64,48 @@ impl<T: Transport + Unpin + 'static> DstarGateway<T> {
     ///
     /// # Errors
     ///
-    /// Returns the original radio on entry failure. Initialization failure
+    /// Returns a boxed pair of the optional radio and error. Entry failure
+    /// retains the original radio. Initialization failure
     /// attempts transient exit and returns an unproven radio if cleanup
     /// succeeds. Failed rollback returns no radio and preserves both causes.
     pub async fn start(
         radio: Radio<T>,
         data_band: TncDataBand,
         config: DstarModemConfig,
-    ) -> Result<Self, (Option<Radio<T>>, Error)> {
+    ) -> Result<Self, Box<(Option<Radio<T>>, Error)>> {
         let wire_config = match Self::wire_configuration() {
             Ok(config) => config,
-            Err(error) => return Err((Some(radio), error.into())),
+            Err(error) => return Err(Box::new((Some(radio), error.into()))),
         };
         let session = match radio.enter_mmdvm(data_band).await {
             Ok(session) => session,
-            Err((radio, error)) => return Err((Some(radio), error)),
+            Err(failure) => {
+                let (radio, error) = *failure;
+                return Err(Box::new((Some(radio), error)));
+            }
         };
         match Self::build_from_session(session, config, wire_config).await {
             Ok(gateway) => Ok(gateway),
-            Err((restore, modem, init_error)) => match restore.exit_and_rebuild(modem).await {
-                Ok(completed) => {
-                    let (radio, summary) = completed.into_parts();
-                    Err((
-                        Some(radio.into_radio_unproven()),
-                        Error::DstarStartup {
-                            initialization: Box::new(init_error),
-                            cleanup: None,
-                            shutdown: Some(summary),
-                        },
-                    ))
+            Err(failure) => {
+                let (restore, modem, init_error) = *failure;
+                match restore.exit_and_rebuild(modem).await {
+                    Ok(completed) => {
+                        let (radio, summary) = completed.into_parts();
+                        Err(Box::new((
+                            Some(radio.into_radio_unproven()),
+                            Error::DstarStartup {
+                                initialization: Box::new(init_error),
+                                cleanup: None,
+                                shutdown: Some(summary),
+                            },
+                        )))
+                    }
+                    Err(exit_error) => Err(Box::new((
+                        None,
+                        startup_cleanup_error(init_error, exit_error),
+                    ))),
                 }
-                Err(exit_error) => Err((None, startup_cleanup_error(init_error, exit_error))),
-            },
+            }
         }
     }
 
@@ -118,40 +128,46 @@ impl<T: Transport + Unpin + 'static> DstarGateway<T, PersistentMmdvm> {
     ///
     /// # Errors
     ///
-    /// Returns the original radio if binary conversion is refused. Failed
+    /// Returns a boxed pair of the optional radio and error. Binary conversion
+    /// refusal retains the original radio. Failed
     /// initialization returns a still-proved binary radio only after clean
     /// modem and transport-pump recovery. Failed recovery returns no radio
     /// and retains both failures; a new connection needs new protocol proof.
     pub async fn start_gateway_mode(
         radio: Radio<T>,
         config: DstarModemConfig,
-    ) -> Result<Self, (Option<Radio<T>>, Error)> {
+    ) -> Result<Self, Box<(Option<Radio<T>>, Error)>> {
         let wire_config = match Self::wire_configuration() {
             Ok(config) => config,
-            Err(error) => return Err((Some(radio), error.into())),
+            Err(error) => return Err(Box::new((Some(radio), error.into()))),
         };
         let session = match radio.into_mmdvm_session() {
             Ok(session) => session,
-            Err((radio, error)) => return Err((Some(radio), error)),
+            Err(failure) => {
+                let (radio, error) = *failure;
+                return Err(Box::new((Some(radio), error)));
+            }
         };
         match Self::build_from_session(session, config, wire_config).await {
             Ok(gateway) => Ok(gateway),
-            Err((restore, modem, init_error)) => {
+            Err(failure) => {
+                let (restore, modem, init_error) = *failure;
                 match restore.shutdown_and_rebuild_binary(modem).await {
                     Ok(completed) => {
                         let (radio, summary) = completed.into_parts();
-                        Err((
+                        Err(Box::new((
                             Some(radio),
                             Error::DstarStartup {
                                 initialization: Box::new(init_error),
                                 cleanup: None,
                                 shutdown: Some(summary),
                             },
-                        ))
+                        )))
                     }
-                    Err(reclaim_error) => {
-                        Err((None, startup_cleanup_error(init_error, reclaim_error)))
-                    }
+                    Err(reclaim_error) => Err(Box::new((
+                        None,
+                        startup_cleanup_error(init_error, reclaim_error),
+                    ))),
                 }
             }
         }
@@ -328,7 +344,7 @@ impl<T: Transport + Unpin + 'static, Lifecycle> DstarGateway<T, Lifecycle> {
         session: MmdvmSession<T, Lifecycle>,
         config: DstarModemConfig,
         wire_config: DstarConfiguration,
-    ) -> Result<Self, (MmdvmRadioRestore<T>, AsyncModem<StreamAdapter<T>>, Error)> {
+    ) -> Result<Self, Box<(MmdvmRadioRestore<T>, AsyncModem<StreamAdapter<T>>, Error)>> {
         let (modem, restore) = session.into_parts();
         match DstarModem::initialize(modem, config, wire_config).await {
             Ok(modem) => Ok(Self {
@@ -336,7 +352,7 @@ impl<T: Transport + Unpin + 'static, Lifecycle> DstarGateway<T, Lifecycle> {
                 restore,
                 lifecycle: PhantomData,
             }),
-            Err((modem, error)) => Err((restore, modem, error.into())),
+            Err((modem, error)) => Err(Box::new((restore, modem, error.into()))),
         }
     }
 }
@@ -369,11 +385,13 @@ mod tests {
     async fn persistent_start_rejects_the_unverified_profile_before_conversion_or_io() -> TestResult
     {
         let radio = Radio::new(MockTransport::new());
-        let Err((Some(radio), error)) =
+        let Err(failure) =
             DstarGateway::start_gateway_mode(radio, DstarModemConfig::new("N0CALL")?).await
         else {
             return Err("unproved CAT radio was not returned after conversion refusal".into());
         };
+        let (radio, error) = *failure;
+        let radio = radio.ok_or("conversion refusal did not retain the radio")?;
         assert!(
             matches!(
                 error,
@@ -384,14 +402,14 @@ mod tests {
             "{error:?}"
         );
         assert_eq!(radio.cat_state, CatState::Ready);
-        assert!(radio.transport.writes().is_empty());
+        assert_eq!(radio.transport.writes(), Vec::<Vec<u8>>::new());
         radio.transport.assert_complete();
         Ok(())
     }
 
     #[tokio::test]
     async fn persistent_profile_refusal_retains_the_original_binary_proof() -> TestResult {
-        let Err((Some(radio), error)) = DstarGateway::start_gateway_mode(
+        let Err(failure) = DstarGateway::start_gateway_mode(
             binary_radio(MockTransport::new()),
             DstarModemConfig::new("N0CALL")?,
         )
@@ -399,6 +417,8 @@ mod tests {
         else {
             return Err("profile refusal did not return its binary radio".into());
         };
+        let (radio, error) = *failure;
+        let radio = radio.ok_or("profile refusal did not retain the binary radio")?;
         assert!(
             matches!(
                 error,
@@ -412,14 +432,14 @@ mod tests {
             radio.cat_state,
             CatState::BinaryProven(BinaryProtocolProof::Mmdvm { data_band: None })
         );
-        assert!(radio.transport.writes().is_empty());
+        assert_eq!(radio.transport.writes(), Vec::<Vec<u8>>::new());
         radio.transport.assert_complete();
         Ok(())
     }
 
     #[tokio::test]
     async fn transient_profile_refusal_sends_no_tnc_mode_command() -> TestResult {
-        let Err((Some(radio), error)) = DstarGateway::start(
+        let Err(failure) = DstarGateway::start(
             Radio::new(MockTransport::new()),
             TncDataBand::B,
             DstarModemConfig::new("N0CALL")?,
@@ -428,6 +448,8 @@ mod tests {
         else {
             return Err("unsupported transient profile did not preserve the radio".into());
         };
+        let (radio, error) = *failure;
+        let radio = radio.ok_or("profile refusal did not retain the transient radio")?;
         assert!(
             matches!(
                 error,
@@ -438,7 +460,7 @@ mod tests {
             "{error:?}"
         );
         assert_eq!(radio.cat_state, CatState::Ready);
-        assert!(radio.transport.writes().is_empty());
+        assert_eq!(radio.transport.writes(), Vec::<Vec<u8>>::new());
         radio.transport.assert_complete();
         Ok(())
     }

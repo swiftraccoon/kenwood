@@ -166,7 +166,12 @@ impl TryFrom<&str> for RadioDateTime {
             ));
         }
 
-        let mut pairs = value.as_bytes().chunks_exact(2).map(two_decimal_digits);
+        let mut pairs = value
+            .as_bytes()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| two_decimal_digits(pair));
         let Some(Some(year)) = pairs.next() else {
             return Err(Self::invalid(value.to_owned(), "missing year"));
         };

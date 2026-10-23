@@ -214,7 +214,8 @@ async fn enter_via_usb(port: &str) -> Result<(), Box<dyn std::error::Error>> {
             drop(radio);
             Ok(())
         }
-        Err((returned, error)) => {
+        Err(failure) => {
+            let (returned, error) = *failure;
             println!("FAIL: {error}");
             if let Some(radio) = returned {
                 drop(radio.disconnect().await);

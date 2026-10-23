@@ -999,7 +999,8 @@ async fn run_selected_profile(
         }
         let mut transport = match radio.into_raw_protocol_session() {
             Ok(transport) => transport,
-            Err((radio, error)) => {
+            Err(failure) => {
+                let (radio, error) = *failure;
                 drop(tokio::time::timeout(CLOSE_TIMEOUT, radio.disconnect()).await);
                 return Err(error.into());
             }
@@ -2566,7 +2567,7 @@ fn validate_response_grammar(command: &str, response: &[u8]) -> bool {
     }
 }
 
-fn validate_ty_shape(response: &[u8]) -> bool {
+const fn validate_ty_shape(response: &[u8]) -> bool {
     matches!(
         response,
         [
@@ -2708,31 +2709,26 @@ fn validate_rt(response: &[u8]) -> bool {
     if payload.len() != 12 || parse_decimal(payload).is_none() {
         return false;
     }
-    let mut pairs = payload.chunks_exact(2);
-    let Some(year) = pairs.next().and_then(parse_decimal) else {
+    let mut pairs = payload.as_chunks::<2>().0.iter();
+    let Some(year) = pairs.next().and_then(|pair| parse_decimal(pair)) else {
         return false;
     };
-    let Some(month) = pairs.next().and_then(parse_decimal) else {
+    let Some(month) = pairs.next().and_then(|pair| parse_decimal(pair)) else {
         return false;
     };
-    let Some(day) = pairs.next().and_then(parse_decimal) else {
+    let Some(day) = pairs.next().and_then(|pair| parse_decimal(pair)) else {
         return false;
     };
-    let Some(hour) = pairs.next().and_then(parse_decimal) else {
+    let Some(hour) = pairs.next().and_then(|pair| parse_decimal(pair)) else {
         return false;
     };
-    let Some(minute) = pairs.next().and_then(parse_decimal) else {
+    let Some(minute) = pairs.next().and_then(|pair| parse_decimal(pair)) else {
         return false;
     };
-    let Some(second) = pairs.next().and_then(parse_decimal) else {
+    let Some(second) = pairs.next().and_then(|pair| parse_decimal(pair)) else {
         return false;
     };
-    if !pairs.remainder().is_empty()
-        || !(1..=12).contains(&month)
-        || hour > 23
-        || minute > 59
-        || second > 59
-    {
+    if !(1..=12).contains(&month) || hour > 23 || minute > 59 || second > 59 {
         return false;
     }
     let full_year = 2000_u64.saturating_add(year);
@@ -3435,22 +3431,31 @@ mod tests {
         }
 
         impl Transport for BusyTransport {
-            async fn write(&mut self, _data: &[u8]) -> Result<(), TransportError> {
-                self.writes = self.writes.saturating_add(1);
-                Ok(())
+            fn write(&mut self, _data: &[u8]) -> impl Future<Output = Result<(), TransportError>> {
+                std::future::poll_fn(move |_| {
+                    self.writes = self.writes.saturating_add(1);
+                    std::task::Poll::Ready(Ok(()))
+                })
             }
 
-            async fn read(&mut self, buffer: &mut [u8]) -> Result<usize, TransportError> {
-                let frame = b"AI 0\r";
-                let target = buffer.get_mut(..frame.len()).ok_or_else(|| {
-                    TransportError::Read(io::Error::other("test buffer too short"))
-                })?;
-                target.copy_from_slice(frame);
-                Ok(frame.len())
+            fn read(
+                &mut self,
+                buffer: &mut [u8],
+            ) -> impl Future<Output = Result<usize, TransportError>> {
+                std::future::poll_fn(move |_| {
+                    let frame = b"AI 0\r";
+                    let Some(target) = buffer.get_mut(..frame.len()) else {
+                        return std::task::Poll::Ready(Err(TransportError::Read(
+                            io::Error::other("test buffer too short"),
+                        )));
+                    };
+                    target.copy_from_slice(frame);
+                    std::task::Poll::Ready(Ok(frame.len()))
+                })
             }
 
-            async fn close(&mut self) -> Result<(), TransportError> {
-                Ok(())
+            fn close(&mut self) -> impl Future<Output = Result<(), TransportError>> {
+                std::future::ready(Ok(()))
             }
         }
 

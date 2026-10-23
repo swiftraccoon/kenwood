@@ -138,7 +138,7 @@ mod tests {
         let channels = radio
             .read_regular_channel_records(std::iter::empty())
             .await?;
-        assert!(channels.is_empty());
+        assert_eq!(channels, []);
         Ok(())
     }
 

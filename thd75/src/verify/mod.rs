@@ -462,7 +462,7 @@ mod tests {
     fn identical_snapshots_have_no_changes() -> TestResult {
         let before = snap(0x1000, &[1, 2, 3, 4])?;
         let after = snap(0x1000, &[1, 2, 3, 4])?;
-        assert!(before.diff(&after)?.is_empty());
+        assert_eq!(before.diff(&after)?, []);
         Ok(())
     }
 
@@ -606,7 +606,7 @@ mod tests {
             "unchanged overrun bytes must not form a snapshot: {result:?}"
         );
         let valid = StateSnapshot::from_windows(vec![(offset, vec![0])])?;
-        assert!(valid.diff(&valid)?.is_empty());
+        assert_eq!(valid.diff(&valid)?, []);
         Ok(())
     }
 

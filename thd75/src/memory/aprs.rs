@@ -167,7 +167,7 @@ mod tests {
         let data = aprs
             .data_region()
             .ok_or("aprs.data_region() returned None")?;
-        assert!(!data.is_empty());
+        assert_ne!(data, [0_u8; 0]);
         // Region should span from APRS_DATA_OFFSET to APRS_END_OFFSET.
         let expected_size = APRS_END_OFFSET - APRS_DATA_OFFSET;
         assert_eq!(data.len(), expected_size);

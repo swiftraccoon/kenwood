@@ -1071,7 +1071,7 @@ mod tests {
         let mi = crate::memory::MemoryImage::from_raw(image)?;
         let dstar = mi.dstar();
         let region = dstar.repeater_callsign_region()?;
-        assert!(!region.as_bytes().is_empty());
+        assert_ne!(region.as_bytes(), [0_u8; 0]);
         assert_eq!(region.as_bytes().len(), dstar.region_size());
         Ok(())
     }

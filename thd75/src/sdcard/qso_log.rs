@@ -969,7 +969,7 @@ struct RawQsoRow<'a> {
 }
 
 impl<'a> RawQsoRow<'a> {
-    fn from_columns(columns: &[&'a str]) -> Option<Self> {
+    const fn from_columns(columns: &[&'a str]) -> Option<Self> {
         let &[
             direction,
             date,
@@ -1379,7 +1379,7 @@ mod tests {
     #[test]
     fn empty_log_round_trips() -> TestResult {
         let data = write_qso_log(&[]);
-        assert!(parse_qso_log(&data)?.is_empty());
+        assert_eq!(parse_qso_log(&data)?, []);
         Ok(())
     }
 }

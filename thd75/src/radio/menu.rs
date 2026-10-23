@@ -50,8 +50,9 @@ impl MenuFieldSnapshot {
         let mut image = vec![0_u8; programming::TOTAL_SIZE];
         for (page, data) in &pages {
             let slot = image
-                .chunks_exact_mut(programming::PAGE_SIZE)
-                .nth(usize::from(page.as_raw()))
+                .as_chunks_mut::<{ programming::PAGE_SIZE }>()
+                .0
+                .get_mut(usize::from(page.as_raw()))
                 .ok_or(Error::McpPageOutOfRange {
                     page: page.as_raw(),
                     total_pages: programming::TOTAL_PAGES,
@@ -338,7 +339,7 @@ mod tests {
     async fn read_menu_snapshot_is_a_no_op_for_no_fields() -> TestResult {
         let mut radio = Radio::new(MockTransport::new());
         let snapshot = radio.read_menu_snapshot(&[]).await?;
-        assert!(snapshot.pages().is_empty());
+        assert_eq!(snapshot.pages(), []);
         radio.transport.assert_complete();
         Ok(())
     }

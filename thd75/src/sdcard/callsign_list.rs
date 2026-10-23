@@ -325,7 +325,7 @@ mod tests {
     #[test]
     fn parses_empty_list() -> TestResult {
         let data = encode_utf16le_bom("Name\tCallsign\tMemo\r\n");
-        assert!(parse_callsign_list(&data)?.is_empty());
+        assert_eq!(parse_callsign_list(&data)?, []);
         Ok(())
     }
 

@@ -154,14 +154,18 @@ impl SelectionBand {
 #[must_use]
 pub fn v103_selection_bands(frame: &ScreenFrame) -> Vec<SelectionBand> {
     let mut selected_rows = [false; SCREEN_HEIGHT];
-    for (y, row) in frame.rgb565_le().chunks_exact(SCREEN_WIDTH * 2).enumerate() {
+    for (y, row) in frame
+        .rgb565_le()
+        .as_chunks::<{ SCREEN_WIDTH * 2 }>()
+        .0
+        .iter()
+        .enumerate()
+    {
         let matches = row
-            .chunks_exact(2)
-            .filter(|pixel| {
-                <[u8; 2]>::try_from(*pixel)
-                    .map(u16::from_le_bytes)
-                    .is_ok_and(|value| value == V103_SELECTION_RGB565)
-            })
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .filter(|pixel| u16::from_le_bytes(**pixel) == V103_SELECTION_RGB565)
             .count();
         if let Some(selected) = selected_rows.get_mut(y) {
             *selected = matches >= V103_SELECTION_MIN_PIXELS_PER_ROW;
@@ -258,7 +262,7 @@ mod tests {
                 .copy_from_slice(&V103_SELECTION_RGB565.to_le_bytes());
         }
         let frame = ScreenFrame::from_rgb565_le(bytes)?;
-        assert!(v103_selection_bands(&frame).is_empty());
+        assert_eq!(v103_selection_bands(&frame), []);
         Ok(())
     }
 

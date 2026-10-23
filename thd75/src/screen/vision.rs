@@ -516,9 +516,9 @@ mod macos {
     fn enlarge_nearest_neighbor(rgb: &[u8]) -> Vec<u8> {
         let mut enlarged = Vec::with_capacity(OCR_BYTES);
         let mut enlarged_row = Vec::with_capacity(OCR_STRIDE);
-        for row in rgb.chunks_exact(RGB888_STRIDE) {
+        for row in rgb.as_chunks::<RGB888_STRIDE>().0 {
             enlarged_row.clear();
-            for pixel in row.chunks_exact(3) {
+            for pixel in row.as_chunks::<3>().0 {
                 for _ in 0..OCR_SCALE {
                     enlarged_row.extend_from_slice(pixel);
                 }

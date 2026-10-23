@@ -17,7 +17,7 @@
 //! let radio = Radio::new(transport);
 //!
 //! // Enter KISS mode (consumes the Radio).
-//! let mut kiss = radio.enter_kiss(TncDataBand::A).await.map_err(|(_, e)| e)?;
+//! let mut kiss = radio.enter_kiss(TncDataBand::A).await.map_err(|failure| failure.1)?;
 //!
 //! // Send and receive KISS frames.
 //! use kiss_tnc::KissFrame;
@@ -29,10 +29,10 @@
 //! let radio = kiss
 //!     .exit()
 //!     .await
-//!     .map_err(|(_session, e)| e)?
+//!     .map_err(|failure| failure.1)?
 //!     .restore()
 //!     .await
-//!     .map_err(|(_desynced, e)| e)?;
+//!     .map_err(|failure| failure.1)?;
 //! # Ok(())
 //! # }
 //! ```
@@ -148,16 +148,12 @@ impl<T: Transport> Radio<T> {
     ///
     /// # Errors
     ///
-    /// Returns the intact radio when its live boundary is not binary-proved or
-    /// another strict protocol still owns the transport.
-    #[expect(
-        clippy::result_large_err,
-        reason = "the ownership-preserving failure must return the intact Radio so callers can recover it"
-    )]
-    pub fn into_kiss_session(self) -> Result<KissSession<T>, (Self, Error)> {
+    /// Returns the intact radio and error in a boxed pair when its live boundary
+    /// is not binary-proved or another strict protocol still owns the transport.
+    pub fn into_kiss_session(self) -> Result<KissSession<T>, Box<(Self, Error)>> {
         let super::CatState::BinaryProven(BinaryProtocolProof::Kiss(data_band)) = self.cat_state
         else {
-            return Err((self, Error::BinaryModeNotProven));
+            return Err(Box::new((self, Error::BinaryModeNotProven)));
         };
         tracing::debug!(?data_band, "consuming proved KISS transition");
         let (transport, cat_restore) =
@@ -179,13 +175,13 @@ impl<T: Transport> Radio<T> {
     ///
     /// # Errors
     ///
-    /// On failure, returns the [`Radio`] alongside the error. If the transition
+    /// On failure, returns the [`Radio`] and error in a boxed pair. If the transition
     /// write may have reached the radio, that handle rejects ordinary CAT until
     /// [`Radio::restore_cat_after_mode_exit`] proves the framing boundary.
     pub async fn enter_kiss(
         mut self,
         data_band: TncDataBand,
-    ) -> Result<KissSession<T>, (Self, Error)> {
+    ) -> Result<KissSession<T>, Box<(Self, Error)>> {
         match self.transition_to_kiss(data_band).await {
             Ok(()) => {}
             Err(e) => {
@@ -195,7 +191,7 @@ impl<T: Transport> Radio<T> {
                 ) {
                     self.cat_state = super::CatState::RecoveryRequired;
                 }
-                return Err((self, e));
+                return Err(Box::new((self, e)));
             }
         }
         self.into_kiss_session()
@@ -554,14 +550,14 @@ impl<T: Transport> KissSession<T> {
     ///
     /// # Errors
     ///
-    /// Returns the session and error when the ten-second write fails. The
-    /// returned session refuses further I/O because Return may have arrived
-    /// partially or completely. Consume it with
+    /// Returns the session and error in a boxed pair when the ten-second write
+    /// fails. The returned session refuses further I/O because Return may have
+    /// arrived partially or completely. Consume it with
     /// [`Self::into_radio_recovery_required`] and recover CAT framing.
-    pub async fn exit(mut self) -> Result<DesyncedRadio<T>, (Self, Error)> {
+    pub async fn exit(mut self) -> Result<DesyncedRadio<T>, Box<(Self, Error)>> {
         tracing::info!("exiting KISS mode");
         if self.write_ambiguous {
-            return Err((self, Error::KissWriteAmbiguous));
+            return Err(Box::new((self, Error::KissWriteAmbiguous)));
         }
         self.write_ambiguous = true;
         let wire = KissFrame::return_command().to_bytes();
@@ -570,7 +566,7 @@ impl<T: Transport> KissSession<T> {
             .map_err(|_| Error::Timeout(KISS_WRITE_TIMEOUT))
             .and_then(|result| result.map_err(Error::Transport));
         if let Err(e) = result {
-            return Err((self, e));
+            return Err(Box::new((self, e)));
         }
 
         // Small delay to let the TNC switch back to CAT mode.
@@ -622,8 +618,8 @@ mod tests {
             std::future::pending().await
         }
 
-        async fn close(&mut self) -> Result<(), TransportError> {
-            Ok(())
+        fn close(&mut self) -> impl Future<Output = Result<(), TransportError>> {
+            std::future::ready(Ok(()))
         }
     }
 
@@ -633,7 +629,7 @@ mod tests {
             let mut radio = Radio::new(BlockedWriteTransport::default());
             radio.cat_state =
                 super::super::CatState::BinaryProven(BinaryProtocolProof::Kiss(TncDataBand::A));
-            let mut session = radio.into_kiss_session().map_err(|(_, error)| error)?;
+            let mut session = radio.into_kiss_session().map_err(|failure| failure.1)?;
             let frame = KissFrame::data(vec![0xAA]);
             if cancel {
                 assert!(
@@ -663,9 +659,10 @@ mod tests {
                 session.receive_frame().await,
                 Err(Error::KissWriteAmbiguous)
             ));
-            let Err((session, error)) = session.exit().await else {
+            let Err(failure) = session.exit().await else {
                 return Err("uncertain write allowed a mode exit".into());
             };
+            let (session, error) = *failure;
             assert!(matches!(error, Error::KissWriteAmbiguous), "{error:?}");
             assert_eq!(
                 session.transport.writes, 1,
@@ -681,7 +678,7 @@ mod tests {
         let mut session = radio
             .enter_kiss(TncDataBand::A)
             .await
-            .map_err(|(_, error)| error)?;
+            .map_err(|failure| failure.1)?;
         let writes = session.transport.writes().len();
         let frame = KissFrame::return_command();
         assert!(matches!(
@@ -703,7 +700,7 @@ mod tests {
         let mut session = radio
             .enter_kiss(TncDataBand::A)
             .await
-            .map_err(|(_, error)| error)?;
+            .map_err(|failure| failure.1)?;
         let frame = KissFrame::data(vec![0xAA]);
         assert!(matches!(
             session.send_frame(&frame).await,
@@ -713,9 +710,10 @@ mod tests {
             session.send_frame(&frame).await,
             Err(Error::KissWriteAmbiguous)
         ));
-        let Err((session, error)) = session.exit().await else {
+        let Err(failure) = session.exit().await else {
             return Err("failed write allowed an exit exchange".into());
         };
+        let (session, error) = *failure;
         assert!(matches!(error, Error::KissWriteAmbiguous), "{error:?}");
         session.transport.assert_complete();
         Ok(())
@@ -747,7 +745,10 @@ mod tests {
     #[tokio::test]
     async fn enter_kiss_sends_tn_command() -> TestResult {
         let radio = mock_radio_for_kiss(TncDataBand::A);
-        let session = radio.enter_kiss(TncDataBand::A).await.map_err(|(_, e)| e)?;
+        let session = radio
+            .enter_kiss(TncDataBand::A)
+            .await
+            .map_err(|failure| failure.1)?;
         // Session created successfully means the TN command was sent and accepted.
         assert!(format!("{session:?}").contains("KissSession"));
         Ok(())
@@ -756,7 +757,10 @@ mod tests {
     #[tokio::test]
     async fn enter_kiss_on_band_b() -> TestResult {
         let radio = mock_radio_for_kiss(TncDataBand::B);
-        let _session = radio.enter_kiss(TncDataBand::B).await.map_err(|(_, e)| e)?;
+        let _session = radio
+            .enter_kiss(TncDataBand::B)
+            .await
+            .map_err(|failure| failure.1)?;
         Ok(())
     }
 
@@ -795,9 +799,10 @@ mod tests {
         radio.cat_state =
             crate::radio::CatState::BinaryProven(BinaryProtocolProof::Mmdvm { data_band: None });
 
-        let Err((radio, error)) = radio.into_kiss_session() else {
+        let Err(failure) = radio.into_kiss_session() else {
             return Err("MMDVM proof unexpectedly authorized a KISS session".into());
         };
+        let (radio, error) = *failure;
 
         assert!(matches!(error, Error::BinaryModeNotProven));
         assert_eq!(
@@ -812,9 +817,10 @@ mod tests {
     async fn enter_kiss_rejects_wrong_mode_echo() -> TestResult {
         let radio = mock_radio_for_kiss_response(TncDataBand::A, b"TN 0,0\r");
         let result = radio.enter_kiss(TncDataBand::A).await;
-        let Err((mut radio, error)) = result else {
+        let Err(failure) = result else {
             return Err("wrong TNC mode echo must not create a KISS session".into());
         };
+        let (mut radio, error) = *failure;
         assert!(matches!(error, Error::Timeout(_)));
         assert_eq!(radio.cat_state, crate::radio::CatState::RecoveryRequired);
         assert!(matches!(
@@ -828,9 +834,10 @@ mod tests {
     async fn enter_kiss_rejects_wrong_data_band_echo() -> TestResult {
         let radio = mock_radio_for_kiss_response(TncDataBand::A, b"TN 2,1\r");
         let result = radio.enter_kiss(TncDataBand::A).await;
-        let Err((mut radio, error)) = result else {
+        let Err(failure) = result else {
             return Err("wrong TNC data-band echo must not create a KISS session".into());
         };
+        let (mut radio, error) = *failure;
         assert!(matches!(error, Error::Timeout(_)));
         assert_eq!(radio.cat_state, crate::radio::CatState::RecoveryRequired);
         assert!(matches!(
@@ -843,7 +850,10 @@ mod tests {
     #[tokio::test]
     async fn send_frame_writes_kiss_encoded() -> TestResult {
         let radio = mock_radio_for_kiss(TncDataBand::A);
-        let mut session = radio.enter_kiss(TncDataBand::A).await.map_err(|(_, e)| e)?;
+        let mut session = radio
+            .enter_kiss(TncDataBand::A)
+            .await
+            .map_err(|failure| failure.1)?;
 
         // The mock transport has no more exchanges queued, so sending
         // will fail. We add one to verify encoding.
@@ -859,7 +869,10 @@ mod tests {
     #[tokio::test]
     async fn send_data_wraps_in_kiss() -> TestResult {
         let radio = mock_radio_for_kiss(TncDataBand::A);
-        let mut session = radio.enter_kiss(TncDataBand::A).await.map_err(|(_, e)| e)?;
+        let mut session = radio
+            .enter_kiss(TncDataBand::A)
+            .await
+            .map_err(|failure| failure.1)?;
 
         session
             .transport
@@ -872,7 +885,10 @@ mod tests {
     #[tokio::test]
     async fn set_tx_delay_sends_correct_frame() -> TestResult {
         let radio = mock_radio_for_kiss(TncDataBand::A);
-        let mut session = radio.enter_kiss(TncDataBand::A).await.map_err(|(_, e)| e)?;
+        let mut session = radio
+            .enter_kiss(TncDataBand::A)
+            .await
+            .map_err(|failure| failure.1)?;
 
         // A 500 ms delay is encoded as 50 ten-millisecond units.
         session.transport.expect(&[FEND, 0x01, 50, FEND], &[]);
@@ -886,7 +902,10 @@ mod tests {
     #[tokio::test]
     async fn set_persistence_sends_correct_frame() -> TestResult {
         let radio = mock_radio_for_kiss(TncDataBand::A);
-        let mut session = radio.enter_kiss(TncDataBand::A).await.map_err(|(_, e)| e)?;
+        let mut session = radio
+            .enter_kiss(TncDataBand::A)
+            .await
+            .map_err(|failure| failure.1)?;
 
         session.transport.expect(&[FEND, 0x02, 128, FEND], &[]);
 
@@ -897,7 +916,10 @@ mod tests {
     #[tokio::test]
     async fn set_slot_time_sends_correct_frame() -> TestResult {
         let radio = mock_radio_for_kiss(TncDataBand::A);
-        let mut session = radio.enter_kiss(TncDataBand::A).await.map_err(|(_, e)| e)?;
+        let mut session = radio
+            .enter_kiss(TncDataBand::A)
+            .await
+            .map_err(|failure| failure.1)?;
 
         session.transport.expect(&[FEND, 0x03, 10, FEND], &[]);
 
@@ -910,7 +932,10 @@ mod tests {
     #[tokio::test]
     async fn set_tx_tail_sends_correct_frame() -> TestResult {
         let radio = mock_radio_for_kiss(TncDataBand::A);
-        let mut session = radio.enter_kiss(TncDataBand::A).await.map_err(|(_, e)| e)?;
+        let mut session = radio
+            .enter_kiss(TncDataBand::A)
+            .await
+            .map_err(|failure| failure.1)?;
 
         session.transport.expect(&[FEND, 0x04, 3, FEND], &[]);
 
@@ -923,7 +948,10 @@ mod tests {
     #[tokio::test]
     async fn set_duplex_sends_correct_frame() -> TestResult {
         let radio = mock_radio_for_kiss(TncDataBand::A);
-        let mut session = radio.enter_kiss(TncDataBand::A).await.map_err(|(_, e)| e)?;
+        let mut session = radio
+            .enter_kiss(TncDataBand::A)
+            .await
+            .map_err(|failure| failure.1)?;
 
         session.transport.expect(&[FEND, 0x05, 1, FEND], &[]);
 
@@ -934,7 +962,10 @@ mod tests {
     #[tokio::test]
     async fn set_hardware_data_rate_1200() -> TestResult {
         let radio = mock_radio_for_kiss(TncDataBand::A);
-        let mut session = radio.enter_kiss(TncDataBand::A).await.map_err(|(_, e)| e)?;
+        let mut session = radio
+            .enter_kiss(TncDataBand::A)
+            .await
+            .map_err(|failure| failure.1)?;
 
         session.transport.expect(&[FEND, 0x06, 0x00, FEND], &[]);
 
@@ -947,7 +978,10 @@ mod tests {
     #[tokio::test]
     async fn set_hardware_data_rate_9600() -> TestResult {
         let radio = mock_radio_for_kiss(TncDataBand::A);
-        let mut session = radio.enter_kiss(TncDataBand::A).await.map_err(|(_, e)| e)?;
+        let mut session = radio
+            .enter_kiss(TncDataBand::A)
+            .await
+            .map_err(|failure| failure.1)?;
 
         session.transport.expect(&[FEND, 0x06, 0x05, FEND], &[]);
 
@@ -970,7 +1004,10 @@ mod tests {
                 .with_pc_output(true),
         );
         radio.gps_sentences = Some(crate::types::NmeaSentences::all());
-        let mut session = radio.enter_kiss(TncDataBand::A).await.map_err(|(_, e)| e)?;
+        let mut session = radio
+            .enter_kiss(TncDataBand::A)
+            .await
+            .map_err(|failure| failure.1)?;
 
         // CMD_RETURN frame: C0 FF C0
         session.transport.expect(&[FEND, 0xFF, FEND], &[]);
@@ -978,7 +1015,7 @@ mod tests {
         let radio = session
             .exit()
             .await
-            .map_err(|(_, e)| e)?
+            .map_err(|failure| failure.1)?
             .into_radio_unproven();
         assert_eq!(radio.timeout, Duration::from_millis(731));
         assert_eq!(
@@ -1010,7 +1047,10 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn exit_then_restore_proves_cat_through_the_wrapper() -> TestResult {
         let radio = mock_radio_for_kiss(TncDataBand::B);
-        let mut session = radio.enter_kiss(TncDataBand::B).await.map_err(|(_, e)| e)?;
+        let mut session = radio
+            .enter_kiss(TncDataBand::B)
+            .await
+            .map_err(|failure| failure.1)?;
 
         // CMD_RETURN, then the read-only CAT identity proof that `restore`
         // must drive. A bare TN query proves that restoration preserved the
@@ -1023,10 +1063,10 @@ mod tests {
         let mut radio = session
             .exit()
             .await
-            .map_err(|(_, e)| e)?
+            .map_err(|failure| failure.1)?
             .restore()
             .await
-            .map_err(|(_, e)| e)?;
+            .map_err(|failure| failure.1)?;
         let tnc = radio.get_tnc_mode().await?;
         assert!(!radio.desynced);
         assert!(!radio.cat_recovery_required());
@@ -1045,7 +1085,7 @@ mod tests {
             .map_err(BoxErr::from)?
             .ok_or("frame behind leading garbage must extract")?;
         assert_eq!(frame.data, vec![0xCC]);
-        assert!(buf.is_empty());
+        assert_eq!(buf, [0_u8; 0]);
         Ok(())
     }
 
@@ -1056,7 +1096,7 @@ mod tests {
         let mut buf = b"pure ascii noise with no fend".to_vec();
         let frame = KissSession::<MockTransport>::try_extract_frame(&mut buf);
         assert!(matches!(frame, Ok(None)));
-        assert!(buf.is_empty(), "FEND-free noise must be discarded");
+        assert_eq!(buf, [0_u8; 0], "FEND-free noise must be discarded");
     }
 
     #[tokio::test]
@@ -1078,7 +1118,10 @@ mod tests {
     #[tokio::test]
     async fn receive_surfaces_malformed_frame() -> TestResult {
         let radio = mock_radio_for_kiss(TncDataBand::A);
-        let mut session = radio.enter_kiss(TncDataBand::A).await.map_err(|(_, e)| e)?;
+        let mut session = radio
+            .enter_kiss(TncDataBand::A)
+            .await
+            .map_err(|failure| failure.1)?;
 
         let mut wire = vec![FEND, 0x00, kiss_tnc::FESC, 0x00, FEND];
         wire.extend_from_slice(&[FEND, 0x00, 0xEF, FEND]);
@@ -1097,7 +1140,10 @@ mod tests {
     #[tokio::test]
     async fn receive_resyncs_past_leading_garbage() -> TestResult {
         let radio = mock_radio_for_kiss(TncDataBand::A);
-        let mut session = radio.enter_kiss(TncDataBand::A).await.map_err(|(_, e)| e)?;
+        let mut session = radio
+            .enter_kiss(TncDataBand::A)
+            .await
+            .map_err(|failure| failure.1)?;
 
         let mut wire = b"stray CAT response\r".to_vec();
         wire.extend_from_slice(&[FEND, 0x00, 0xEE, FEND]);
@@ -1111,7 +1157,10 @@ mod tests {
     #[tokio::test]
     async fn read_buffer_is_capped() -> TestResult {
         let radio = mock_radio_for_kiss(TncDataBand::A);
-        let mut session = radio.enter_kiss(TncDataBand::A).await.map_err(|(_, e)| e)?;
+        let mut session = radio
+            .enter_kiss(TncDataBand::A)
+            .await
+            .map_err(|failure| failure.1)?;
 
         // An opening FEND followed by an endless unterminated payload
         // (a stuck TNC): the buffer must not grow without bound.
@@ -1144,21 +1193,25 @@ mod tests {
         let next = KissSession::<MockTransport>::try_extract_frame(&mut buf)?
             .ok_or("following frame was discarded")?;
         assert_eq!(next.data, [0xAB]);
-        assert!(buf.is_empty());
+        assert_eq!(buf, [0_u8; 0]);
         Ok(())
     }
 
     #[tokio::test]
     async fn exit_failure_returns_session_intact() -> TestResult {
         let radio = mock_radio_for_kiss(TncDataBand::A);
-        let session = radio.enter_kiss(TncDataBand::A).await.map_err(|(_, e)| e)?;
+        let session = radio
+            .enter_kiss(TncDataBand::A)
+            .await
+            .map_err(|failure| failure.1)?;
 
         // No expected exchange for CMD_RETURN, so the write fails. The
         // session and transport return for explicit CAT recovery.
         let result = session.exit().await;
-        let Err((session, _err)) = result else {
+        let Err(failure) = result else {
             return Err("exit with a failing write must return the session".into());
         };
+        let (session, _err) = *failure;
         drop(session);
         Ok(())
     }
@@ -1171,7 +1224,7 @@ mod tests {
             .ok_or("try_extract_frame returned None for complete frame")?;
         assert_eq!(frame.command, KissCommand::Data);
         assert_eq!(frame.data, vec![0xAA]);
-        assert!(buf.is_empty());
+        assert_eq!(buf, [0_u8; 0]);
         Ok(())
     }
 
@@ -1198,7 +1251,10 @@ mod tests {
     #[tokio::test]
     async fn set_receive_timeout() -> TestResult {
         let radio = mock_radio_for_kiss(TncDataBand::A);
-        let mut session = radio.enter_kiss(TncDataBand::A).await.map_err(|(_, e)| e)?;
+        let mut session = radio
+            .enter_kiss(TncDataBand::A)
+            .await
+            .map_err(|failure| failure.1)?;
         session.set_receive_timeout(Duration::from_secs(30));
         assert_eq!(session.receive_timeout, Duration::from_secs(30));
         Ok(())

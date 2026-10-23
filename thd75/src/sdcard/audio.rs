@@ -165,21 +165,17 @@ fn parse_required_chunks(data: &[u8]) -> Result<(RiffChunk<'_>, RiffChunk<'_>), 
     for chunk in RiffChunks::new(data, declared_file_size) {
         let chunk = chunk?;
         match chunk.id {
-            id if id == *b"fmt " => {
-                if fmt_chunk.replace(chunk).is_some() {
-                    return Err(invalid_wav(format!(
-                        "duplicate fmt chunk at offset {}",
-                        chunk.offset
-                    )));
-                }
+            id if id == *b"fmt " && fmt_chunk.replace(chunk).is_some() => {
+                return Err(invalid_wav(format!(
+                    "duplicate fmt chunk at offset {}",
+                    chunk.offset
+                )));
             }
-            id if id == *b"data" => {
-                if data_chunk.replace(chunk).is_some() {
-                    return Err(invalid_wav(format!(
-                        "duplicate data chunk at offset {}",
-                        chunk.offset
-                    )));
-                }
+            id if id == *b"data" && data_chunk.replace(chunk).is_some() => {
+                return Err(invalid_wav(format!(
+                    "duplicate data chunk at offset {}",
+                    chunk.offset
+                )));
             }
             _ => {}
         }

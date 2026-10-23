@@ -188,36 +188,49 @@ mod tests {
     }
 
     impl Transport for FailedClose {
-        async fn write(&mut self, _data: &[u8]) -> Result<(), kenwood_transport::TransportError> {
-            self.other_io += 1;
-            Err(kenwood_transport::TransportError::Disconnected(
-                std::io::Error::other("unexpected write"),
-            ))
+        fn write(
+            &mut self,
+            _data: &[u8],
+        ) -> impl Future<Output = Result<(), kenwood_transport::TransportError>> {
+            std::future::poll_fn(move |_| {
+                self.other_io += 1;
+                std::task::Poll::Ready(Err(kenwood_transport::TransportError::Disconnected(
+                    std::io::Error::other("unexpected write"),
+                )))
+            })
         }
 
-        async fn read(
+        fn read(
             &mut self,
             _data: &mut [u8],
-        ) -> Result<usize, kenwood_transport::TransportError> {
-            self.other_io += 1;
-            Err(kenwood_transport::TransportError::Disconnected(
-                std::io::Error::other("unexpected read"),
-            ))
+        ) -> impl Future<Output = Result<usize, kenwood_transport::TransportError>> {
+            std::future::poll_fn(move |_| {
+                self.other_io += 1;
+                std::task::Poll::Ready(Err(kenwood_transport::TransportError::Disconnected(
+                    std::io::Error::other("unexpected read"),
+                )))
+            })
         }
 
-        async fn close(&mut self) -> Result<(), kenwood_transport::TransportError> {
-            self.closes += 1;
-            Err(kenwood_transport::TransportError::Disconnected(
-                std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "injected close failure",
-                ),
-            ))
+        fn close(&mut self) -> impl Future<Output = Result<(), kenwood_transport::TransportError>> {
+            std::future::poll_fn(move |_| {
+                self.closes += 1;
+                std::task::Poll::Ready(Err(kenwood_transport::TransportError::Disconnected(
+                    std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "injected close failure",
+                    ),
+                )))
+            })
         }
 
-        async fn reopen(&mut self) -> Result<(), kenwood_transport::TransportError> {
-            self.reopens += 1;
-            Ok(())
+        fn reopen(
+            &mut self,
+        ) -> impl Future<Output = Result<(), kenwood_transport::TransportError>> {
+            std::future::poll_fn(move |_| {
+                self.reopens += 1;
+                std::task::Poll::Ready(Ok(()))
+            })
         }
     }
 
@@ -264,7 +277,7 @@ mod tests {
         assert_eq!(*radio.link_state().borrow(), LinkState::Down);
         let (transport, _restore) = radio
             .into_binary_mode_parts(BinaryProtocolProof::Mmdvm { data_band: None })
-            .map_err(|(_, error)| error)?;
+            .map_err(|failure| failure.1)?;
         transport.assert_complete();
         Ok(())
     }

@@ -258,7 +258,7 @@ fn decode_memory_data(hex: &[u8]) -> Result<MemoryReadData, ProtocolError> {
         .map_err(|_| field_err("decoded length does not fit in u16".to_owned()))?;
     let len = ReadLen::new(decoded_len).map_err(|error| field_err(error.to_string()))?;
     let mut storage = [0_u8; 256];
-    for (index, pair) in hex.chunks_exact(2).enumerate() {
+    for (index, pair) in hex.as_chunks::<2>().0.iter().enumerate() {
         let high = pair
             .first()
             .copied()

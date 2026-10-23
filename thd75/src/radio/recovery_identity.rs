@@ -329,15 +329,19 @@ mod tests {
             self.inner.read(data).await
         }
 
-        async fn close(&mut self) -> Result<(), TransportError> {
-            Err(TransportError::Disconnected(std::io::Error::other(
-                "synthetic close failure",
-            )))
+        fn close(&mut self) -> impl Future<Output = Result<(), TransportError>> {
+            std::future::poll_fn(|_| {
+                std::task::Poll::Ready(Err(TransportError::Disconnected(std::io::Error::other(
+                    "synthetic close failure",
+                ))))
+            })
         }
 
-        async fn reopen(&mut self) -> Result<(), TransportError> {
-            self.reopen_count += 1;
-            Ok(())
+        fn reopen(&mut self) -> impl Future<Output = Result<(), TransportError>> {
+            std::future::poll_fn(move |_| {
+                self.reopen_count += 1;
+                std::task::Poll::Ready(Ok(()))
+            })
         }
     }
 
@@ -354,7 +358,7 @@ mod tests {
             "{result:?}"
         );
         assert_eq!(radio.transport.reopen_count, 0);
-        assert!(radio.transport.inner.writes().is_empty());
+        assert_eq!(radio.transport.inner.writes(), Vec::<Vec<u8>>::new());
         assert!(radio.cat_recovery_required());
         radio.transport.inner.assert_complete();
         Ok(())

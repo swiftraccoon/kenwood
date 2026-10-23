@@ -432,7 +432,7 @@ impl<T: Transport> Radio<T> {
             return Err(preflight(Error::IfTapRestorePending));
         }
 
-        let tuning_mode = self.get_tuning_mode(Band::B).await.map_err(&preflight)?;
+        let tuning_mode = self.get_tuning_mode(Band::B).await.map_err(preflight)?;
         if tuning_mode != TuningMode::Vfo {
             return Err(preflight(Error::VfoTuningRequired {
                 band: Band::B,
@@ -442,13 +442,13 @@ impl<T: Transport> Radio<T> {
 
         let saved = IfTapSavedState {
             lease: Arc::new(()),
-            active_band: self.get_band().await.map_err(&preflight)?,
-            band_mode: self.get_band_mode().await.map_err(&preflight)?,
-            output: self.get_usb_audio_output().await.map_err(&preflight)?,
-            squelch: self.get_squelch(Band::B).await.map_err(&preflight)?,
-            operating_mode: self.get_operating_mode(Band::B).await.map_err(&preflight)?,
-            band_b_frequency: self.get_frequency(Band::B).await.map_err(&preflight)?,
-            step: self.get_step_size(Band::B).await.map_err(&preflight)?,
+            active_band: self.get_band().await.map_err(preflight)?,
+            band_mode: self.get_band_mode().await.map_err(preflight)?,
+            output: self.get_usb_audio_output().await.map_err(preflight)?,
+            squelch: self.get_squelch(Band::B).await.map_err(preflight)?,
+            operating_mode: self.get_operating_mode(Band::B).await.map_err(preflight)?,
+            band_b_frequency: self.get_frequency(Band::B).await.map_err(preflight)?,
+            step: self.get_step_size(Band::B).await.map_err(preflight)?,
         };
 
         self.if_tap_saved = Some(saved.clone());
@@ -872,7 +872,7 @@ mod tests {
             "{report:?}"
         );
         assert!(radio.pending_if_tap_state().is_some());
-        assert!(radio.transport.writes().is_empty());
+        assert_eq!(radio.transport.writes(), Vec::<Vec<u8>>::new());
         radio.transport.assert_complete();
         Ok(())
     }

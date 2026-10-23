@@ -455,7 +455,7 @@ mod tests {
         let flags = image
             .get_mut(flags_offset..flags_end)
             .ok_or("regular-channel flag table is outside the test image")?;
-        for flag in flags.chunks_exact_mut(CHANNEL_FLAGS_SIZE) {
+        for flag in flags.as_chunks_mut::<CHANNEL_FLAGS_SIZE>().0 {
             let marker = flag
                 .first_mut()
                 .ok_or("channel flag record has no marker byte")?;

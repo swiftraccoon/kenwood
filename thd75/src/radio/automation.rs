@@ -2164,13 +2164,8 @@ impl<T: Transport> AutomationSession<'_, T> {
         }
 
         let mut decoded = Vec::with_capacity(SCREEN_BYTES);
-        for record in encoded.chunks_exact(3) {
-            let [count, low, high] = record else {
-                return Err(Radio::<T>::strict_protocol_error(
-                    "one complete RLE3 record",
-                    record.to_vec(),
-                ));
-            };
+        for record in encoded.as_chunks::<3>().0 {
+            let [count, low, high] = record;
             if *count == 0 {
                 return Err(Radio::<T>::strict_protocol_error(
                     "a nonzero RLE3 run length",
@@ -3137,7 +3132,7 @@ mod tests {
             assert!(!session.is_valid(), "accepted TN ends CAT automation");
         }
 
-        let kiss = radio.into_kiss_session().map_err(|(_, error)| error)?;
+        let kiss = radio.into_kiss_session().map_err(|failure| failure.1)?;
         assert_eq!(
             kiss.transport.writes(),
             &[b"TN 2,0\r".to_vec(), b"TN 2,0\r".to_vec()],

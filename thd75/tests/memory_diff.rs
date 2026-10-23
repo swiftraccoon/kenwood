@@ -203,9 +203,9 @@ fn diff_memory_dumps() {
     eprintln!("  Range: 0x{offset_min:05X} - 0x{offset_max:05X}");
     eprintln!("  Span : {} bytes", offset_max - offset_min + 1);
     eprintln!("  Count: {} changed bytes", diffs.len());
-    eprintln!("  Region(s): {}", region_for_offset(offset_min),);
+    eprintln!("  Region(s): {}", region_for_offset(offset_min));
     if region_for_offset(offset_min) != region_for_offset(offset_max) {
-        eprintln!("           + {}", region_for_offset(offset_max),);
+        eprintln!("           + {}", region_for_offset(offset_max));
     }
 }
 

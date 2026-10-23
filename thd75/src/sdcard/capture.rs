@@ -375,12 +375,7 @@ fn decode_pixels(
                 expected: row_end,
                 actual: data.len(),
             })?;
-        for bgr in row.chunks_exact(RGB_BYTES_PER_PIXEL) {
-            let &[blue, green, red] = bgr else {
-                return Err(invalid_bmp(
-                    "pixel row is not a whole number of 24-bit pixels",
-                ));
-            };
+        for &[blue, green, red] in row.as_chunks::<RGB_BYTES_PER_PIXEL>().0 {
             pixels.extend_from_slice(&[red, green, blue]);
         }
     }

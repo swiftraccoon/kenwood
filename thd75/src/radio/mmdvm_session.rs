@@ -31,7 +31,7 @@
 //! let radio = Radio::new(transport);
 //!
 //! // Enter MMDVM mode (consumes the Radio).
-//! let session = radio.enter_mmdvm(TncDataBand::B).await.map_err(|(_, e)| e)?;
+//! let session = radio.enter_mmdvm(TncDataBand::B).await.map_err(|failure| failure.1)?;
 //!
 //! // Inspect session.modem() while the runtime remains paired with this radio.
 //!
@@ -43,7 +43,7 @@
 //!     .into_radio()
 //!     .restore()
 //!     .await
-//!     .map_err(|(_desynced, e)| e)?;
+//!     .map_err(|failure| failure.1)?;
 //! # Ok(())
 //! # }
 //! ```
@@ -139,16 +139,14 @@ impl<T: Transport + Unpin + 'static> Radio<T> {
     ///
     /// # Errors
     ///
-    /// Returns the original radio and [`Error::BinaryModeNotProven`] if the
-    /// link is still ordinary CAT, [`Error::MemoryReadStreamPoisoned`] if an
-    /// incomplete GM exchange requires a reconnect, or [`Error::McpInterrupted`]
-    /// if an MCP session is not fully recovered.
-    #[expect(
-        clippy::result_large_err,
-        reason = "The ownership-preserving error matches enter_mmdvm: callers need the original \
-                  Radio to reconnect or recover MCP without losing the selected transport"
-    )]
-    pub fn into_mmdvm_session(self) -> Result<MmdvmSession<T, PersistentMmdvm>, (Self, Error)> {
+    /// Returns the original radio and error in a boxed pair:
+    /// [`Error::BinaryModeNotProven`] if the link is still ordinary CAT,
+    /// [`Error::MemoryReadStreamPoisoned`] if an incomplete GM exchange requires
+    /// a reconnect, or [`Error::McpInterrupted`] if an MCP session is not fully
+    /// recovered.
+    pub fn into_mmdvm_session(
+        self,
+    ) -> Result<MmdvmSession<T, PersistentMmdvm>, Box<(Self, Error)>> {
         let proof = BinaryProtocolProof::Mmdvm { data_band: None };
         let (transport, cat_restore) = self.into_binary_mode_parts(proof)?;
         Ok(Self::mmdvm_session_with_lifecycle(
@@ -182,13 +180,13 @@ impl<T: Transport + Unpin + 'static> Radio<T> {
     ///
     /// # Errors
     ///
-    /// On failure, returns the [`Radio`] alongside the error. If the transition
+    /// On failure, returns the [`Radio`] and error in a boxed pair. If the transition
     /// write may have reached the radio, that handle rejects ordinary CAT until
     /// [`Radio::restore_cat_after_mode_exit`] proves the framing boundary.
     pub async fn enter_mmdvm(
         mut self,
         data_band: TncDataBand,
-    ) -> Result<MmdvmSession<T>, (Self, Error)> {
+    ) -> Result<MmdvmSession<T>, Box<(Self, Error)>> {
         tracing::info!(?data_band, "entering MMDVM mode");
         let response = match self
             .execute(Command::SetTncMode {
@@ -205,7 +203,7 @@ impl<T: Transport + Unpin + 'static> Radio<T> {
                 ) {
                     self.cat_state = super::CatState::RecoveryRequired;
                 }
-                return Err((self, e));
+                return Err(Box::new((self, e)));
             }
         };
         match response {
@@ -221,13 +219,13 @@ impl<T: Transport + Unpin + 'static> Radio<T> {
             }
             other => {
                 self.cat_state = super::CatState::RecoveryRequired;
-                return Err((
+                return Err(Box::new((
                     self,
                     Error::Protocol(ProtocolError::UnexpectedResponse {
                         expected: format!("TncMode {{ mode: Mmdvm, data_band: {data_band:?} }}"),
                         actual: format!("{other:?}").into_bytes(),
                     }),
-                ));
+                )));
             }
         }
 
@@ -457,7 +455,7 @@ mod tests {
             let session = radio
                 .enter_mmdvm(TncDataBand::A)
                 .await
-                .map_err(|(_, e)| e)?;
+                .map_err(|failure| failure.1)?;
             assert!(format!("{session:?}").contains("MmdvmSession"));
             TestResult::Ok(())
         })
@@ -473,7 +471,7 @@ mod tests {
                 let _session = radio
                     .enter_mmdvm(TncDataBand::B)
                     .await
-                    .map_err(|(_, e)| e)?;
+                    .map_err(|failure| failure.1)?;
                 Ok(())
             })
             .await
@@ -486,9 +484,10 @@ mod tests {
         let mut radio = Radio::new(transport);
         radio.set_timeout(Duration::from_millis(1));
 
-        let Err((mut radio, error)) = radio.enter_mmdvm(TncDataBand::B).await else {
+        let Err(failure) = radio.enter_mmdvm(TncDataBand::B).await else {
             return Err("silent MMDVM transition unexpectedly created a session".into());
         };
+        let (mut radio, error) = *failure;
         assert!(matches!(error, Error::Timeout(_)));
         assert_eq!(radio.cat_state, crate::radio::CatState::RecoveryRequired);
         assert!(matches!(
@@ -506,9 +505,10 @@ mod tests {
         radio.cat_state =
             crate::radio::CatState::BinaryProven(BinaryProtocolProof::Kiss(TncDataBand::A));
 
-        let Err((radio, error)) = radio.into_mmdvm_session() else {
+        let Err(failure) = radio.into_mmdvm_session() else {
             return Err("KISS proof unexpectedly authorized an MMDVM session".into());
         };
+        let (radio, error) = *failure;
 
         assert!(matches!(error, Error::BinaryModeNotProven));
         assert_eq!(
@@ -542,7 +542,7 @@ mod tests {
                 let session = radio
                     .enter_mmdvm(TncDataBand::B)
                     .await
-                    .map_err(|(_, error)| error)?;
+                    .map_err(|failure| failure.1)?;
                 let radio = session.exit().await?.into_radio().into_radio_unproven();
 
                 assert_eq!(radio.timeout, Duration::from_millis(731));
@@ -588,7 +588,7 @@ mod tests {
                 let session = radio
                     .enter_mmdvm(TncDataBand::A)
                     .await
-                    .map_err(|(_, error)| error)?;
+                    .map_err(|failure| failure.1)?;
                 let radio = session.exit().await?.into_radio().into_radio_unproven();
                 radio.transport.assert_complete();
                 Ok(())
@@ -605,7 +605,7 @@ mod tests {
         radio.cat_state =
             crate::radio::CatState::BinaryProven(BinaryProtocolProof::Mmdvm { data_band: None });
 
-        let session = radio.into_mmdvm_session().map_err(|(_, error)| error)?;
+        let session = radio.into_mmdvm_session().map_err(|failure| failure.1)?;
         let completed = session.shutdown().await?;
         assert_eq!(completed.summary().dropped_frames(), Some(0));
         let (radio, summary) = completed.into_parts();
@@ -634,9 +634,10 @@ mod tests {
             data_band: Some(TncDataBand::B),
         });
 
-        let Err((radio, error)) = radio.into_mmdvm_session() else {
+        let Err(failure) = radio.into_mmdvm_session() else {
             return Err("transient MMDVM proof unexpectedly became persistent".into());
         };
+        let (radio, error) = *failure;
 
         assert!(matches!(error, Error::BinaryModeNotProven));
         assert_eq!(
@@ -654,9 +655,10 @@ mod tests {
         let mut radio = Radio::new(MockTransport::new());
         radio.gm_poisoned = true;
 
-        let Err((radio, error)) = radio.into_mmdvm_session() else {
+        let Err(failure) = radio.into_mmdvm_session() else {
             return Err("poisoned radio unexpectedly entered MMDVM mode".into());
         };
+        let (radio, error) = *failure;
         assert!(matches!(error, Error::MemoryReadStreamPoisoned));
         radio.transport.assert_complete();
         Ok(())
@@ -666,9 +668,10 @@ mod tests {
     async fn direct_mmdvm_conversion_rejects_an_unproved_cat_link() -> TestResult {
         let radio = Radio::new(MockTransport::new());
 
-        let Err((radio, error)) = radio.into_mmdvm_session() else {
+        let Err(failure) = radio.into_mmdvm_session() else {
             return Err("unproved CAT link unexpectedly entered MMDVM mode".into());
         };
+        let (radio, error) = *failure;
         assert!(matches!(error, Error::BinaryModeNotProven));
         radio.transport.assert_complete();
         Ok(())
@@ -679,9 +682,10 @@ mod tests {
         let mut radio = Radio::new(MockTransport::new());
         radio.mcp_phase = super::super::McpPhase::Active;
 
-        let Err((radio, error)) = radio.into_mmdvm_session() else {
+        let Err(failure) = radio.into_mmdvm_session() else {
             return Err("MCP-active radio unexpectedly entered MMDVM mode".into());
         };
+        let (radio, error) = *failure;
         assert!(matches!(error, Error::McpInterrupted));
         radio.transport.assert_complete();
         Ok(())

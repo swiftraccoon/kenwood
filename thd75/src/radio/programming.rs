@@ -2443,17 +2443,10 @@ impl<T: Transport> Radio<T> {
 
         let mut progress = McpWriteProgress::default();
 
-        // `chunks_exact` guarantees each chunk is exactly `PAGE_SIZE` bytes, so the
-        // conversion to `&[u8; PAGE_SIZE]` is effectively infallible; `map_err`
-        // converts the impossible error into an `McpInvalidImageSize` for type
-        // purposes rather than using `.expect()`.
-        for (i, chunk) in (0u16..page_count_u16).zip(data.chunks_exact(programming::PAGE_SIZE)) {
+        for (i, page_data) in
+            (0u16..page_count_u16).zip(data.as_chunks::<{ programming::PAGE_SIZE }>().0)
+        {
             let page = WritableMcpPage::new(start_page.as_raw() + i)?;
-            let page_data: &[u8; programming::PAGE_SIZE] =
-                chunk.try_into().map_err(|_| Error::McpInvalidImageSize {
-                    actual: chunk.len(),
-                    expected: programming::PAGE_SIZE,
-                })?;
             progress.possibly_written_pages.push(page);
             if let Err(source) = self.write_single_page(page, page_data).await {
                 return Err(progress.retain(source));
@@ -2936,8 +2929,8 @@ mod tests {
             std::future::pending().await
         }
 
-        async fn close(&mut self) -> Result<(), TransportError> {
-            Ok(())
+        fn close(&mut self) -> impl Future<Output = Result<(), TransportError>> {
+            std::future::ready(Ok(()))
         }
     }
 
@@ -4111,7 +4104,7 @@ mod tests {
             .read_sparse_memory_pages_with_progress(&[], |_, _| callback_called = true)
             .await?;
 
-        assert!(pages.is_empty());
+        assert_eq!(pages, []);
         assert!(
             !callback_called,
             "empty request must not invoke the callback"
@@ -5126,7 +5119,7 @@ mod tests {
             ),
             "first mismatch was not reported exactly: {error:?}"
         );
-        assert!(error.possibly_written_pages().is_empty());
+        assert_eq!(error.possibly_written_pages(), []);
         assert_eq!(radio.mcp_phase, McpPhase::Inactive);
         radio.transport.assert_complete();
         Ok(())
@@ -5329,7 +5322,7 @@ mod tests {
                 .into());
             }
         };
-        assert!(error.possibly_written_pages().is_empty());
+        assert_eq!(error.possibly_written_pages(), []);
         assert!(
             matches!(
                 &error,

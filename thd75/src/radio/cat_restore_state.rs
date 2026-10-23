@@ -40,29 +40,25 @@ impl<T: Transport> Radio<T> {
     /// remains unresolved. A complete binary diagnostic proof is accepted even
     /// though ordinary CAT stays blocked. Returning the intact radio on failure
     /// lets the caller recover without losing the selected transport.
-    #[expect(
-        clippy::result_large_err,
-        reason = "the ownership-preserving failure must return the intact Radio so callers can recover it"
-    )]
     pub(super) fn into_binary_mode_parts(
         self,
         expected_protocol: BinaryProtocolProof,
-    ) -> Result<(T, CatRestoreState), (Self, Error)> {
+    ) -> Result<(T, CatRestoreState), Box<(Self, Error)>> {
         if self.gm_poisoned {
-            return Err((self, Error::MemoryReadStreamPoisoned));
+            return Err(Box::new((self, Error::MemoryReadStreamPoisoned)));
         }
         if self.mcp_phase != McpPhase::Inactive
             || self.mcp_saved_timeout.is_some()
             || self.mcp_pending_exit_error.is_some()
         {
-            return Err((self, Error::McpInterrupted));
+            return Err(Box::new((self, Error::McpInterrupted)));
         }
         match self.cat_state {
             CatState::BinaryProven(proof) if proof == expected_protocol => {}
             CatState::BinaryProven(_) | CatState::Ready => {
-                return Err((self, Error::BinaryModeNotProven));
+                return Err(Box::new((self, Error::BinaryModeNotProven)));
             }
-            CatState::RecoveryRequired => return Err((self, Error::CatRecoveryRequired)),
+            CatState::RecoveryRequired => return Err(Box::new((self, Error::CatRecoveryRequired))),
         }
 
         let Self {
@@ -206,7 +202,7 @@ mod tests {
 
         let (transport, restore) = radio
             .into_binary_mode_parts(BinaryProtocolProof::Mmdvm { data_band: None })
-            .map_err(|(_, error)| error)?;
+            .map_err(|failure| failure.1)?;
         let radio = restore.rebuild_desynchronized(transport);
 
         assert!(
@@ -260,7 +256,7 @@ mod tests {
         let link_state = radio.link_state();
         let (transport, restore) = radio
             .into_binary_mode_parts(BinaryProtocolProof::Mmdvm { data_band: None })
-            .map_err(|(_, error)| error)?;
+            .map_err(|failure| failure.1)?;
 
         let radio = restore.rebuild_binary_proven(transport);
 
@@ -281,11 +277,12 @@ mod tests {
         let mut radio = Radio::new(MockTransport::new());
         radio.gm_poisoned = true;
 
-        let Err((radio, error)) =
+        let Err(failure) =
             radio.into_binary_mode_parts(BinaryProtocolProof::Mmdvm { data_band: None })
         else {
             return Err("poisoned CAT stream unexpectedly entered a binary session".into());
         };
+        let (radio, error) = *failure;
 
         assert!(matches!(error, Error::MemoryReadStreamPoisoned));
         assert!(radio.gm_poisoned);
@@ -297,11 +294,12 @@ mod tests {
     async fn split_rejects_an_unproved_cat_link_intact() -> TestResult {
         let radio = Radio::new(MockTransport::new());
 
-        let Err((radio, error)) =
+        let Err(failure) =
             radio.into_binary_mode_parts(BinaryProtocolProof::Mmdvm { data_band: None })
         else {
             return Err("unproved CAT link unexpectedly entered a binary session".into());
         };
+        let (radio, error) = *failure;
 
         assert!(matches!(error, Error::BinaryModeNotProven));
         assert_eq!(radio.cat_state, CatState::Ready);
@@ -314,11 +312,12 @@ mod tests {
         let mut radio = Radio::new(MockTransport::new());
         radio.mcp_phase = McpPhase::ExitSent;
 
-        let Err((radio, error)) =
+        let Err(failure) =
             radio.into_binary_mode_parts(BinaryProtocolProof::Mmdvm { data_band: None })
         else {
             return Err("interrupted MCP state unexpectedly entered a binary session".into());
         };
+        let (radio, error) = *failure;
 
         assert!(matches!(error, Error::McpInterrupted));
         assert_eq!(radio.mcp_phase, McpPhase::ExitSent);
@@ -331,11 +330,12 @@ mod tests {
         let mut radio = Radio::new(MockTransport::new());
         radio.mcp_saved_timeout = Some(Duration::from_millis(731));
 
-        let Err((mut radio, error)) =
+        let Err(failure) =
             radio.into_binary_mode_parts(BinaryProtocolProof::Mmdvm { data_band: None })
         else {
             return Err("saved MCP timeout unexpectedly entered a binary session".into());
         };
+        let (mut radio, error) = *failure;
         assert!(matches!(error, Error::McpInterrupted));
         assert_eq!(radio.mcp_saved_timeout, Some(Duration::from_millis(731)));
 
@@ -343,11 +343,12 @@ mod tests {
         radio.mcp_pending_exit_error = Some(Error::CommandRejected {
             mnemonic: "0M".to_string(),
         });
-        let Err((radio, error)) =
+        let Err(failure) =
             radio.into_binary_mode_parts(BinaryProtocolProof::Mmdvm { data_band: None })
         else {
             return Err("pending MCP exit error unexpectedly entered a binary session".into());
         };
+        let (radio, error) = *failure;
         assert!(matches!(error, Error::McpInterrupted));
         assert!(radio.mcp_pending_exit_error.is_some());
         radio.transport.assert_complete();

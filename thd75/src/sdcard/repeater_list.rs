@@ -784,7 +784,7 @@ struct RawCatalogRow<'a> {
 }
 
 impl<'a> RawCatalogRow<'a> {
-    fn from_columns(columns: &[&'a str]) -> Option<Self> {
+    const fn from_columns(columns: &[&'a str]) -> Option<Self> {
         let &[
             wn,
             world_region,

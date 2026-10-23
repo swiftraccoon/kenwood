@@ -542,15 +542,7 @@ pub(crate) fn decode_utf16le_bom(data: &[u8]) -> Result<String, SdCardError> {
         return Err(SdCardError::InvalidUtf16Length { len: payload.len() });
     }
 
-    let mut code_units = Vec::with_capacity(payload.len() / 2);
-    for pair in payload.chunks_exact(2) {
-        let bytes: [u8; 2] = pair
-            .try_into()
-            .map_err(|_| SdCardError::InvalidUtf16Length { len: payload.len() })?;
-        code_units.push(u16::from_le_bytes(bytes));
-    }
-
-    String::from_utf16(&code_units).map_err(|error| SdCardError::Utf16Decode {
+    String::from_utf16le(payload).map_err(|error| SdCardError::Utf16Decode {
         detail: error.to_string(),
     })
 }
@@ -595,4 +587,33 @@ fn read_array<const N: usize>(data: &[u8], offset: usize) -> Result<[u8; N], SdC
         expected: end,
         actual: data.len(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::assert_matches;
+
+    use super::{SdCardError, decode_utf16le_bom};
+
+    #[test]
+    fn utf16_decoder_preserves_bom_length_and_surrogate_errors()
+    -> Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(
+            decode_utf16le_bom(&[0xFF, 0xFE, b'A', 0, 0x3E, 0xD8, 0x80, 0xDD])?,
+            "A🦀"
+        );
+        assert_eq!(decode_utf16le_bom(&[0xFF, 0xFE])?, "");
+        for bytes in [b"A\0".as_slice(), &[0xFE, 0xFF, 0, b'A'], &[]] {
+            assert_matches!(decode_utf16le_bom(bytes), Err(SdCardError::MissingBom));
+        }
+        assert_matches!(
+            decode_utf16le_bom(&[0xFF, 0xFE, b'A']),
+            Err(SdCardError::InvalidUtf16Length { len: 1 })
+        );
+        assert_matches!(
+            decode_utf16le_bom(&[0xFF, 0xFE, 0, 0xD8]),
+            Err(SdCardError::Utf16Decode { .. })
+        );
+        Ok(())
+    }
 }

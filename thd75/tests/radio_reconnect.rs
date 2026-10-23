@@ -199,8 +199,8 @@ impl Transport for WedgedWriteTransport {
     async fn read(&mut self, _b: &mut [u8]) -> Result<usize, TransportError> {
         std::future::pending().await
     }
-    async fn close(&mut self) -> Result<(), TransportError> {
-        Ok(())
+    fn close(&mut self) -> impl Future<Output = Result<(), TransportError>> {
+        std::future::ready(Ok(()))
     }
 }
 

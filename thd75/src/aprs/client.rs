@@ -37,7 +37,7 @@
 //!
 //! let station = Ax25Address::new("N0CALL", 7)?;
 //! let config = AprsClientConfig::new(station, TncDataBand::A)?;
-//! let mut client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
+//! let mut client = AprsClient::start(radio, config).await.map_err(|failure| failure.1)?;
 //!
 //! // Send a message
 //! let addressee = kenwood_thd75::DirectMessageAddressee::new("KQ4NIT")?;
@@ -83,7 +83,7 @@
 //!     .map_err(|(_client, e)| e)?
 //!     .restore()
 //!     .await
-//!     .map_err(|(_desynced, e)| e)?;
+//!     .map_err(|failure| failure.1)?;
 //! # Ok(())
 //! # }
 //! ```
@@ -312,7 +312,7 @@ impl IGateToRfConfig {
         sender_rf_quiet_period: Duration,
         receiver_internet_quiet_period: Duration,
     ) -> Result<Self, crate::error::ValidationError> {
-        if receiver_rf_max_age.is_zero() || receiver_rf_max_age > Duration::from_secs(60 * 60) {
+        if receiver_rf_max_age.is_zero() || receiver_rf_max_age > Duration::from_hours(1) {
             return Err(crate::error::ValidationError::IGatePeriodOutOfRange {
                 field: "receiver RF maximum age",
                 value: receiver_rf_max_age,
@@ -1118,19 +1118,19 @@ impl<T: Transport> AprsClient<T> {
     ///
     /// # Errors
     ///
-    /// On failure, returns the [`Radio`] alongside the error. The radio may
+    /// On failure, returns the [`Radio`] and error in a boxed pair. The radio may
     /// require [`Radio::restore_cat_after_mode_exit`] before CAT commands are
     /// safe again because a failed KISS transition can leave binary bytes on
     /// the transport.
     pub async fn start(
         radio: Radio<T>,
         config: AprsClientConfig,
-    ) -> Result<Self, (Radio<T>, Error)> {
+    ) -> Result<Self, Box<(Radio<T>, Error)>> {
         let my_addr = config.source.clone();
 
         let mut session = match radio.enter_kiss(config.data_band).await {
             Ok(s) => s,
-            Err((radio, e)) => return Err((radio, e)),
+            Err(failure) => return Err(failure),
         };
         session.set_receive_timeout(EVENT_POLL_TIMEOUT);
 
@@ -1147,14 +1147,17 @@ impl<T: Transport> AprsClient<T> {
             // The caller receives the apply error either way; the radio
             // still tracks its own recovery obligation internally.
             return match session.exit().await {
-                Ok(desynced) => Err((desynced.into_radio_unproven(), error)),
-                Err((session, cleanup)) => Err((
-                    session.into_radio_recovery_required(),
-                    Error::KissStartupCleanup {
-                        configuration: Box::new(error),
-                        cleanup: Box::new(cleanup),
-                    },
-                )),
+                Ok(desynced) => Err(Box::new((desynced.into_radio_unproven(), error))),
+                Err(failure) => {
+                    let (session, cleanup) = *failure;
+                    Err(Box::new((
+                        session.into_radio_recovery_required(),
+                        Error::KissStartupCleanup {
+                            configuration: Box::new(error),
+                            cleanup: Box::new(cleanup),
+                        },
+                    )))
+                }
             };
         }
 
@@ -1215,22 +1218,25 @@ impl<T: Transport> AprsClient<T> {
         } = self;
         match session.exit().await {
             Ok(radio) => Ok(radio),
-            Err((session, e)) => Err((
-                Box::new(Self {
-                    session,
-                    config,
-                    my_addr,
-                    messenger,
-                    stations,
-                    igate_to_rf,
-                    beaconing,
-                    pending_events,
-                    pending_viscous,
-                    last_rf_packet,
-                    last_rf_frame_raw,
-                }),
-                e,
-            )),
+            Err(failure) => {
+                let (session, error) = *failure;
+                Err((
+                    Box::new(Self {
+                        session,
+                        config,
+                        my_addr,
+                        messenger,
+                        stations,
+                        igate_to_rf,
+                        beaconing,
+                        pending_events,
+                        pending_viscous,
+                        last_rf_packet,
+                        last_rf_frame_raw,
+                    }),
+                    error,
+                ))
+            }
         }
     }
 
@@ -2470,7 +2476,9 @@ mod tests {
     async fn start_enters_kiss_mode() -> TestResult {
         let radio = mock_radio(TncDataBand::A);
         let config = test_config()?;
-        let client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
+        let client = AprsClient::start(radio, config)
+            .await
+            .map_err(|failure| failure.1)?;
         let source = client.config().source().ok_or("expected an identity")?;
         assert_eq!(source.callsign, "N0CALL");
         assert_eq!(source.ssid, 7);
@@ -2489,7 +2497,9 @@ mod tests {
     async fn stop_exits_kiss_mode() -> TestResult {
         let radio = mock_radio(TncDataBand::A);
         let config = test_config()?;
-        let mut client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
+        let mut client = AprsClient::start(radio, config)
+            .await
+            .map_err(|failure| failure.1)?;
 
         // Queue the KISS exit frame expectation.
         client.session.transport.expect(&[FEND, 0xFF, FEND], &[]);
@@ -2512,7 +2522,9 @@ mod tests {
     async fn queue_message_returns_the_id_before_the_event_pump_transmits() -> TestResult {
         let radio = mock_radio(TncDataBand::A);
         let config = test_config()?;
-        let mut client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
+        let mut client = AprsClient::start(radio, config)
+            .await
+            .map_err(|failure| failure.1)?;
 
         let addressee = DirectMessageAddressee::new("W1AW")?;
         let text = MessageText::new("Hello")?;
@@ -2538,7 +2550,7 @@ mod tests {
         let radio = mock_radio(TncDataBand::A);
         let mut client = AprsClient::start(radio, test_config()?)
             .await
-            .map_err(|(_, error)| error)?;
+            .map_err(|failure| failure.1)?;
         let id = client.queue_message(
             &DirectMessageAddressee::new("W1AW-7")?,
             &MessageText::new("test")?,
@@ -2575,7 +2587,7 @@ mod tests {
             .build();
         let mut client = AprsClient::start(radio, config)
             .await
-            .map_err(|(_, error)| error)?;
+            .map_err(|failure| failure.1)?;
         let id = client.queue_message(
             &DirectMessageAddressee::new("W1AW-7")?,
             &MessageText::new("test")?,
@@ -2598,7 +2610,7 @@ mod tests {
         let radio = mock_radio(TncDataBand::A);
         let mut client = AprsClient::start(radio, test_config()?)
             .await
-            .map_err(|(_, error)| error)?;
+            .map_err(|failure| failure.1)?;
         let id = MessageId::new("42")?;
         let from = Ax25Address::new("W1AW", 7)?;
         let frame = client
@@ -2620,7 +2632,7 @@ mod tests {
         let radio = mock_radio(TncDataBand::A);
         let mut client = AprsClient::start(radio, test_config()?)
             .await
-            .map_err(|(_, error)| error)?;
+            .map_err(|failure| failure.1)?;
         let packet = AprsFrameHeader::new(
             Ax25Address::new("W1AW", 7)?,
             Tocall::th_d75(),
@@ -2658,7 +2670,7 @@ mod tests {
         let radio = mock_radio(TncDataBand::A);
         let mut client = AprsClient::start(radio, test_config()?)
             .await
-            .map_err(|(_, error)| error)?;
+            .map_err(|failure| failure.1)?;
         let config = aprs::MessengerConfig::default()
             .with_incoming_deduplication(Duration::from_secs(300), NonZeroUsize::MIN)?;
         let mut messenger = AprsMessenger::with_config(client.frame_header()?, config);
@@ -2725,7 +2737,7 @@ mod tests {
         });
         let mut client = AprsClient::start(radio, test_config()?)
             .await
-            .map_err(|(_, error)| error)?;
+            .map_err(|failure| failure.1)?;
         client.config.digipeater = Some(DigipeaterConfig::new(
             test_address()?,
             aprs::DigipeaterAliases {
@@ -2772,7 +2784,7 @@ mod tests {
         let radio = mock_radio(TncDataBand::A);
         let mut client = AprsClient::start(radio, test_config()?)
             .await
-            .map_err(|(_, error)| error)?;
+            .map_err(|failure| failure.1)?;
         for source in ["W1AW", "W2AW"] {
             client
                 .pending_viscous
@@ -2804,7 +2816,9 @@ mod tests {
     async fn beacon_position_transmits() -> TestResult {
         let radio = mock_radio(TncDataBand::A);
         let config = test_config()?;
-        let mut client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
+        let mut client = AprsClient::start(radio, config)
+            .await
+            .map_err(|failure| failure.1)?;
 
         let expected = test_header()?.position_report(
             Latitude::new(35.25)?,
@@ -2828,7 +2842,9 @@ mod tests {
     async fn beacon_position_compressed_transmits() -> TestResult {
         let radio = mock_radio(TncDataBand::A);
         let config = test_config()?;
-        let mut client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
+        let mut client = AprsClient::start(radio, config)
+            .await
+            .map_err(|failure| failure.1)?;
 
         let expected = test_header()?.position_compressed(
             Latitude::new(35.25)?,
@@ -2852,7 +2868,9 @@ mod tests {
     async fn raw_frame_tap_captures_exact_ax25_bytes() -> TestResult {
         let radio = mock_radio(TncDataBand::A);
         let config = test_config()?;
-        let mut client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
+        let mut client = AprsClient::start(radio, config)
+            .await
+            .map_err(|failure| failure.1)?;
 
         let packet = Ax25Packet::unnumbered_information(
             Ax25Header {
@@ -2888,7 +2906,9 @@ mod tests {
     async fn send_message_unacked_transmits_once_with_no_retry_state() -> TestResult {
         let radio = mock_radio(TncDataBand::A);
         let config = test_config()?;
-        let mut client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
+        let mut client = AprsClient::start(radio, config)
+            .await
+            .map_err(|failure| failure.1)?;
 
         let addressee = DirectMessageAddressee::new("KQ4NIT")?;
         let text = MessageText::new("one-shot")?;
@@ -2933,7 +2953,9 @@ mod tests {
                 ..KissParams::default()
             })
             .build();
-        let client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
+        let client = AprsClient::start(radio, config)
+            .await
+            .map_err(|failure| failure.1)?;
 
         // The strict-FIFO mock proves the parameter frame went on the
         // wire during start, in order, and nothing else was sent.
@@ -2945,7 +2967,9 @@ mod tests {
     async fn receive_only_client_decodes_but_refuses_transmit() -> TestResult {
         let radio = mock_radio(TncDataBand::A);
         let config = AprsClientConfig::receive_only(TncDataBand::A);
-        let mut client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
+        let mut client = AprsClient::start(radio, config)
+            .await
+            .map_err(|failure| failure.1)?;
 
         // RX still decodes into events with no station identity.
         let info = b"!3515.00N/09745.00W>mobile";
@@ -2978,7 +3002,9 @@ mod tests {
     async fn send_status_transmits() -> TestResult {
         let radio = mock_radio(TncDataBand::A);
         let config = test_config()?;
-        let mut client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
+        let mut client = AprsClient::start(radio, config)
+            .await
+            .map_err(|failure| failure.1)?;
 
         let text = StatusText::new("On the air")?;
         let expected = test_header()?.status(&text);
@@ -2992,7 +3018,9 @@ mod tests {
     async fn send_timestamped_status_transmits() -> TestResult {
         let radio = mock_radio(TncDataBand::A);
         let config = test_config()?;
-        let mut client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
+        let mut client = AprsClient::start(radio, config)
+            .await
+            .map_err(|failure| failure.1)?;
 
         let timestamp = AprsStatusTimestamp::day_hour_minute_utc(9, 23, 45)?;
         let text = TimestampedStatusText::new("On the air")?;
@@ -3007,7 +3035,9 @@ mod tests {
     async fn send_object_transmits() -> TestResult {
         let radio = mock_radio(TncDataBand::A);
         let config = test_config()?;
-        let mut client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
+        let mut client = AprsClient::start(radio, config)
+            .await
+            .map_err(|failure| failure.1)?;
         let timestamp = AprsReportTimestamp::day_hour_minute_utc(15, 14, 30)?;
 
         let report = ObjectReport::new(
@@ -3214,7 +3244,9 @@ mod tests {
     async fn format_packet_for_aprs_is_is_byte_exact() -> TestResult {
         let radio = mock_radio(TncDataBand::A);
         let config = test_config()?;
-        let client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
+        let client = AprsClient::start(radio, config)
+            .await
+            .map_err(|failure| failure.1)?;
 
         let packet = make_test_packet("W1AW", "APK005", &["WIDE1-1"], b"!4903.50N/07201.75W-")?;
         let is_line = client.format_packet_for_aprs_is(&packet, IgateMessaging::Bidirectional)?;
@@ -3230,7 +3262,9 @@ mod tests {
     async fn format_packet_for_aprs_is_normalizes_terminal_tnc_framing() -> TestResult {
         let radio = mock_radio(TncDataBand::A);
         let config = test_config()?;
-        let client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
+        let client = AprsClient::start(radio, config)
+            .await
+            .map_err(|failure| failure.1)?;
 
         let packet = make_test_packet("W1AW", "APK005", &["WIDE1-1"], b">QRV mobile\r")?;
         let normalized =
@@ -3254,7 +3288,9 @@ mod tests {
     async fn format_packet_for_aprs_is_preserves_non_utf8_and_rf_return_capability() -> TestResult {
         let radio = mock_radio(TncDataBand::A);
         let config = test_config()?;
-        let client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
+        let client = AprsClient::start(radio, config)
+            .await
+            .map_err(|failure| failure.1)?;
 
         let information = [b'`', 0xC1, 0x82, b'X'];
         let packet = make_test_packet("W1AW", "APK005", &[], &information)?;
@@ -3313,7 +3349,9 @@ mod tests {
     async fn observe_and_evaluate_gate_from_is_rejects_position_reports() -> TestResult {
         let radio = mock_radio(TncDataBand::A);
         let config = test_igate_config()?;
-        let mut client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
+        let mut client = AprsClient::start(radio, config)
+            .await
+            .map_err(|failure| failure.1)?;
 
         // Position report (starts with '!') should not be gated to RF.
         let line = parse_is_fixture("W1AW>APK005,TCPIP:!4903.50N/07201.75W-Test\r\n")?;
@@ -3326,7 +3364,9 @@ mod tests {
     -> TestResult {
         let radio = mock_radio(TncDataBand::A);
         let config = test_igate_config()?;
-        let mut client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
+        let mut client = AprsClient::start(radio, config)
+            .await
+            .map_err(|failure| failure.1)?;
         let now = Instant::now();
         hear_directly_on_rf(&mut client, "NWS-WARN", now)?;
 
@@ -3339,7 +3379,9 @@ mod tests {
     async fn observe_and_evaluate_gate_from_is_rejects_nogate_in_path() -> TestResult {
         let radio = mock_radio(TncDataBand::A);
         let config = test_igate_config()?;
-        let mut client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
+        let mut client = AprsClient::start(radio, config)
+            .await
+            .map_err(|failure| failure.1)?;
 
         let line = parse_is_fixture("W1AW>APK005,NOGATE::N0CALL   :Hello{123\r\n")?;
         assert!(!client.observe_and_evaluate_gate_from_is(&line, Instant::now())?);
@@ -3350,7 +3392,9 @@ mod tests {
     async fn observe_and_evaluate_gate_from_is_requires_heard_station() -> TestResult {
         let radio = mock_radio(TncDataBand::A);
         let config = test_igate_config()?;
-        let mut client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
+        let mut client = AprsClient::start(radio, config)
+            .await
+            .map_err(|failure| failure.1)?;
 
         // Message to a station NOT in our station list.
         let line = parse_is_fixture("W1AW>APK005,TCPIP::UNKNOWN  :Hello{123\r\n")?;
@@ -3362,7 +3406,9 @@ mod tests {
     async fn observe_and_evaluate_gate_from_is_accepts_message_to_heard_station() -> TestResult {
         let radio = mock_radio(TncDataBand::A);
         let config = test_igate_config()?;
-        let mut client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
+        let mut client = AprsClient::start(radio, config)
+            .await
+            .map_err(|failure| failure.1)?;
 
         // Simulate hearing a station on RF.
         let now = Instant::now();
@@ -3379,7 +3425,9 @@ mod tests {
     {
         let radio = mock_radio(TncDataBand::A);
         let config = test_igate_config()?;
-        let mut client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
+        let mut client = AprsClient::start(radio, config)
+            .await
+            .map_err(|failure| failure.1)?;
         let now = Instant::now();
         hear_directly_on_rf(&mut client, "KQ4NIT", now)?;
         for wire in [
@@ -3402,7 +3450,7 @@ mod tests {
         let radio = mock_radio(TncDataBand::A);
         let mut client = AprsClient::start(radio, test_config()?)
             .await
-            .map_err(|(_, error)| error)?;
+            .map_err(|failure| failure.1)?;
         let line = parse_is_fixture("W1AW>APK005,TCPIP*,qAC,SRV::KQ4NIT   :Hello{123")?;
         assert!(!client.observe_and_evaluate_gate_from_is(&line, Instant::now())?);
         Ok(())
@@ -3416,7 +3464,9 @@ mod tests {
             .igate_to_rf(policy)
             .build();
         let radio = mock_radio(TncDataBand::A);
-        let mut client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
+        let mut client = AprsClient::start(radio, config)
+            .await
+            .map_err(|failure| failure.1)?;
         let now = Instant::now();
         let repeated_one = ax25_codec::RouteEntry::new("WIDE1", 1)?.marked_used();
         let repeated_two = ax25_codec::RouteEntry::new("WIDE2", 1)?.marked_used();
@@ -3467,7 +3517,7 @@ mod tests {
         let radio = mock_radio(TncDataBand::A);
         let mut client = AprsClient::start(radio, test_igate_config()?)
             .await
-            .map_err(|(_, error)| error)?;
+            .map_err(|failure| failure.1)?;
         let now = Instant::now();
         hear_directly_on_rf(&mut client, "KQ4NIT", now)?;
 
@@ -3500,7 +3550,9 @@ mod tests {
             .igate_to_rf(policy)
             .build();
         let radio = mock_radio(TncDataBand::A);
-        let mut client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
+        let mut client = AprsClient::start(radio, config)
+            .await
+            .map_err(|failure| failure.1)?;
         let observed = Instant::now();
         hear_directly_on_rf(&mut client, "KQ4NIT", observed)?;
         hear_directly_on_rf(&mut client, "W1AW", observed)?;
@@ -3528,7 +3580,9 @@ mod tests {
             .igate_to_rf(policy)
             .build();
         let radio = mock_radio(TncDataBand::A);
-        let mut client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
+        let mut client = AprsClient::start(radio, config)
+            .await
+            .map_err(|failure| failure.1)?;
         let observed = Instant::now();
         hear_directly_on_rf(&mut client, "KQ4NIT", observed)?;
         let line = parse_is_fixture("W1AW>APK005,TCPIP*,qAC,SRV::KQ4NIT   :Hello{123")?;
@@ -3555,7 +3609,9 @@ mod tests {
             .igate_to_rf(policy)
             .build();
         let radio = mock_radio(TncDataBand::A);
-        let mut client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
+        let mut client = AprsClient::start(radio, config)
+            .await
+            .map_err(|failure| failure.1)?;
         let observed = Instant::now();
         hear_directly_on_rf(&mut client, "KQ4NIT-9", observed)?;
         hear_via_internet(&mut client, "KQ4NIT-9", observed)?;
@@ -3575,7 +3631,7 @@ mod tests {
         let radio = mock_radio(TncDataBand::A);
         let mut client = AprsClient::start(radio, test_igate_config()?)
             .await
-            .map_err(|(_, error)| error)?;
+            .map_err(|failure| failure.1)?;
         let now = Instant::now();
         let direct = Ax25Packet::unnumbered_information(
             Ax25Header {
@@ -3624,7 +3680,7 @@ mod tests {
         let radio = mock_radio(TncDataBand::A);
         let mut client = AprsClient::start(radio, test_igate_config()?)
             .await
-            .map_err(|(_, error)| error)?;
+            .map_err(|failure| failure.1)?;
         let now = Instant::now();
         hear_directly_on_rf(&mut client, "KQ4NIT", now)?;
         let receiver_position =
@@ -3641,7 +3697,7 @@ mod tests {
         let radio = mock_radio(TncDataBand::A);
         let mut client = AprsClient::start(radio, test_igate_config()?)
             .await
-            .map_err(|(_, error)| error)?;
+            .map_err(|failure| failure.1)?;
         let now = Instant::now();
         hear_directly_on_rf(&mut client, "KQ4NIT", now)?;
         let ack = parse_is_fixture("W1AW>APK005,TCPIP*,qAC,SRV::KQ4NIT   :ack123")?;
@@ -3657,7 +3713,7 @@ mod tests {
         let radio = mock_radio(TncDataBand::A);
         let mut client = AprsClient::start(radio, test_igate_config()?)
             .await
-            .map_err(|(_, error)| error)?;
+            .map_err(|failure| failure.1)?;
         let now = Instant::now();
         hear_directly_on_rf(&mut client, "KQ4NIT", now)?;
         client.session.transport.expect_any_write();
@@ -3689,7 +3745,7 @@ mod tests {
             let radio = mock_radio(TncDataBand::A);
             let mut client = AprsClient::start(radio, test_igate_config()?)
                 .await
-                .map_err(|(_, error)| error)?;
+                .map_err(|failure| failure.1)?;
             let now = Instant::now();
             hear_directly_on_rf(&mut client, "KQ4NIT", now)?;
             client.session.transport.expect_any_write();
@@ -3714,7 +3770,9 @@ mod tests {
     async fn gate_from_is_wraps_in_third_party_header() -> TestResult {
         let radio = mock_radio(TncDataBand::A);
         let config = test_igate_config()?;
-        let mut client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
+        let mut client = AprsClient::start(radio, config)
+            .await
+            .map_err(|failure| failure.1)?;
 
         // Simulate hearing the addressee on RF so gating is allowed.
         let now = Instant::now();
@@ -3742,7 +3800,9 @@ mod tests {
         // protocol coverage.
         let radio = mock_radio(TncDataBand::A);
         let config = test_igate_config()?;
-        let mut client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
+        let mut client = AprsClient::start(radio, config)
+            .await
+            .map_err(|failure| failure.1)?;
 
         // Simulate hearing the addressee on RF so gating is allowed.
         let now = Instant::now();
@@ -3795,7 +3855,9 @@ mod tests {
     async fn gate_from_is_filters_position_report() -> TestResult {
         let radio = mock_radio(TncDataBand::A);
         let config = test_igate_config()?;
-        let mut client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
+        let mut client = AprsClient::start(radio, config)
+            .await
+            .map_err(|failure| failure.1)?;
 
         // Position report should not be gated to RF.
         let result = client
@@ -3811,7 +3873,7 @@ mod tests {
         let config = test_igate_config()?;
         let mut client = AprsClient::start(radio, config)
             .await
-            .map_err(|(_, error)| error)?;
+            .map_err(|failure| failure.1)?;
 
         for malformed in [
             b"W1AW>APK005,qAC,SRV::KQ4NIT   :hello\r\nEVIL>APRS:forged\r\n".as_slice(),
@@ -3842,7 +3904,7 @@ mod tests {
         let config = test_igate_config()?;
         let mut client = AprsClient::start(radio, config)
             .await
-            .map_err(|(_, error)| error)?;
+            .map_err(|failure| failure.1)?;
         let now = Instant::now();
         hear_directly_on_rf(&mut client, "KQ4NIT", now)?;
 
@@ -3861,7 +3923,7 @@ mod tests {
         let config = test_igate_config()?;
         let mut client = AprsClient::start(radio, config)
             .await
-            .map_err(|(_, error)| error)?;
+            .map_err(|failure| failure.1)?;
         let now = Instant::now();
         hear_directly_on_rf(&mut client, "KQ4NIT", now)?;
 
@@ -3946,7 +4008,7 @@ mod tests {
         let radio = mock_radio(TncDataBand::A);
         let mut client = AprsClient::start(radio, test_config()?)
             .await
-            .map_err(|(_, error)| error)?;
+            .map_err(|failure| failure.1)?;
         let expected = Ax25Address::new("W1AW", 11)?;
         for info in [
             b"!3515.00N/09745.00W>mobile".as_slice(),
@@ -3987,7 +4049,7 @@ mod tests {
         let radio = mock_radio(TncDataBand::A);
         let mut client = AprsClient::start(radio, config)
             .await
-            .map_err(|(_, error)| error)?;
+            .map_err(|failure| failure.1)?;
         let remote = Ax25Address::new("W1AW", 11)?;
         let relay = AprsFrameHeader::new(remote.clone(), Tocall::th_d75(), DigipeaterPath::empty())
             .status_packet(&StatusText::new("relay")?);
@@ -4019,7 +4081,9 @@ mod tests {
     async fn next_event_position_received() -> TestResult {
         let radio = mock_radio(TncDataBand::A);
         let config = test_config()?;
-        let mut client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
+        let mut client = AprsClient::start(radio, config)
+            .await
+            .map_err(|failure| failure.1)?;
 
         // Uncompressed position: !DDMM.MMN/DDDMM.MMW>comment
         let info = b"!3515.00N/09745.00W>mobile";
@@ -4050,7 +4114,9 @@ mod tests {
     async fn next_event_weather_received() -> TestResult {
         let radio = mock_radio(TncDataBand::A);
         let config = test_config()?;
-        let mut client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
+        let mut client = AprsClient::start(radio, config)
+            .await
+            .map_err(|failure| failure.1)?;
 
         // Position + weather report: !DDMM.MMN/DDDMM.MMW_DIR/SPDgGUSTt072
         let info = b"!3515.00N/09745.00W_090/010g015t072";
@@ -4104,7 +4170,9 @@ mod tests {
         let config = AprsClientConfig::try_builder("N0CALL", 7, TncDataBand::A)?
             .auto_ack(false)
             .build();
-        let mut client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
+        let mut client = AprsClient::start(radio, config)
+            .await
+            .map_err(|failure| failure.1)?;
 
         // APRS message: :ADDRESSEE:message text{id
         let info = b":N0CALL-7 :Hello from W1AW{42";
@@ -4127,7 +4195,9 @@ mod tests {
     async fn next_event_message_delivered() -> TestResult {
         let radio = mock_radio(TncDataBand::A);
         let config = test_config()?;
-        let mut client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
+        let mut client = AprsClient::start(radio, config)
+            .await
+            .map_err(|failure| failure.1)?;
 
         // First, send a message so we have a pending message with id "1"
         let addressee = DirectMessageAddressee::new("W1AW")?;
@@ -4157,7 +4227,9 @@ mod tests {
     async fn next_event_message_rejected() -> TestResult {
         let radio = mock_radio(TncDataBand::A);
         let config = test_config()?;
-        let mut client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
+        let mut client = AprsClient::start(radio, config)
+            .await
+            .map_err(|failure| failure.1)?;
 
         // Send a message to have pending id "1"
         let addressee = DirectMessageAddressee::new("W1AW")?;
@@ -4187,7 +4259,9 @@ mod tests {
     async fn next_event_raw_packet_for_unknown_data() -> TestResult {
         let radio = mock_radio(TncDataBand::A);
         let config = test_config()?;
-        let mut client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
+        let mut client = AprsClient::start(radio, config)
+            .await
+            .map_err(|failure| failure.1)?;
 
         // Send some unparseable APRS data (random info bytes)
         let info = b"XUNKNOWN_DATA_TYPE";
@@ -4213,7 +4287,9 @@ mod tests {
         // hand back the underlying frame so the IGate can forward it.
         let radio = mock_radio(TncDataBand::A);
         let config = test_config()?;
-        let mut client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
+        let mut client = AprsClient::start(radio, config)
+            .await
+            .map_err(|failure| failure.1)?;
 
         let info = b"!3515.00N/09745.00W>mobile";
         let wire = build_kiss_data_frame("W1AW", 7, info);
@@ -4248,7 +4324,9 @@ mod tests {
         // that an IGate would re-gate against an unrelated event.
         let radio = mock_radio(TncDataBand::A);
         let config = test_config()?;
-        let mut client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
+        let mut client = AprsClient::start(radio, config)
+            .await
+            .map_err(|failure| failure.1)?;
         let _idle_event = client.next_event().await?;
         assert!(
             client.take_last_rf_packet().is_none(),
@@ -4267,7 +4345,9 @@ mod tests {
         // which next_event maps to Ok(None) without ever sleeping.
         let radio = mock_radio(TncDataBand::A);
         let config = test_config()?;
-        let mut client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
+        let mut client = AprsClient::start(radio, config)
+            .await
+            .map_err(|failure| failure.1)?;
         let event = client.next_event().await?;
         assert!(event.is_none(), "expected Ok(None) on idle, got {event:?}");
         Ok(())
@@ -4281,7 +4361,9 @@ mod tests {
     async fn update_motion_first_call_triggers_beacon() -> TestResult {
         let radio = mock_radio(TncDataBand::A);
         let config = test_config()?;
-        let mut client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
+        let mut client = AprsClient::start(radio, config)
+            .await
+            .map_err(|failure| failure.1)?;
 
         // SmartBeaconing always triggers on first call.
         let expected = test_header()?.position_report(
@@ -4308,7 +4390,9 @@ mod tests {
     async fn update_motion_second_call_no_beacon() -> TestResult {
         let radio = mock_radio(TncDataBand::A);
         let config = test_config()?;
-        let mut client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
+        let mut client = AprsClient::start(radio, config)
+            .await
+            .map_err(|failure| failure.1)?;
 
         // First call beacons.
         let expected = test_header()?.position_report(
@@ -4344,7 +4428,9 @@ mod tests {
     async fn beacon_position_mice_sends_expected_wire_bytes() -> TestResult {
         let radio = mock_radio(TncDataBand::A);
         let config = test_config()?;
-        let mut client = AprsClient::start(radio, config).await.map_err(|(_, e)| e)?;
+        let mut client = AprsClient::start(radio, config)
+            .await
+            .map_err(|failure| failure.1)?;
 
         let expected = MiceReport::new(
             Latitude::new(35.30)?,
@@ -4375,7 +4461,7 @@ mod tests {
         let radio = mock_radio(TncDataBand::A);
         let mut client = AprsClient::start(radio, test_config()?)
             .await
-            .map_err(|(_, error)| error)?;
+            .map_err(|failure| failure.1)?;
         for longitude in [-180.0, -179.999_99, 179.999_99, 180.0] {
             let result = client
                 .beacon_position_mice(

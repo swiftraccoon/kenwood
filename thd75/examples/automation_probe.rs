@@ -576,8 +576,10 @@ mod macos {
 
     fn differing_pixels(left: &ScreenFrame, right: &ScreenFrame) -> usize {
         left.rgb565_le()
-            .chunks_exact(2)
-            .zip(right.rgb565_le().chunks_exact(2))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .zip(right.rgb565_le().as_chunks::<2>().0)
             .filter(|(left_pixel, right_pixel)| left_pixel != right_pixel)
             .count()
     }

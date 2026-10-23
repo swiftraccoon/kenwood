@@ -81,7 +81,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                     // Parse the AX.25 payload.
                     if let Ok(ax25) = ax25_codec::Ax25Packet::from_bytes(&kiss_frame.data) {
-                        print!("{}>{}", ax25.header.source, ax25.header.destination,);
+                        print!("{}>{}", ax25.header.source, ax25.header.destination);
                         for digi in &ax25.header.digipeaters {
                             print!(",{digi}");
                         }

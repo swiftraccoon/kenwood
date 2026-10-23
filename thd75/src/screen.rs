@@ -160,7 +160,7 @@ impl ScreenFrame {
     pub fn to_stock_bmp(&self) -> Vec<u8> {
         let mut bmp = Vec::with_capacity(STOCK_BMP_HEADER.len() + SCREEN_WIDTH * SCREEN_HEIGHT * 3);
         bmp.extend_from_slice(&STOCK_BMP_HEADER);
-        for row in self.rgb565_le.chunks_exact(SCREEN_STRIDE).rev() {
+        for row in self.rgb565_le.as_chunks::<SCREEN_STRIDE>().0.iter().rev() {
             let (pixels, _remainder) = row.as_chunks::<2>();
             for pair in pixels {
                 let [red, green, blue] = zero_extend_rgb565(u16::from_le_bytes(*pair));
@@ -288,10 +288,10 @@ mod tests {
         let rgb = frame.to_rgb888();
         let rgba = frame.to_rgba8888();
         assert_eq!(rgba.len(), SCREEN_WIDTH * SCREEN_HEIGHT * 4);
-        for (pixel_rgb, pixel_rgba) in rgb.chunks_exact(3).zip(rgba.chunks_exact(4)) {
+        for (pixel_rgb, pixel_rgba) in rgb.as_chunks::<3>().0.iter().zip(rgba.as_chunks::<4>().0) {
             assert_eq!(
                 pixel_rgba.get(..3),
-                Some(pixel_rgb),
+                Some(pixel_rgb.as_slice()),
                 "color bytes must match to_rgb888"
             );
             assert_eq!(pixel_rgba.get(3), Some(&0xFF), "alpha must be opaque");
