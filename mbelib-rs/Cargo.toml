@@ -16,10 +16,10 @@ description = "Pure Rust AMBE 3600x2400 voice codec for D-STAR digital radio"
 # Real-input FFT for JMBE-compatible unvoiced synthesis (Algorithms #117-126)
 # and (when `encoder` is enabled) for the AMBE encode-side spectral analysis.
 # Pure Rust, MIT/Apache-2.0 (compatible with our GPL outgoing license).
-realfft = "3.4"
+realfft = "3.5.0"
 # SIMD primitives (f32x4 / i32x4) for the float→i16 conversion hot path.
 # Pure Rust, MIT/Apache-2.0/Zlib.
-wide = "0.7"
+wide = "1.7.1"
 
 [features]
 default = []
@@ -47,7 +47,7 @@ kenwood-tables = ["encoder"]
 wave-enhance = []
 
 [dev-dependencies]
-proptest = "1"
+proptest = "1.12.0"
 
 # Examples that depend on the encoder feature. Cargo silently skips a
 # target whose `required-features` are off, so these are invisible to a
