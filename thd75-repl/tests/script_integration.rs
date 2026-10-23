@@ -67,8 +67,8 @@ fn run_with_script_args(
     let output = Command::new(env!("CARGO_BIN_EXE_thd75-repl"))
         .args(&args)
         .output()?;
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let stdout = String::from_utf8_lossy_owned(output.stdout);
+    let stderr = String::from_utf8_lossy_owned(output.stderr);
     Ok((output.status.success(), stdout, stderr))
 }
 

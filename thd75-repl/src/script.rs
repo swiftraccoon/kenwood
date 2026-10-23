@@ -121,14 +121,14 @@ mod tests {
     #[test]
     fn empty_file_is_valid() -> TestResult {
         let s = parse("")?;
-        assert!(s.commands.is_empty());
+        assert_eq!(s.commands, Vec::<String>::new());
         Ok(())
     }
 
     #[test]
     fn only_comments_is_valid() -> TestResult {
         let s = parse("# foo\n# bar\n\n")?;
-        assert!(s.commands.is_empty());
+        assert_eq!(s.commands, Vec::<String>::new());
         Ok(())
     }
 }

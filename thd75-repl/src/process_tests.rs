@@ -26,32 +26,40 @@ impl RecordingTransport {
 }
 
 impl Transport for RecordingTransport {
-    async fn write(&mut self, _bytes: &[u8]) -> Result<(), TransportError> {
-        self.record("write");
-        Err(TransportError::Write(std::io::Error::other(
-            "unexpected write",
-        )))
+    fn write(&mut self, _bytes: &[u8]) -> impl Future<Output = Result<(), TransportError>> {
+        std::future::poll_fn(move |_| {
+            self.record("write");
+            std::task::Poll::Ready(Err(TransportError::Write(std::io::Error::other(
+                "unexpected write",
+            ))))
+        })
     }
 
-    async fn read(&mut self, _buffer: &mut [u8]) -> Result<usize, TransportError> {
-        self.record("read");
-        Err(TransportError::Read(std::io::Error::other(
-            "unexpected read",
-        )))
+    fn read(&mut self, _buffer: &mut [u8]) -> impl Future<Output = Result<usize, TransportError>> {
+        std::future::poll_fn(move |_| {
+            self.record("read");
+            std::task::Poll::Ready(Err(TransportError::Read(std::io::Error::other(
+                "unexpected read",
+            ))))
+        })
     }
 
-    async fn close(&mut self) -> Result<(), TransportError> {
-        self.record("close");
-        if self.close_fails {
-            Err(TransportError::NotFound)
-        } else {
-            Ok(())
-        }
+    fn close(&mut self) -> impl Future<Output = Result<(), TransportError>> {
+        std::future::poll_fn(move |_| {
+            self.record("close");
+            std::task::Poll::Ready(if self.close_fails {
+                Err(TransportError::NotFound)
+            } else {
+                Ok(())
+            })
+        })
     }
 
-    async fn reopen(&mut self) -> Result<(), TransportError> {
-        self.record("reopen");
-        Err(TransportError::NotFound)
+    fn reopen(&mut self) -> impl Future<Output = Result<(), TransportError>> {
+        std::future::poll_fn(move |_| {
+            self.record("reopen");
+            std::task::Poll::Ready(Err(TransportError::NotFound))
+        })
     }
 }
 

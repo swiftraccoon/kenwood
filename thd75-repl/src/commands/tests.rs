@@ -14,26 +14,32 @@ struct RecordingTransport {
 }
 
 impl Transport for RecordingTransport {
-    async fn write(&mut self, bytes: &[u8]) -> Result<(), TransportError> {
-        self.writes
-            .lock()
-            .map_err(|_| {
-                TransportError::Write(std::io::Error::other("write record lock poisoned"))
-            })?
-            .push(bytes.to_vec());
-        Err(TransportError::Write(std::io::Error::other(
-            "unexpected CAT write",
-        )))
+    fn write(&mut self, bytes: &[u8]) -> impl Future<Output = Result<(), TransportError>> {
+        std::future::poll_fn(move |_| {
+            match self.writes.lock() {
+                Ok(mut writes) => writes.push(bytes.to_vec()),
+                Err(_) => {
+                    return std::task::Poll::Ready(Err(TransportError::Write(
+                        std::io::Error::other("write record lock poisoned"),
+                    )));
+                }
+            }
+            std::task::Poll::Ready(Err(TransportError::Write(std::io::Error::other(
+                "unexpected CAT write",
+            ))))
+        })
     }
 
-    async fn read(&mut self, _buffer: &mut [u8]) -> Result<usize, TransportError> {
-        Err(TransportError::Read(std::io::Error::other(
-            "unexpected CAT read",
-        )))
+    fn read(&mut self, _buffer: &mut [u8]) -> impl Future<Output = Result<usize, TransportError>> {
+        std::future::poll_fn(|_| {
+            std::task::Poll::Ready(Err(TransportError::Read(std::io::Error::other(
+                "unexpected CAT read",
+            ))))
+        })
     }
 
-    async fn close(&mut self) -> Result<(), TransportError> {
-        Ok(())
+    fn close(&mut self) -> impl Future<Output = Result<(), TransportError>> {
+        std::future::ready(Ok(()))
     }
 }
 

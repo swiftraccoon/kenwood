@@ -215,14 +215,12 @@ fn infer_explicit_serial_interface(path: &str) -> EndpointInterface {
         return EndpointInterface::Known(PcOutputInterface::Bluetooth);
     }
     if SerialTransport::discover_usb()
-        .ok()
-        .is_some_and(|ports| ports.iter().any(|port| port.port_name == path))
+        .is_ok_and(|ports| ports.iter().any(|port| port.port_name == path))
     {
         return EndpointInterface::Known(PcOutputInterface::Usb);
     }
     if SerialTransport::discover_bluetooth()
-        .ok()
-        .is_some_and(|ports| ports.iter().any(|port| port.port_name == path))
+        .is_ok_and(|ports| ports.iter().any(|port| port.port_name == path))
     {
         return EndpointInterface::Known(PcOutputInterface::Bluetooth);
     }

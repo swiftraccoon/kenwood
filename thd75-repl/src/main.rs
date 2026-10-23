@@ -1517,19 +1517,18 @@ async fn run_repl(transport: EitherTransport, options: ReplOptions) -> AppResult
                 if cmd == "aprs" && parts.get(1).is_some_and(|s| *s == "start") {
                     match enter_aprs(*radio, parts.get(2..).unwrap_or(&[])).await {
                         Ok(next_state) => next_state,
-                        Err((Some(radio_back), e)) => {
+                        Err(failure) => {
+                            let (radio_back, error) = *failure;
                             aprintln!(
                                 "{}",
-                                thd75_repl::output::error(format_args!("entering APRS mode: {e}"))
+                                thd75_repl::output::error(format_args!(
+                                    "entering APRS mode: {error}"
+                                ))
                             );
-                            ReplState::Cat(Box::new(radio_back))
-                        }
-                        Err((None, e)) => {
-                            aprintln!(
-                                "{}",
-                                thd75_repl::output::error(format_args!("entering APRS mode: {e}"))
-                            );
-                            return Err(e);
+                            match radio_back {
+                                Some(radio) => ReplState::Cat(Box::new(radio)),
+                                None => return Err(error),
+                            }
                         }
                     }
                 } else {
@@ -1547,7 +1546,8 @@ async fn run_repl(transport: EitherTransport, options: ReplOptions) -> AppResult
                                 aprintln!("APRS mode stopped. Returned to CAT mode.");
                                 ReplState::Cat(Box::new(radio))
                             }
-                            Err((desynced, error)) => {
+                            Err(failure) => {
+                                let (desynced, error) = *failure;
                                 aprintln!(
                                     "{}",
                                     thd75_repl::output::error(format_args!(
@@ -1668,14 +1668,14 @@ async fn enter_aprs(
     args: &[&str],
 ) -> Result<
     ReplState,
-    (
+    Box<(
         Option<Radio<EitherTransport>>,
         Box<dyn std::error::Error + Send + Sync>,
-    ),
+    )>,
 > {
     let parsed = match thd75_repl::aprs_args::StartArgs::parse(args) {
         Ok(p) => p,
-        Err(e) => return Err((Some(radio), e.into())),
+        Err(e) => return Err(Box::new((Some(radio), e.into()))),
     };
     match commands::confirm_transmit() {
         Ok(true) => {}
@@ -1689,7 +1689,7 @@ async fn enter_aprs(
                     cleanup: error.into(),
                 }),
             };
-            return Err((None, failure));
+            return Err(Box::new((None, failure)));
         }
     }
     let data_band = parsed.data_band();
@@ -1698,13 +1698,13 @@ async fn enter_aprs(
     aprintln!("Leaving normal radio control. Entering APRS mode as {address}.");
     let builder = match AprsClientConfig::builder(address.clone(), data_band) {
         Ok(builder) => builder,
-        Err(error) => return Err((Some(radio), error.into())),
+        Err(error) => return Err(Box::new((Some(radio), error.into()))),
     };
     let config = if digipeater {
         let wide1 = match Ax25Address::new("WIDE1", 1) {
             Ok(alias) => alias,
             Err(e) => {
-                return Err((Some(radio), e.into()));
+                return Err(Box::new((Some(radio), e.into())));
             }
         };
         let digi_cfg = DigipeaterConfig::new(
@@ -1729,7 +1729,12 @@ async fn enter_aprs(
             print_aprs_command_list();
             Ok(ReplState::Aprs(Box::new(client)))
         }
-        Err((radio, e)) => Err(recover_cat_after_failed_mode_entry(radio, e.into()).await),
+        Err(failure) => {
+            let (radio, error) = *failure;
+            Err(Box::new(
+                recover_cat_after_failed_mode_entry(radio, error.into()).await,
+            ))
+        }
     }
 }
 

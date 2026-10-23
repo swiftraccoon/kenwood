@@ -9,7 +9,7 @@ license = "GPL-2.0-or-later"
 publish = false
 readme = "README.md"
 repository = "https://github.com/swiftraccoon/kenwood"
-rust-version = "1.94"
+rust-version = "1.99"
 description = "Line-oriented CAT control and APRS KISS commands for the Kenwood TH-D75"
 
 [lib]
