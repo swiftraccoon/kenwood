@@ -21,7 +21,7 @@ jobs:
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@1.94.0
+      - uses: dtolnay/rust-toolchain@1.99.1
       # Cargo.lock is intentionally gitignored; resolve it first so
       # rust-cache gets a stable, content-addressed key.
       - run: cargo generate-lockfile

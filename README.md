@@ -1,6 +1,6 @@
 # kenwood
 
-[![Rust](https://img.shields.io/badge/rust-1.94%2B-orange.svg)](https://www.rust-lang.org)
+[![Rust](https://img.shields.io/badge/rust-1.99%2B-orange.svg)](https://www.rust-lang.org)
 [![License](https://img.shields.io/badge/license-GPL--2.0--or--later-blue.svg)](LICENSE)
 [![Docs](https://img.shields.io/badge/docs-github.io-blue)](https://swiftraccoon.github.io/kenwood/)
 
@@ -98,7 +98,8 @@ cargo test --workspace
 ./ci-local.sh   # Ubuntu and Fedora CI in k8s pods; lint.sh covers macOS
 ```
 
-Rust 1.94.0, edition 2024. Workspace-level lints enforce `unsafe_code = "forbid"`,
+Rust 1.99 minimum, with builds and checks pinned to 1.99.1; edition 2024.
+Workspace-level lints enforce `unsafe_code = "forbid"`,
 `missing_docs = "deny"`, and Clippy `all`/`pedantic`/`nursery`/`cargo`. Six crates
 restate the lint tables, which Cargo replaces rather than merges:
 `kenwood-transport` permits its audited native Bluetooth helper, `thd75` permits

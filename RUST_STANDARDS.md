@@ -14,8 +14,9 @@ APIs, implementation and documentation through the contributor workflow.
 
 The linked revisions fix the adopted text. Upstream changes require a policy
 change that identifies affected rules, enforcement and existing code. The
-executable baseline is Rust 1.94.0, including its Clippy and rustfmt components;
-the nightly documentation URL does not change the workspace toolchain.
+executable baseline is Rust 1.99.1, including its Clippy and rustfmt components.
+Packages declare Rust 1.99 as their minimum supported compiler. The nightly
+documentation URL does not change the workspace toolchain.
 
 ## Scope and precedence
 

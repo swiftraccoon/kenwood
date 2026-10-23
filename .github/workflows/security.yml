@@ -17,7 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.94.0
+      - uses: dtolnay/rust-toolchain@1.99.1
       - run: cargo generate-lockfile
       # Prebuilt release binary (~2s). `cargo install cargo-audit` was
       # compiling the tool from source on every run (149s of a ~180s

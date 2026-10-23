@@ -32,7 +32,7 @@ jobs:
       # perl-Digest-SHA: the hardware-audit manifest hashes its evidence
       # with shasum; Fedora packages that executable separately.
       - run: dnf install -y gcc git-core perl-Digest-SHA zstd
-      - uses: dtolnay/rust-toolchain@1.94.0
+      - uses: dtolnay/rust-toolchain@1.99.1
         with:
           components: clippy
       # Cargo.lock is intentionally gitignored; resolve it first so

@@ -5,13 +5,19 @@ affected crates' `AGENTS.md` files before editing.
 
 ## Toolchain and checks
 
-Use Rust 1.94.0 and its matching Clippy and rustfmt executables. On POSIX hosts,
-put the selected toolchain's binaries first so another installed Clippy cannot
-override it:
+Packages require Rust 1.99 or later. Use the pinned Rust 1.99.1 compiler and its
+matching Clippy and rustfmt executables for builds and checks. On POSIX hosts,
+put that toolchain's binaries first so another installed Clippy cannot override
+it:
 
 ```sh
-export PATH="$(rustup run 1.94.0 rustc --print sysroot)/bin:$PATH"
+export PATH="$(rustup run 1.99.1 rustc --print sysroot)/bin:$PATH"
 ```
+
+The toolchain file includes `llvm-tools-preview`. On Apple Silicon, it supplies
+the LLVM shared library required by `rust-objcopy` when toolchain binaries run
+directly from that PATH. Add it to an existing installation with
+`rustup component add llvm-tools-preview --toolchain 1.99.1`.
 
 Install the gate's required tools before running it: `cargo-nextest`,
 `cargo-audit`, `cargo-deny`, `cargo-machete`, `shellcheck`, `taplo` and `mdbook`.

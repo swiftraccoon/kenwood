@@ -139,11 +139,8 @@ ci_pod() {
         #   libasound2-dev / alsa-lib-devel: sextant (cpal) needs
         #     ALSA headers. Missing ALSA is exactly the silent
         #     regression the Docs workflow hit previously.
-        #   git: cargo-deny clones the RustSec advisory database
-        #     via `git clone`, and neither `rust:1.94` nor
-        #     `fedora:latest` preinstalls a git binary. Without
-        #     this, `cargo deny check` fails with
-        #     "failed to spawn git: No such file or directory".
+        #   git: cargo-deny clones the RustSec advisory database;
+        #     install git explicitly in both container setups.
         #   perl-Digest-SHA: Fedora packages `shasum` separately; the
         #     hardware-audit example uses it to hash captured evidence.
         # No `sudo`: both base images run as root and neither
@@ -156,12 +153,8 @@ ci_pod() {
             dnf install -y alsa-lib-devel git perl-Digest-SHA >/dev/null
         fi
 
-        # Ensure clippy is present. Neither `rust:1.94` nor the
-        # `rustup --profile minimal` install on fedora ships clippy
-        # by default; a previous run surfaced the mistake only at
-        # the `cargo clippy` step, far too late. rustup component
-        # add is idempotent, so running it unconditionally is cheap
-        # on pods that already have it.
+        # Install Clippy for the selected toolchain. The minimal rustup
+        # profile on Fedora omits it; adding an installed component is safe.
         rustup component add clippy >/dev/null
 
         # Install required lint-gate tools as prebuilt release
@@ -235,7 +228,7 @@ ci_pod() {
     # we observed in practice.
 }
 
-ci_pod "ubuntu" "rust:1.94" "" &
+ci_pod "ubuntu" "rust:1.99.1" "" &
 UBUNTU_PID=$!
 
 ci_pod "fedora" "fedora:latest" "
@@ -263,7 +256,7 @@ ci_pod "fedora" "fedora:latest" "
         sleep 5
     done
     curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-        | sh -s -- -y --profile minimal --default-toolchain 1.94.0
+        | sh -s -- -y --profile minimal --default-toolchain 1.99.1
     source \$HOME/.cargo/env
 " &
 FEDORA_PID=$!

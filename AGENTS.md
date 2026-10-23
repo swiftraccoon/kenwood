@@ -57,7 +57,8 @@ cargo nextest run -p <package> -E 'test(<substring>)'   # one test; -E 'binary(<
 cargo test -p <package> --doc                            # doctests; nextest never runs them
 ```
 
-- Pin the toolchain for every cargo invocation, including `./lint.sh`: `PATH="$HOME/.rustup/toolchains/1.94.0-aarch64-apple-darwin/bin:$PATH"`. The Homebrew `cargo` first on PATH is newer and ignores `rust-toolchain.toml`; `rustup run 1.94.0` alone does not prevent a Homebrew clippy from being selected.
+- Pin the toolchain for every cargo invocation, including `./lint.sh`: `PATH="$HOME/.rustup/toolchains/1.99.1-aarch64-apple-darwin/bin:$PATH"`. Another installed `cargo` or Clippy earlier on PATH can bypass `rust-toolchain.toml`; `rustup run 1.99.1` alone does not prevent another Clippy executable from being selected.
+- Keep `llvm-tools-preview` in the pinned toolchain's components. On Apple Silicon, it supplies the LLVM shared library required by directly invoked `rust-objcopy`; add it with `rustup component add llvm-tools-preview --toolchain 1.99.1`.
 - Package names differ from directories for two crates: `-p kenwood-thd75` (not `thd75`) and `-p kenwood-tmd750` (not `tmd750`). `Cargo.lock` is gitignored; never stage it.
 - Scoped clippy must match the gate: `cargo clippy -p <pkg> --all-targets -- -D warnings`. Without `-D warnings`, warn-level rustc lints pass locally and fail `lint.sh`.
 - Never pipe `./lint.sh` before acting on its status: `lint.sh | tail -1 && git commit` commits on failure. Run it bare or with `set -o pipefail`.
@@ -92,7 +93,7 @@ cargo test -p <package> --doc                            # doctests; nextest nev
 
 ## CI
 
-- Build, lint and test platforms pin Rust 1.94.0; `rust-toolchain.toml` matches. Instrumented fuzz execution uses nightly. Symptom of unintended drift: dozens of new clippy lints and trybuild stderr mismatches that CI never sees.
+- Build, lint and test platforms pin Rust 1.99.1; `rust-toolchain.toml` matches. Packages declare Rust 1.99 as their minimum supported compiler. Instrumented fuzz execution uses nightly. Symptom of unintended drift: new Clippy diagnostics and trybuild stderr mismatches that CI never sees.
 - A new RUSTSEC advisory fails the gate: try `cargo update <crate>` first. With no semver-compatible fix, add paired documented ignores in both `.cargo/audit.toml` and `deny.toml`. A duplicate-version `skip` names a whole release line (`crate@0.5`, never `crate@0.5.2`), since a pinned patch goes stale when a fresh lockfile picks up the next release; drop entries a fresh lockfile reports as unmatched or unnecessary.
 - CI resolves a fresh lockfile, so a green local gate proves nothing about it. Reproduce cargo-deny duplicates with `cargo generate-lockfile` (back up `Cargo.lock` first) and `cargo deny check bans`.
 - The persistent `target/clippy-gate` dir and CI's rust-cache reuse clippy fingerprints, so a pre-existing `-D warnings` violation (e.g. `missing_assert_message`) stays hidden until an edit to that module or its dependencies invalidates the fingerprint; a green gate is not proof the whole tree is clippy-clean.
@@ -134,7 +135,7 @@ cargo test -p <package> --doc                            # doctests; nextest nev
 ## Rust knowledge hygiene
 
 - Never claim a feature is nightly-only or unstable without verifying; when unsure what the stdlib can do, write a ten-line test and run it.
-- Local docs: the pinned 1.94.0 toolchain has no `rust-docs` component, so a bare `rustup doc` fails from the repo root. Use `rustup component add rust-docs --toolchain 1.94.0`, or `rustup doc --toolchain stable --std`, remembering that stable is ahead of the gate.
+- Local docs: install the pinned documentation with `rustup component add rust-docs --toolchain 1.99.1`, then open it with `rustup doc --toolchain 1.99.1 --std`. Online stable documentation may describe a newer compiler than the pinned gate.
 - Same discipline for platform APIs: read the primary Apple doc page before asserting that something is impossible on iOS or macOS.
 - `#![expect(lint)]` is stable since 1.81; use it instead of `#![allow(lint)]` so a stale suppression fails.
 - `fancy_regex` patterns must not open with `(?m)^\s*`; over long whitespace runs `\s*` backtracks until the limit trips. Anchor with `^[ \t]*`; the `regex` crate is unaffected.
