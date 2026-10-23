@@ -54,6 +54,7 @@ pub use session::{
     ReflectorSession, VoiceEndCause, fetch_dplus_directory,
 };
 pub use tracing_layer::init_tracing;
+pub use uniffi_scaffolding::*;
 pub use wire::{VoiceSequence, VoiceStreamId, WireValueError};
 
 #[forbid(unsafe_code)]
@@ -71,7 +72,19 @@ pub mod session;
 #[forbid(unsafe_code)]
 mod wire;
 
-uniffi::include_scaffolding!("lodestar");
+/// Generated `UniFFI` exports for the UDL interface.
+#[expect(
+    clippy::large_const_arrays,
+    reason = "UniFFI's non-Copy 32 KiB metadata buffer must remain const for consuming into_array"
+)]
+mod uniffi_scaffolding {
+    use crate::{
+        CatCommand, CatResponse, Reflector, ReflectorProtocol, default_reflectors, encode_cat,
+        parse_cat_line, version,
+    };
+
+    uniffi::include_scaffolding!("lodestar");
+}
 
 /// Returns the semantic version of this crate as configured in `Cargo.toml`.
 #[must_use]

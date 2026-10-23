@@ -9,7 +9,7 @@ license = "GPL-2.0-or-later OR GPL-3.0-or-later"
 publish = false
 readme = "README.md"
 repository = "https://github.com/swiftraccoon/kenwood"
-rust-version = "1.94"
+rust-version = "1.99"
 description = "Rust control, reflector and audio core for the Lodestar TH-D75 app"
 
 [lib]

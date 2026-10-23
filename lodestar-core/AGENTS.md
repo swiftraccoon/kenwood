@@ -37,8 +37,13 @@ workspace root from its own location.
 
 ## Lint opt-outs versus the workspace
 
-All three are forced by UniFFI scaffolding: `unsafe_code = "forbid"` (it emits
+Three crate-level exceptions are forced by UniFFI scaffolding: `unsafe_code = "forbid"` (it emits
 `#[unsafe(no_mangle)]`), `clippy::missing_const_for_fn`, and
 `unused_qualifications` (it emits `std::vec::Vec<u8>`). UDL-exposed
 `fn(Vec<u8>)` entry points additionally carry a file-local
 `#[expect(clippy::needless_pass_by_value, reason = "UniFFI FFI boundary requires owned Vec<u8>")]`.
+
+Keep generated UDL scaffolding in its private module and re-export its public
+items at the crate root. Its generated-only `#[expect(clippy::large_const_arrays)]`
+covers UniFFI's non-`Copy` 32 KiB compile-time metadata buffer, consumed to create
+the exact-sized exported byte array. Handwritten modules retain the denied lint.

@@ -1762,10 +1762,8 @@ mod slow_data_gps_tests {
         buf.truncate(full_size);
 
         let mut frames: Vec<[u8; 3]> = Vec::new();
-        for chunk in buf.chunks_exact(3) {
-            let mut tri = [0u8; 3];
-            tri.copy_from_slice(chunk);
-            frames.push(scramble(tri));
+        for chunk in buf.as_chunks::<3>().0 {
+            frames.push(scramble(*chunk));
         }
         frames
     }
