@@ -9,7 +9,7 @@ license = "GPL-2.0-or-later"
 publish = false
 readme = "README.md"
 repository = "https://github.com/swiftraccoon/kenwood"
-rust-version = "1.94"
+rust-version = "1.99"
 description = "Accessible SSB/CW/AM listener for the Kenwood TH-D75 USB IF stream"
 
 [lib]
