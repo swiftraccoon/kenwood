@@ -14,15 +14,15 @@ description = "Tokio and synchronous drivers for D-STAR reflector clients"
 
 [dependencies]
 dstar-gateway-core = { path = "../dstar-gateway-core" }
-thiserror = "2"
-tokio = { version = "1", features = ["net", "time", "sync", "macros", "io-util", "rt"] }
-tracing = "0.1"
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["net", "time", "sync", "macros", "io-util", "rt"] }
+tracing = "0.1.44"
 
 [dependencies.reqwest]
 default-features = false
-features = ["rustls-tls"]
+features = ["rustls"]
 optional = true
-version = "0.12"
+version = "0.13.5"
 
 [features]
 blocking = []
@@ -35,14 +35,14 @@ hardware-tests = []
 insecure-plaintext-xlx-directory = ["dep:reqwest"]
 
 [dev-dependencies]
-pcap-parser = "0.17"
-tokio = { version = "1", features = ["rt-multi-thread", "test-util"] }
-trybuild = "1"
+pcap-parser = "0.17.0"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "test-util"] }
+trybuild = "1.0.122"
 
 [dev-dependencies.tracing-subscriber]
 default-features = false
 features = ["fmt"]
-version = "0.3"
+version = "0.3.23"
 
 # Network examples compile only when their required features are requested.
 [[example]]
