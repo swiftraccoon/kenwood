@@ -14,26 +14,29 @@ description = "Multi-client D-STAR reflector server (DPlus, DExtra, DCS)"
 
 [dependencies]
 dstar-gateway-core = { path = "../dstar-gateway-core" }
-thiserror = "2"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt"] }
+thiserror = "2.0.21"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", default-features = false, features = [
+    "env-filter",
+    "fmt",
+] }
 
 [dependencies.tokio]
 features = ["macros", "net", "rt", "rt-multi-thread", "signal", "sync", "time"]
-version = "1"
+version = "1.54.1"
 
 [[bin]]
 name = "polaris"
 path = "src/bin/polaris.rs"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["test-util"] }
-trybuild = "1"
+tokio = { version = "1.54.1", features = ["test-util"] }
+trybuild = "1.0.122"
 
 [dev-dependencies.tracing-subscriber]
 default-features = false
 features = ["env-filter", "fmt", "json"]
-version = "0.3"
+version = "0.3.23"
 
 [lints]
 workspace = true
