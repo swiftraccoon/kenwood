@@ -13,14 +13,14 @@ rust-version = "1.99"
 description = "Terminal UI for the Kenwood TH-D75 transceiver"
 
 [dependencies]
-clap = { version = "4", features = ["derive"] }
-crossterm = "0.29"
+clap = { version = "4.6.7", features = ["derive"] }
+crossterm = "0.29.0"
 kenwood-thd75 = { path = "../thd75" }
 kenwood-transport = { path = "../kenwood-transport", default-features = false }
-ratatui = "0.30"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+ratatui = "0.30.2"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 # KNOWN DIVERGENCE FROM WORKSPACE (this block replaces, never merges with,
 # the workspace `[lints.rust]`):
