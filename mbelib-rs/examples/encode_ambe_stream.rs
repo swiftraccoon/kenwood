@@ -56,10 +56,8 @@ fn main() -> std::io::Result<()> {
             Err(e) => return Err(e),
         }
         let mut pcm = [0_i16; 160];
-        for (slot, chunk) in pcm.iter_mut().zip(pcm_bytes.chunks_exact(2)) {
-            if let [lo, hi] = *chunk {
-                *slot = i16::from_le_bytes([lo, hi]);
-            }
+        for (slot, chunk) in pcm.iter_mut().zip(pcm_bytes.as_chunks::<2>().0) {
+            *slot = i16::from_le_bytes(*chunk);
         }
         let ambe = enc.encode_frame_i16(&pcm);
         output.write_all(&ambe)?;

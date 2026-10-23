@@ -733,7 +733,8 @@ fn quantize_vuv(pitch: &PitchEstimate, vuv: &VuvDecisions, amps: &SpectralAmplit
             let obs = vuv.voiced.get(band).copied().unwrap_or(false);
             if obs != row_slot {
                 let m = amps.magnitudes.get(l - 1).copied().unwrap_or(0.0);
-                en += m * m;
+                let harmonic_energy = m * m;
+                en += harmonic_energy;
             }
         }
         if en < best_en {
@@ -1005,7 +1006,8 @@ fn quantize_spectrum(t_residuals: &[f32; 57], n: usize) -> QuantizedSpectrum {
                 // Decode uses (j - 0.5) for j=1..=ji_val; our offset
                 // with j=0..ji_val uses (j + 0.5).
                 let angle = step * (j as f32 + 0.5);
-                sum += m * angle.cos();
+                let dct_component = m * angle.cos();
+                sum += dct_component;
             }
             // Normalization: the decoder's inverse_dct_blocks
             // applies `ak` = 1 for k=1, 2 for k≥2. Our forward pass
@@ -1186,7 +1188,8 @@ fn nearest_hoc(table: &[[f32; 4]], target: &[f32; 4], dims: usize, stride: usize
         let mut err = 0.0_f32;
         for (r, t) in row.iter().zip(target.iter()).take(dims) {
             let d = r - t;
-            err += d * d;
+            let squared_distance = d * d;
+            err += squared_distance;
         }
         if err < best_err {
             best_err = err;
@@ -1237,7 +1240,8 @@ fn inverse_dct_8(ri: &[f32; PRBA_BLOCKS + 1]) -> [f32; PRBA_BLOCKS + 1] {
         let mut sum = 0.0_f32;
         for (i, &ri_val) in ri.iter().enumerate().take(PRBA_BLOCKS + 1).skip(1) {
             let angle = std::f32::consts::PI * (m as f32 - 1.0) * (i as f32 - 0.5) / n;
-            sum += ri_val * angle.cos();
+            let dct_component = ri_val * angle.cos();
+            sum += dct_component;
         }
         *gm_slot = sum / n;
     }
@@ -1257,7 +1261,8 @@ fn nearest_prba24(target: &[f32; 3]) -> u16 {
         let mut err = 0.0_f32;
         for (r, t) in row.iter().zip(target.iter()) {
             let d = r - t;
-            err += d * d;
+            let squared_distance = d * d;
+            err += squared_distance;
         }
         if err < best_err {
             best_err = err;
@@ -1280,7 +1285,8 @@ fn nearest_prba58(target: &[f32; 4]) -> u8 {
         let mut err = 0.0_f32;
         for (r, t) in row.iter().zip(target.iter()) {
             let d = r - t;
-            err += d * d;
+            let squared_distance = d * d;
+            err += squared_distance;
         }
         if err < best_err {
             best_err = err;
@@ -1381,7 +1387,8 @@ mod tests {
                     reason = "test DCT: j_idx < n = 12; usize-to-f32 cast is exact."
                 )]
                 let angle = step * (j_idx as f32 + 0.5);
-                sum += v * angle.cos();
+                let dct_component = v * angle.cos();
+                sum += dct_component;
             }
             #[expect(
                 clippy::cast_precision_loss,
@@ -1408,7 +1415,8 @@ mod tests {
                     reason = "test inverse DCT: k_idx < n = 12; cast is exact."
                 )]
                 let angle = step * k_idx as f32;
-                sum += ak * c * angle.cos();
+                let dct_component = ak * c * angle.cos();
+                sum += dct_component;
             }
             *tl_slot = sum;
         }
@@ -1457,7 +1465,8 @@ mod tests {
                 )]
                 let angle = step * (m as f32 - 1.0);
                 let am: f32 = if m == 1 { 1.0 } else { 2.0 };
-                sum += am * gm_val * angle.cos();
+                let dct_component = am * gm_val * angle.cos();
+                sum += dct_component;
             }
             *ri_slot = sum;
         }

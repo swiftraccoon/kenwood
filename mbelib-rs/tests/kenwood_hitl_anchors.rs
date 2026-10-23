@@ -43,6 +43,7 @@ use proptest as _;
 use realfft as _;
 use wide as _;
 
+use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -76,11 +77,7 @@ fn parse_frames(raw: &[u8]) -> Option<Vec<[u8; FRAME_LEN]>> {
     if raw.is_empty() {
         return None;
     }
-    Some(
-        raw.chunks_exact(FRAME_LEN)
-            .filter_map(|chunk| chunk.try_into().ok())
-            .collect(),
-    )
+    Some(raw.as_chunks::<FRAME_LEN>().0.to_vec())
 }
 
 /// Apply [`STABLE_BIT_MASK`] to a frame.
@@ -902,8 +899,9 @@ fn pitch_tracker_diagnostic() -> TestResult {
         let mut tracker = PitchTracker::new();
 
         // Walk the frames; print every 20th to keep output compact
-        for (frame_idx, chunk) in pcm_float.chunks_exact(160).enumerate() {
-            let _spectrum = analyze_frame(&PcmFrame::try_from(chunk)?, &mut bufs, &mut plan);
+        for (frame_idx, chunk) in pcm_float.as_chunks::<160>().0.iter().enumerate() {
+            let _spectrum =
+                analyze_frame(&PcmFrame::try_from(chunk.as_slice())?, &mut bufs, &mut plan);
             let est = tracker.estimate(bufs.pitch_est_buf())?;
             if frame_idx == 0 || frame_idx == 39 || frame_idx == 79 {
                 println!(
@@ -1154,7 +1152,7 @@ fn rust_encoder_field_breakdown() -> TestResult {
     }
 
     let mut by_field: Vec<(&str, u32)> = counters.into_iter().collect();
-    by_field.sort_by(|a, b| b.1.cmp(&a.1));
+    by_field.sort_by_key(|entry| Reverse(entry.1));
     let total: u32 = by_field.iter().map(|(_, n)| *n).sum();
     println!();
     println!("  field            | wrong bits across 4 anchors");

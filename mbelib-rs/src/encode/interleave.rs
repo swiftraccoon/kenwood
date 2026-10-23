@@ -120,7 +120,7 @@ mod tests {
             let slot = seen
                 .get_mut(i)
                 .ok_or_else(|| format!("inverse contains out-of-range value {i}"))?;
-            assert!(!*slot, "inverse maps two ambe_fr slots to input bit {i}",);
+            assert!(!*slot, "inverse maps two ambe_fr slots to input bit {i}");
             *slot = true;
         }
         // Redundant with the loop above, but explicit: all 72 bits covered.

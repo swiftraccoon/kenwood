@@ -44,7 +44,9 @@ fn make_voiced_chunk(t0_samples: usize) -> [f32; 160] {
                 reason = "harmonic index: k < 4, usize-to-f32 cast is exact."
             )]
             let harm_num = (k + 1) as f32;
-            s += amp * (t * 2.0 * std::f32::consts::PI * f0_hz * harm_num / sr).sin();
+            let harmonic_sample =
+                amp * (t * 2.0 * std::f32::consts::PI * f0_hz * harm_num / sr).sin();
+            s += harmonic_sample;
         }
         *slot = s;
     }
@@ -132,8 +134,10 @@ fn pure_sine_pitch_preserved_through_codec() -> Result<(), Box<dyn std::error::E
             let t = i as f32 / sr;
             let x = f32::from(s) / 32768.0;
             let phase = 2.0 * std::f32::consts::PI * freq_hz * t;
-            real += x * phase.cos();
-            imag += x * phase.sin();
+            let real_component = x * phase.cos();
+            real += real_component;
+            let imaginary_component = x * phase.sin();
+            imag += imaginary_component;
         }
         let n = decoded.len();
         #[expect(
@@ -199,8 +203,10 @@ fn voiced_input_produces_harmonic_output() -> Result<(), Box<dyn std::error::Err
             let t = i as f32 / sr;
             let x = f32::from(s) / 32768.0;
             let phase = 2.0 * std::f32::consts::PI * freq_hz * t;
-            real += x * phase.cos();
-            imag += x * phase.sin();
+            let real_component = x * phase.cos();
+            real += real_component;
+            let imaginary_component = x * phase.sin();
+            imag += imaginary_component;
         }
         let _ = bw_hz;
         let n = decoded.len();

@@ -17,8 +17,10 @@ const VEC: &[u8] = include_bytes!("fixtures/wave_testvec.bin");
 
 fn floats(bytes: &[u8]) -> Vec<f32> {
     bytes
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes(c.try_into().unwrap_or([0; 4])))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
         .collect()
 }
 

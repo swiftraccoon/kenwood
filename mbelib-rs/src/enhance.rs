@@ -175,7 +175,8 @@ pub(crate) fn spectral_amp_enhance(params: &mut MbeParams, tuning: &SynthesisTun
     let mut sum: f32 = 0.0;
     for l in 1..=big_l {
         let ml = params.ml.get(l).copied().unwrap_or(0.0).abs();
-        sum += ml * ml;
+        let band_energy = ml * ml;
+        sum += band_energy;
     }
 
     let gamma = if sum == 0.0 { 1.0 } else { (rm0 / sum).sqrt() };

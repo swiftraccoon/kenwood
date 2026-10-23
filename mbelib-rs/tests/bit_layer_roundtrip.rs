@@ -116,8 +116,10 @@ fn encoder_pack_inverts_decoder_unpack_via_pitch_roundtrip()
         )]
         let t_f = i as f32;
         let phase = 2.0 * std::f32::consts::PI * target_hz * t_f / 8000.0;
-        re += s * phase.cos();
-        im += s * phase.sin();
+        let real_component = s * phase.cos();
+        re += real_component;
+        let imaginary_component = s * phase.sin();
+        im += imaginary_component;
     }
     let mag_at_target = re.hypot(im) / n_f;
 

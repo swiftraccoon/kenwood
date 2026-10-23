@@ -133,7 +133,7 @@ mod tests {
             let [prev, next] = pair else {
                 continue;
             };
-            assert!(next >= prev, "non-monotonic at {}: {prev} vs {next}", i + 1,);
+            assert!(next >= prev, "non-monotonic at {}: {prev} vs {next}", i + 1);
         }
     }
 

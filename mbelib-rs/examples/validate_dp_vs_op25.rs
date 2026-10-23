@@ -35,11 +35,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut f = std::fs::File::open(&pcm_path)?;
         let mut buf = Vec::new();
         let _len = f.read_to_end(&mut buf)?;
-        buf.chunks_exact(2)
-            .filter_map(|b| match *b {
-                [lo, hi] => Some(f32::from(i16::from_le_bytes([lo, hi])) / 32768.0),
-                _ => None,
-            })
+        buf.as_chunks::<2>()
+            .0
+            .iter()
+            .map(|b| f32::from(i16::from_le_bytes(*b)) / 32768.0)
             .collect()
     };
 

@@ -382,7 +382,8 @@ fn synth_interpolated(
         let aln = amp_step.mul_add(n_f32, prev_ml);
         // Algorithm #134: synthesize sample (JMBE multiplies by 2.0).
         if let Some(sample) = pcm.get_mut(n) {
-            *sample += 2.0 * aln * theta.cos();
+            let harmonic_sample = 2.0 * aln * theta.cos();
+            *sample += harmonic_sample;
         }
     }
 }

@@ -158,8 +158,10 @@ fn read_f32s(blob: &[u8], offset: &mut usize, count: usize) -> Option<Vec<f32>> 
     *offset += count * 4;
     Some(
         bytes
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes(c.try_into().unwrap_or([0; 4])))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
             .collect(),
     )
 }
@@ -176,7 +178,8 @@ fn gelu(x: f32) -> f32 {
         ),
         0.254_829_6,
     );
-    let erf_abs = 1.0 - poly * (-z * z).exp();
+    let erf_tail = poly * (-z * z).exp();
+    let erf_abs = 1.0 - erf_tail;
     let erf = if z < 0.0 { -erf_abs } else { erf_abs };
     0.5 * x * (1.0 + erf)
 }
@@ -327,9 +330,9 @@ fn gru_step(
             gates_in.get(GRU_H + j).copied().unwrap_or(0.0)
                 + gates_hid.get(GRU_H + j).copied().unwrap_or(0.0),
         );
-        let candidate = (gates_in.get(2 * GRU_H + j).copied().unwrap_or(0.0)
-            + reset * gates_hid.get(2 * GRU_H + j).copied().unwrap_or(0.0))
-        .tanh();
+        let recurrent_candidate = reset * gates_hid.get(2 * GRU_H + j).copied().unwrap_or(0.0);
+        let candidate =
+            (gates_in.get(2 * GRU_H + j).copied().unwrap_or(0.0) + recurrent_candidate).tanh();
         let prev = hidden.get(j).copied().unwrap_or(0.0);
         let next = (1.0 - update).mul_add(candidate, update * prev);
         if let Some(slot) = hidden.get_mut(j) {
@@ -645,10 +648,12 @@ impl Model {
             for (n, &v) in time.iter().enumerate() {
                 let w = self.window.get(n).copied().unwrap_or(0.0);
                 if let Some(slot) = out_padded.get_mut(f * HOP + n) {
-                    *slot += v * INV_N * w;
+                    let windowed_sample = v * INV_N * w;
+                    *slot += windowed_sample;
                 }
                 if let Some(slot) = norm.get_mut(f * HOP + n) {
-                    *slot += w * w;
+                    let squared_window = w * w;
+                    *slot += squared_window;
                 }
             }
         }
@@ -1237,10 +1242,12 @@ impl LiveWaveStream {
                 continue;
             };
             if let Some(slot) = self.acc.get_mut(rel) {
-                *slot += v * INV_N * w;
+                let windowed_sample = v * INV_N * w;
+                *slot += windowed_sample;
             }
             if let Some(slot) = self.norm.get_mut(rel) {
-                *slot += w * w;
+                let squared_window = w * w;
+                *slot += squared_window;
             }
         }
         self.emit_ready(start + HOP - 1);
@@ -1290,9 +1297,7 @@ impl LiveWaveStream {
         self.pad_base = 0;
         self.tail_ring.clear();
         self.next_col = 0;
-        for v in &mut self.hidden {
-            *v = 0.0;
-        }
+        self.hidden.fill(0.0);
         self.acc.clear();
         self.norm.clear();
         self.acc_base = 0;

@@ -711,7 +711,8 @@ pub(crate) fn compute_e_p_kernel(
         let prev = corr.get(i - 1).copied().unwrap_or(0.0);
         let next = corr.get(i + 1).copied().unwrap_or(0.0);
         if let Some(slot) = corr.get_mut(i) {
-            *slot = 0.5 * (prev + next);
+            let adjacent_correlation_sum = prev + next;
+            *slot = 0.5 * adjacent_correlation_sum;
         }
     }
 
@@ -911,7 +912,9 @@ mod tests {
                     reason = "harmonic index: k < 4, usize-to-f32 cast is exact."
                 )]
                 let harm = (k + 1) as f32;
-                sum += amp * (t * 2.0 * std::f32::consts::PI * f0_hz * harm / sr).sin();
+                let harmonic_sample =
+                    amp * (t * 2.0 * std::f32::consts::PI * f0_hz * harm / sr).sin();
+                sum += harmonic_sample;
             }
             *slot = sum * 0.4;
         }

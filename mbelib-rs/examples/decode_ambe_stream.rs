@@ -143,7 +143,7 @@ fn main() -> std::io::Result<()> {
             all_pcm.extend_from_slice(&pcm);
         } else {
             let mut bytes = [0u8; 320];
-            for (chunk, &s) in bytes.chunks_exact_mut(2).zip(pcm.iter()) {
+            for (chunk, &s) in bytes.as_chunks_mut::<2>().0.iter_mut().zip(pcm.iter()) {
                 chunk.copy_from_slice(&s.to_le_bytes());
             }
             output.write_all(&bytes)?;

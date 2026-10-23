@@ -127,11 +127,10 @@ fn load_pcm(path: &str) -> Result<Vec<f32>, std::io::Error> {
     let mut buf = Vec::new();
     let _len = file.read_to_end(&mut buf)?;
     Ok(buf
-        .chunks_exact(2)
-        .filter_map(|b| match *b {
-            [lo, hi] => Some(f32::from(i16::from_le_bytes([lo, hi])) / 32768.0),
-            _ => None,
-        })
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|b| f32::from(i16::from_le_bytes(*b)) / 32768.0)
         .collect())
 }
 

@@ -366,7 +366,8 @@ fn make_voice_chunk(t0_samples: usize) -> [f32; 160] {
             )]
             let k = (k_idx + 1) as f32;
             let amp = 1.0 / k; // 1/k decay = pink-spectrum-like envelope
-            s += amp * (t * 2.0 * std::f32::consts::PI * f0_hz * k / sr).sin();
+            let harmonic_sample = amp * (t * 2.0 * std::f32::consts::PI * f0_hz * k / sr).sin();
+            s += harmonic_sample;
         }
         *slot = amplitude * s;
     }

@@ -508,7 +508,9 @@ mod tests {
                         reason = "harmonic index: k < 4, usize-to-f32 cast is exact."
                     )]
                     let harm = (k + 1) as f32;
-                    sum += amp * (t * 2.0 * std::f32::consts::PI * f0 * harm / sr).sin();
+                    let harmonic_sample =
+                        amp * (t * 2.0 * std::f32::consts::PI * f0 * harm / sr).sin();
+                    sum += harmonic_sample;
                 }
                 // Normalize to keep within [-1, 1).
                 sum * 0.4
@@ -532,7 +534,8 @@ mod tests {
             let decoded = dec.decode_frame(&ambe);
             for &s in &decoded {
                 let sf = f32::from(s) / 32768.0;
-                total_energy += sf * sf;
+                let sample_energy = sf * sf;
+                total_energy += sample_energy;
                 total_samples += 1;
             }
         }

@@ -307,7 +307,9 @@ fn decode_spectral_offsets(ambe_d: &[u8; AMBE_DATA_BITS], big_l: usize) -> [f32;
         let r_even = *ri.get(2 * blk).unwrap_or(&0.0);
         if let Some(block) = cik.get_mut(blk) {
             if let Some(c) = block.get_mut(1) {
-                *c = 0.5 * (r_odd + r_even);
+                // Round the Ri pair sum before scaling the first Cik coefficient.
+                let pair_sum = r_odd + r_even;
+                *c = 0.5 * pair_sum;
             }
             if let Some(c) = block.get_mut(2) {
                 *c = rconst * (r_odd - r_even);

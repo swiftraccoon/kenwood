@@ -186,7 +186,7 @@ mod tests {
         let snd = [0.0_f32; FRAME];
         analyze_frame(&snd, &mut bufs, &mut plan, &mut fft_out);
         for bin in &fft_out {
-            assert!(bin.norm() < 1e-9, "nonzero bin {bin} for silent input",);
+            assert!(bin.norm() < 1e-9, "nonzero bin {bin} for silent input");
         }
     }
 

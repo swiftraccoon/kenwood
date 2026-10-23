@@ -246,6 +246,7 @@ pub(crate) fn detect_vuv_and_sa_kernel(
     // `L_TABLE`-indexed `b0` selection and cascades into b1/b2/b3
     // quantizer searches. Matched exactly here.
     let num_harms: usize = {
+        let half_period = period * 0.5;
         #[expect(
             clippy::cast_possible_truncation,
             clippy::cast_sign_loss,
@@ -253,7 +254,7 @@ pub(crate) fn detect_vuv_and_sa_kernel(
                       `period*0.5 + 0.25` is < 513; the float-to-usize truncation matches \
                       OP25's Q8.8 arithmetic exactly (see comment above)."
         )]
-        let tmp = (period * 0.5 + 0.25) as usize;
+        let tmp = (half_period + 0.25) as usize;
         #[expect(
             clippy::cast_precision_loss,
             reason = "tmp <= 513 from the truncation above; usize-to-f32 cast is exact."
@@ -297,7 +298,8 @@ pub(crate) fn detect_vuv_and_sa_kernel(
         .sum();
     let energy_total = energy_low + energy_high;
     state.th_max = if energy_total > state.th_max {
-        0.5 * (state.th_max + energy_total)
+        let threshold_energy_sum = state.th_max + energy_total;
+        0.5 * threshold_energy_sum
     } else {
         0.99_f32.mul_add(state.th_max, 0.01 * energy_total)
     };

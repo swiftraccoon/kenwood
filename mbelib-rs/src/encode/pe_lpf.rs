@@ -66,7 +66,8 @@ pub(crate) fn pe_lpf(sigin: &[f32], sigout: &mut [f32], mem: &mut [f32; PE_LPF_O
         // Convolution sum.
         let mut sum = 0.0_f32;
         for (&m, &c) in mem.iter().zip(LPF_COEF.iter()) {
-            sum += m * c;
+            let tap_contribution = m * c;
+            sum += tap_contribution;
         }
         *y = sum;
     }
