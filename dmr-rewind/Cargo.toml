@@ -14,12 +14,12 @@ description = "Receive-only Tokio client for BrandMeister's REWIND Open DMR Term
 
 [dependencies]
 dmr-rewind-core = { path = "../dmr-rewind-core" }
-thiserror = "2"
-tokio = { version = "1", features = ["net", "time"] }
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["net", "time"] }
 
 [dev-dependencies]
-socket2 = "0.6"
-tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "test-util", "time"] }
+socket2 = "0.6.5"
+tokio = { version = "1.54.1", features = ["macros", "net", "rt-multi-thread", "test-util", "time"] }
 
 [lints]
 workspace = true
