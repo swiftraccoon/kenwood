@@ -646,8 +646,8 @@ mod tests {
     #[test]
     fn strict_line_accepts_no_path_and_empty_information() -> TestResult {
         let parsed = AprsIsLine::parse("N0CALL>APK005:")?;
-        assert!(parsed.path().is_empty());
-        assert!(parsed.information().is_empty());
+        assert_eq!(parsed.path(), []);
+        assert_eq!(parsed.information(), b"");
         assert_eq!(parsed.qconstruct(), None);
         Ok(())
     }

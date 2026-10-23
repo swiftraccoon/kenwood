@@ -507,7 +507,7 @@ mod tests {
         assert_eq!(config.passcode.as_wire(), 13023);
         assert_eq!(config.server, "rotate.aprs2.net");
         assert_eq!(config.port, 14580);
-        assert!(config.filter.is_empty());
+        assert_eq!(config.filter, "");
         assert_eq!(config.software_name, "aprs-is");
         Ok(())
     }
