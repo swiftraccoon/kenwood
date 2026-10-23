@@ -9,7 +9,7 @@ license = "GPL-2.0-or-later"
 publish = false
 readme = "README.md"
 repository = "https://github.com/swiftraccoon/kenwood"
-rust-version = "1.94"
+rust-version = "1.99"
 description = "APRS codecs, checked reports, messaging and relay algorithms"
 
 [dependencies]

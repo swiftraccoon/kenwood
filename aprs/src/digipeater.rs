@@ -1729,7 +1729,10 @@ mod tests {
         let earlier = now
             .checked_sub(Duration::from_secs(1))
             .ok_or("one second fits")?;
-        assert!(config.drain_ready_viscous(earlier).is_empty());
+        assert_eq!(
+            config.drain_ready_viscous(earlier),
+            Vec::<Ax25Packet>::new()
+        );
         assert_eq!(config.pending_viscous.len(), 2);
         let ready = config.drain_ready_viscous(now + Duration::from_secs(5));
         assert_eq!(ready.len(), 2);
@@ -1995,7 +1998,10 @@ mod tests {
         let queued_at = earlier + Duration::from_secs(10);
 
         assert_eq!(config.process(&packet, queued_at), DigiAction::Drop);
-        assert!(config.drain_ready_viscous(earlier).is_empty());
+        assert_eq!(
+            config.drain_ready_viscous(earlier),
+            Vec::<Ax25Packet>::new()
+        );
         assert_eq!(
             config
                 .drain_ready_viscous(queued_at + Duration::from_secs(5))

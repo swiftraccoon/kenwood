@@ -1481,7 +1481,7 @@ mod tests {
 
     #[test]
     fn symbol_table_round_trip() -> TestResult {
-        for b in [b'/', b'\\', b'0', b'5', b'A', b'Z'] {
+        for b in *b"/\\05AZ" {
             let table = SymbolTable::from_byte(b)?;
             assert_eq!(table.as_byte(), b);
         }

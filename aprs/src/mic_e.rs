@@ -673,7 +673,7 @@ mod tests {
             position.mice_telemetry(),
             Some(MiceTelemetry::BinaryFive([0x80, 0x00, 0xFF, 0x7F, 0x01]))
         );
-        assert!(position.comment().is_empty());
+        assert_eq!(position.comment(), "");
         assert_eq!(position.mice_altitude_m(), None);
         Ok(())
     }

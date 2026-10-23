@@ -29,7 +29,7 @@ use crate::{AprsFrameHeader, Tocall};
 
 /// How long an incoming message's `(source, msgno)` stays in the dedup
 /// cache before being purged.
-pub const INCOMING_DEDUP_WINDOW: Duration = Duration::from_secs(5 * 60);
+pub const INCOMING_DEDUP_WINDOW: Duration = Duration::from_mins(5);
 
 /// Maximum number of transmission attempts per message before giving up
 /// (the default used when [`MessengerConfig::default`] is in play).
@@ -728,8 +728,11 @@ mod tests {
             messenger.commit_send(&id, later + RETRY_INTERVAL * 2),
             Err(AprsError::MessageAttemptsExhausted)
         );
-        assert!(messenger.cleanup_expired(later).is_empty());
-        assert!(messenger.cleanup_expired(later + RETRY_INTERVAL).is_empty());
+        assert_eq!(messenger.cleanup_expired(later), Vec::<MessageId>::new());
+        assert_eq!(
+            messenger.cleanup_expired(later + RETRY_INTERVAL),
+            Vec::<MessageId>::new()
+        );
         assert_eq!(
             messenger.cleanup_expired(later + RETRY_INTERVAL * 2),
             std::slice::from_ref(&id)
@@ -1114,7 +1117,7 @@ mod tests {
         }
 
         assert_eq!(m.pending_count(), 1); // Still present, just exhausted.
-        assert!(m.cleanup_expired(clock).is_empty());
+        assert_eq!(m.cleanup_expired(clock), Vec::<MessageId>::new());
         let expired = m.cleanup_expired(clock + RETRY_INTERVAL);
         assert_eq!(expired, vec![id]);
         assert_eq!(m.pending_count(), 0);

@@ -2,6 +2,7 @@
 //!
 //! See the [station storage example](crate#beacon-scheduling-and-station-storage).
 
+use std::cmp::Reverse;
 use std::collections::{HashMap, hash_map};
 use std::num::NonZeroUsize;
 use std::time::{Duration, Instant};
@@ -286,7 +287,7 @@ impl StationList {
     #[must_use]
     pub fn recent(&self) -> Vec<&StationEntry> {
         let mut entries: Vec<_> = self.iter().collect();
-        entries.sort_by(|a, b| b.last_heard.cmp(&a.last_heard));
+        entries.sort_by_key(|entry| Reverse(entry.last_heard));
         entries
     }
     /// Borrow stations within an inclusive spherical radius, without allocating.
