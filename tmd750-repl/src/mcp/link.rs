@@ -231,19 +231,19 @@ impl<B: Backend> WriteLink for UsbLink<'_, B> {
         Radio::new(transport)
     }
 
-    async fn admit(
+    fn admit(
         &mut self,
         _radio: &mut Radio<CaptureTransport<Self::Connection, File>>,
-    ) -> Admission {
-        Admission::default()
+    ) -> impl Future<Output = Admission> {
+        std::future::ready(Admission::default())
     }
 
-    async fn hold_after_exit(
+    fn hold_after_exit(
         &mut self,
         _post_exit: &mut Recorder<File>,
         _cancelled: &AtomicBool,
-    ) -> io::Result<()> {
-        Ok(())
+    ) -> impl Future<Output = io::Result<()>> {
+        std::future::ready(Ok(()))
     }
 
     /// The bounded silent-`ID` retry that backups use, on either USB role.

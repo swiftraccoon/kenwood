@@ -13,7 +13,7 @@ type TestResult = Result<(), TestError>;
 /// `Weather`.
 fn backup(directory: &Path) -> Result<PathBuf, TestError> {
     let mut names = vec![0_u8; 31 * 16];
-    for (index, field) in names.chunks_exact_mut(16).enumerate() {
+    for (index, field) in names.as_chunks_mut::<16>().0.iter_mut().enumerate() {
         let text = if index == 30 {
             "Weather".to_owned()
         } else {
@@ -112,7 +112,7 @@ fn an_edit_needs_valid_groups_and_names() -> TestResult {
         );
     }
     let unchanged = selection(report, &[("29", "GRP-29")]).prepare(&snapshot)?;
-    assert!(unchanged.replacements.is_empty());
+    assert_eq!(unchanged.replacements, Vec::<PageReplacement>::new());
     Ok(())
 }
 

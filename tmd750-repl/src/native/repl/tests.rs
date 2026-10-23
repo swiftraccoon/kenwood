@@ -43,8 +43,10 @@ impl CommandInput for Input {
         self.mode
     }
 
-    async fn next(&mut self, _cancelled: &AtomicBool) -> AppResult<Event> {
-        self.events.pop_front().unwrap_or(Ok(Event::Eof))
+    fn next(&mut self, _cancelled: &AtomicBool) -> impl Future<Output = AppResult<Event>> {
+        std::future::poll_fn(move |_| {
+            std::task::Poll::Ready(self.events.pop_front().unwrap_or(Ok(Event::Eof)))
+        })
     }
 
     fn close(&mut self) -> AppResult<()> {
@@ -87,19 +89,25 @@ impl Transport for Connection {
         Ok(count)
     }
 
-    async fn close(&mut self) -> Result<(), TransportError> {
-        self.log
-            .lock()
-            .map_err(|_| TransportError::Read(io::Error::other("test log poisoned")))?
-            .push(b"close".to_vec());
-        self.script.assert_complete();
-        if self.close_error {
-            Err(TransportError::Read(io::Error::other(
-                "scripted radio close failure",
-            )))
-        } else {
-            Ok(())
-        }
+    fn close(&mut self) -> impl Future<Output = Result<(), TransportError>> {
+        std::future::poll_fn(move |_| {
+            match self.log.lock() {
+                Ok(mut log) => log.push(b"close".to_vec()),
+                Err(_) => {
+                    return std::task::Poll::Ready(Err(TransportError::Read(io::Error::other(
+                        "test log poisoned",
+                    ))));
+                }
+            }
+            self.script.assert_complete();
+            std::task::Poll::Ready(if self.close_error {
+                Err(TransportError::Read(io::Error::other(
+                    "scripted radio close failure",
+                )))
+            } else {
+                Ok(())
+            })
+        })
     }
 }
 

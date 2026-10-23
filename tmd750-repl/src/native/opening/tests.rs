@@ -38,29 +38,38 @@ struct Connection {
 }
 
 impl Transport for Connection {
-    async fn write(&mut self, _bytes: &[u8]) -> Result<(), TransportError> {
-        record(&self.log, Seen::Write)?;
-        Err(TransportError::Write(io::Error::other(
-            "unexpected protocol write",
-        )))
+    fn write(&mut self, _bytes: &[u8]) -> impl Future<Output = Result<(), TransportError>> {
+        std::future::poll_fn(move |_| {
+            std::task::Poll::Ready(record(&self.log, Seen::Write).and_then(|()| {
+                Err(TransportError::Write(io::Error::other(
+                    "unexpected protocol write",
+                )))
+            }))
+        })
     }
 
-    async fn read(&mut self, _bytes: &mut [u8]) -> Result<usize, TransportError> {
-        record(&self.log, Seen::Read)?;
-        Err(TransportError::Read(io::Error::other(
-            "unexpected protocol read",
-        )))
+    fn read(&mut self, _bytes: &mut [u8]) -> impl Future<Output = Result<usize, TransportError>> {
+        std::future::poll_fn(move |_| {
+            std::task::Poll::Ready(record(&self.log, Seen::Read).and_then(|()| {
+                Err(TransportError::Read(io::Error::other(
+                    "unexpected protocol read",
+                )))
+            }))
+        })
     }
 
-    async fn close(&mut self) -> Result<(), TransportError> {
-        record(&self.log, Seen::Close)?;
-        if self.close_fails {
-            Err(TransportError::Disconnected(io::Error::other(
-                "fake close failure",
-            )))
-        } else {
-            Ok(())
-        }
+    fn close(&mut self) -> impl Future<Output = Result<(), TransportError>> {
+        std::future::poll_fn(move |_| {
+            std::task::Poll::Ready(record(&self.log, Seen::Close).and_then(|()| {
+                if self.close_fails {
+                    Err(TransportError::Disconnected(io::Error::other(
+                        "fake close failure",
+                    )))
+                } else {
+                    Ok(())
+                }
+            }))
+        })
     }
 }
 
@@ -106,44 +115,54 @@ struct FakeBackend {
 impl Backend for FakeBackend {
     type Connection = Connection;
 
-    async fn open(
+    fn open(
         &mut self,
         endpoint: &Endpoint,
         service: BluetoothService,
         _cancelled: &AtomicBool,
-    ) -> Result<Opened<Connection>, OpenFailure> {
-        record(&self.log, Seen::Open(endpoint.address.to_string(), service))
-            .map_err(OpenFailure::from_error)?;
-        match self.steps.pop_front().ok_or_else(|| {
-            OpenFailure::from_error(io::Error::other("unexpected additional open"))
-        })? {
-            Step::Failure(error) => Err(error),
-            Step::Success {
-                resolved,
-                cancel,
-                close_fails,
-            } => {
-                if cancel {
-                    self.cancelled.store(true, Ordering::Relaxed);
-                }
-                Ok(Opened {
-                    connection: Connection {
-                        log: Arc::clone(&self.log),
-                        close_fails,
-                    },
-                    resolved,
-                })
+    ) -> impl Future<Output = Result<Opened<Connection>, Box<OpenFailure>>> {
+        std::future::poll_fn(move |_| {
+            if let Err(error) = record(&self.log, Seen::Open(endpoint.address.to_string(), service))
+            {
+                return std::task::Poll::Ready(Err(Box::new(OpenFailure::from_error(error))));
             }
-        }
+            let Some(step) = self.steps.pop_front() else {
+                return std::task::Poll::Ready(Err(Box::new(OpenFailure::from_error(
+                    io::Error::other("unexpected additional open"),
+                ))));
+            };
+            std::task::Poll::Ready(match step {
+                Step::Failure(error) => Err(Box::new(error)),
+                Step::Success {
+                    resolved,
+                    cancel,
+                    close_fails,
+                } => {
+                    if cancel {
+                        self.cancelled.store(true, Ordering::Relaxed);
+                    }
+                    Ok(Opened {
+                        connection: Connection {
+                            log: Arc::clone(&self.log),
+                            close_fails,
+                        },
+                        resolved,
+                    })
+                }
+            })
+        })
     }
 
-    async fn wait(&mut self, duration: Duration) {
-        if let Ok(mut log) = self.log.lock() {
-            log.push(Seen::Wait(duration));
-        }
-        if self.cancel_on_wait {
-            self.cancelled.store(true, Ordering::Relaxed);
-        }
+    fn wait(&mut self, duration: Duration) -> impl Future<Output = ()> {
+        std::future::poll_fn(move |_| {
+            if let Ok(mut log) = self.log.lock() {
+                log.push(Seen::Wait(duration));
+            }
+            if self.cancel_on_wait {
+                self.cancelled.store(true, Ordering::Relaxed);
+            }
+            std::task::Poll::Ready(())
+        })
     }
 }
 

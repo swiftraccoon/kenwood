@@ -189,7 +189,7 @@ fn selected_pm_and_my_entry_are_never_substituted_with_populated_defaults() -> T
     assert_eq!(report.slot.index(), 5);
     assert_eq!(report.captured_active_slot.index(), 0);
     assert_eq!(report.selected_my_callsign.index(), 5);
-    assert!(report.my_callsign.is_empty());
+    assert_eq!(report.my_callsign, "");
     assert_eq!(
         report.findings,
         vec![
@@ -242,7 +242,7 @@ fn even_conflict_free_output_does_not_claim_a_radio_is_ready() -> TestResult {
     write_fixture(&path, &image)?;
     let snapshot = Snapshot::load(&path)?;
     let report = assess(&request(&path)?, &snapshot)?;
-    assert!(report.findings.is_empty());
+    assert_eq!(report.findings, Vec::<TerminalFinding>::new());
     let output = describe(&snapshot, &report)?.join("\n");
     assert!(output.contains("No conflicts found by these offline checks"));
     assert!(output.contains("current radio state is unknown"));

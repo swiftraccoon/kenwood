@@ -152,10 +152,7 @@ impl EditRequest {
             }
         }
         let mut entries: Vec<CallsignEntry> = kept.into_iter().flatten().collect();
-        for fields in self.add.chunks_exact(3) {
-            let [name, callsign, memo] = fields else {
-                continue;
-            };
+        for [name, callsign, memo] in self.add.as_chunks::<3>().0 {
             entries.push(CallsignEntry::new(
                 StoredText::new(name)?,
                 StoredCallsign::new(callsign)?,

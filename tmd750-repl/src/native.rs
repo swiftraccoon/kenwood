@@ -216,7 +216,7 @@ pub(crate) trait Backend {
         endpoint: &Endpoint,
         service: BluetoothService,
         cancelled: &AtomicBool,
-    ) -> Result<Opened<Self::Connection>, OpenFailure>;
+    ) -> Result<Opened<Self::Connection>, Box<OpenFailure>>;
     async fn wait(&mut self, duration: Duration) {
         tokio::time::sleep(duration).await;
     }
@@ -232,7 +232,7 @@ impl Backend for SystemBackend {
         endpoint: &Endpoint,
         service: BluetoothService,
         cancelled: &AtomicBool,
-    ) -> Result<Opened<Connection>, OpenFailure> {
+    ) -> Result<Opened<Connection>, Box<OpenFailure>> {
         open(endpoint, service, cancelled, OPEN_BUDGET).await
     }
 }
@@ -244,15 +244,15 @@ async fn open_worker<T, F>(
     cancelled: &AtomicBool,
     budget: Duration,
     worker: F,
-) -> Result<Opened<T>, OpenFailure>
+) -> Result<Opened<T>, Box<OpenFailure>>
 where
     T: Transport + 'static,
     F: FnOnce(BluetoothOpenCancellation) -> Result<Opened<T>, TransportError> + Send + 'static,
 {
     if cancelled.load(Ordering::Relaxed) {
-        return Err(OpenFailure::before_open(
+        return Err(Box::new(OpenFailure::before_open(
             TransportError::BluetoothOpenInterrupted,
-        ));
+        )));
     }
     let cancellation = BluetoothOpenCancellation::default();
     let worker_cancellation = cancellation.clone();
@@ -269,8 +269,8 @@ where
         && let Some(result) = completed
     {
         return result
-            .map_err(OpenFailure::from_error)?
-            .map_err(OpenFailure::from_error);
+            .map_err(|error| Box::new(OpenFailure::from_error(error)))?
+            .map_err(|error| Box::new(OpenFailure::from_error(error)));
     }
     cancellation.cancel();
     let reason = if stopped {
@@ -300,7 +300,7 @@ where
             failure.sources.push(Box::new(error));
         }
     }
-    Err(failure)
+    Err(Box::new(failure))
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -326,7 +326,7 @@ async fn open(
     service: BluetoothService,
     cancelled: &AtomicBool,
     budget: Duration,
-) -> Result<Opened<Connection>, OpenFailure> {
+) -> Result<Opened<Connection>, Box<OpenFailure>> {
     use kenwood_transport::bluetooth::{BluetoothDeviceSelector, BluetoothTransport};
 
     let endpoint = endpoint.clone();
@@ -361,9 +361,11 @@ fn open(
     _service: BluetoothService,
     _cancelled: &AtomicBool,
     _budget: Duration,
-) -> std::future::Ready<Result<Opened<Connection>, OpenFailure>> {
-    std::future::ready(Err(OpenFailure::before_open(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "native Bluetooth is currently available only on macOS",
+) -> std::future::Ready<Result<Opened<Connection>, Box<OpenFailure>>> {
+    std::future::ready(Err(Box::new(OpenFailure::before_open(
+        std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "native Bluetooth is currently available only on macOS",
+        ),
     ))))
 }

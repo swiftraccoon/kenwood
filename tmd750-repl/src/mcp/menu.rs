@@ -156,8 +156,10 @@ impl ApplyRequest {
         }
         let pairs = std::iter::once((self.selection.field.as_str(), self.value.as_str())).chain(
             self.and
-                .chunks_exact(2)
-                .filter_map(|pair| Some((pair.first()?.as_str(), pair.get(1)?.as_str()))),
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|[field, value]| (field.as_str(), value.as_str())),
         );
         let mut assignments = Vec::new();
         let mut per_slot = false;

@@ -148,7 +148,7 @@ fn an_edit_needs_a_name_or_code_or_clear_and_a_radio_channel() -> TestResult {
     );
     assert_eq!(pages(&cleared), [0x38, 0x100]);
     let unchanged = edit(report, Memory::EchoLink, 1, None).prepare(&snapshot)?;
-    assert!(unchanged.replacements.is_empty());
+    assert_eq!(unchanged.replacements, Vec::<PageReplacement>::new());
     Ok(())
 }
 

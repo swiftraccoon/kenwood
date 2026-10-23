@@ -76,7 +76,7 @@ fn serialization_failure_writes_no_prefix_and_blocks_later_records() -> TestResu
     recorder.record(Event::CloseCompleted);
     assert_eq!(recorder.writer.writes, 0);
     assert_eq!(recorder.writer.flushes, 0);
-    assert!(recorder.writer.inner.is_empty());
+    assert_eq!(recorder.writer.inner, [0_u8; 0]);
     assert_eq!(recorder.summary().events, 0);
     assert!(!recorder.summary().complete);
     assert!(

@@ -92,10 +92,7 @@ impl EditSelection {
         let image = covered(snapshot)?;
         let access = ChannelAccess::from_memory_image(image);
         let mut writes = Vec::new();
-        for pair in self.store.chunks_exact(2) {
-            let [channel, source] = pair else {
-                continue;
-            };
+        for [channel, source] in self.store.as_chunks::<2>().0 {
             let address = parse_address(channel)?;
             let record = source_record(snapshot, &access, source)?;
             writes.push((address, ChannelWrite::Store(record)));

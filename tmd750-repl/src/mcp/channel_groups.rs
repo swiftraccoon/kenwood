@@ -97,10 +97,7 @@ impl GroupSelection {
         let access = ChannelAccess::from_memory_image(image);
         let mut assignments = Vec::new();
         let mut changes = Vec::new();
-        for pair in self.set.chunks_exact(2) {
-            let [channel, group] = pair else {
-                continue;
-            };
+        for [channel, group] in self.set.as_chunks::<2>().0 {
             let channel = PhysicalChannel::from_address(parse_address(channel)?);
             let group = group
                 .parse()

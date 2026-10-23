@@ -106,10 +106,7 @@ impl NamesSelection {
         let access = ChannelAccess::from_memory_image(image);
         let mut names = Vec::new();
         let mut changes = Vec::new();
-        for pair in self.set.chunks_exact(2) {
-            let [group, name] = pair else {
-                continue;
-            };
+        for [group, name] in self.set.as_chunks::<2>().0 {
             let group = group
                 .parse()
                 .map_err(|_| CommandError(format!("group {group:?} is not 0 to 29")))

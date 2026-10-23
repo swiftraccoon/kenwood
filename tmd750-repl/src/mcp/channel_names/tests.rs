@@ -107,7 +107,7 @@ fn a_plan_needs_channels_valid_names_and_no_repeats() -> TestResult {
         );
     }
     let unchanged = selection(report, &[], &["995"]).prepare(&snapshot)?;
-    assert!(unchanged.replacements.is_empty());
+    assert_eq!(unchanged.replacements, Vec::<PageReplacement>::new());
     Ok(())
 }
 

@@ -93,7 +93,7 @@ fn a_restore_writes_the_changed_pages_and_keeps_lifecycle_settings() -> TestResu
         from_file: None,
     }
     .prepare(&Snapshot::load(&current)?)?;
-    assert!(unchanged.replacements().is_empty());
+    assert_eq!(unchanged.replacements(), []);
     Ok(())
 }
 

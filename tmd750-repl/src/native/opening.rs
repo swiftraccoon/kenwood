@@ -245,7 +245,7 @@ async fn attempt<B: Backend>(
             (owner, evidence)
         }
         Err(error) => {
-            evidence.record_failure(error, cancelled, deadline);
+            evidence.record_failure(*error, cancelled, deadline);
             (Owner::Retired(recorder), evidence)
         }
     }

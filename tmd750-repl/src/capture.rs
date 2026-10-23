@@ -954,23 +954,27 @@ mod tests {
     }
 
     impl Transport for FailedUsb {
-        async fn write(&mut self, _data: &[u8]) -> Result<(), TransportError> {
-            let message = if self.request_flushed.load(Ordering::Relaxed) {
-                "original USB write error"
-            } else {
-                "request evidence was not flushed before dispatch"
-            };
-            Err(TransportError::Write(io::Error::other(message)))
+        fn write(&mut self, _data: &[u8]) -> impl Future<Output = Result<(), TransportError>> {
+            std::future::poll_fn(move |_| {
+                let message = if self.request_flushed.load(Ordering::Relaxed) {
+                    "original USB write error"
+                } else {
+                    "request evidence was not flushed before dispatch"
+                };
+                std::task::Poll::Ready(Err(TransportError::Write(io::Error::other(message))))
+            })
         }
 
-        async fn read(&mut self, _buf: &mut [u8]) -> Result<usize, TransportError> {
-            Err(TransportError::Read(io::Error::other(
-                "original USB read error",
-            )))
+        fn read(&mut self, _buf: &mut [u8]) -> impl Future<Output = Result<usize, TransportError>> {
+            std::future::poll_fn(|_| {
+                std::task::Poll::Ready(Err(TransportError::Read(io::Error::other(
+                    "original USB read error",
+                ))))
+            })
         }
 
-        async fn close(&mut self) -> Result<(), TransportError> {
-            Ok(())
+        fn close(&mut self) -> impl Future<Output = Result<(), TransportError>> {
+            std::future::ready(Ok(()))
         }
     }
 
@@ -1055,7 +1059,7 @@ mod tests {
             matches!(result, Err(TransportError::Write(ref source)) if source.to_string().contains("before write dispatch")),
             "a failed request capture must prevent dispatch: {result:?}"
         );
-        assert!(transport.inner.writes().is_empty());
+        assert_eq!(transport.inner.writes(), Vec::<Vec<u8>>::new());
         transport.inner.assert_complete();
         assert!(cancelled.load(Ordering::Relaxed));
         assert!(!transport.recorder.summary().complete);
@@ -1099,7 +1103,7 @@ mod tests {
             matches!(write, Err(TransportError::Write(ref source)) if source.to_string().contains("before write dispatch")),
             "capture can fail at a new request after prior evidence succeeded: {write:?}"
         );
-        assert!(transport.inner.writes().is_empty());
+        assert_eq!(transport.inner.writes(), Vec::<Vec<u8>>::new());
         Ok(())
     }
 
@@ -1129,19 +1133,25 @@ mod tests {
     }
 
     impl Transport for OperationWitness {
-        async fn write(&mut self, _data: &[u8]) -> Result<(), TransportError> {
-            self.operations.push("write");
-            Ok(())
+        fn write(&mut self, _data: &[u8]) -> impl Future<Output = Result<(), TransportError>> {
+            std::future::poll_fn(move |_| {
+                self.operations.push("write");
+                std::task::Poll::Ready(Ok(()))
+            })
         }
 
-        async fn read(&mut self, _buf: &mut [u8]) -> Result<usize, TransportError> {
-            self.operations.push("read");
-            Ok(0)
+        fn read(&mut self, _buf: &mut [u8]) -> impl Future<Output = Result<usize, TransportError>> {
+            std::future::poll_fn(move |_| {
+                self.operations.push("read");
+                std::task::Poll::Ready(Ok(0))
+            })
         }
 
-        async fn close(&mut self) -> Result<(), TransportError> {
-            self.operations.push("close");
-            Ok(())
+        fn close(&mut self) -> impl Future<Output = Result<(), TransportError>> {
+            std::future::poll_fn(move |_| {
+                self.operations.push("close");
+                std::task::Poll::Ready(Ok(()))
+            })
         }
 
         fn set_baud_rate(&mut self, _baud: NonZeroU32) -> Result<(), TransportError> {
@@ -1204,7 +1214,7 @@ mod tests {
             .await
             .err()
             .ok_or("failed capture dispatched a write")?;
-        assert!(transport.inner.operations.is_empty());
+        assert_eq!(transport.inner.operations, Vec::<&str>::new());
         assert!(
             matches!(&error, TransportError::Write(source) if source.kind() == io::ErrorKind::PermissionDenied)
         );
@@ -1272,7 +1282,7 @@ mod tests {
             transport.set_baud_rate(TEST_BAUD),
             Err(TransportError::Open { .. })
         ));
-        assert!(transport.inner.operations.is_empty());
+        assert_eq!(transport.inner.operations, Vec::<&str>::new());
         let close = transport.close().await;
         assert!(matches!(close, Err(TransportError::Disconnected(_))));
         assert_eq!(transport.inner.operations, ["close"]);
@@ -1281,16 +1291,19 @@ mod tests {
     struct InvalidReadCountTransport;
 
     impl Transport for InvalidReadCountTransport {
-        async fn write(&mut self, _data: &[u8]) -> Result<(), TransportError> {
-            Ok(())
+        fn write(&mut self, _data: &[u8]) -> impl Future<Output = Result<(), TransportError>> {
+            std::future::ready(Ok(()))
         }
 
-        async fn read(&mut self, buffer: &mut [u8]) -> Result<usize, TransportError> {
-            Ok(buffer.len() + 1)
+        fn read(
+            &mut self,
+            buffer: &mut [u8],
+        ) -> impl Future<Output = Result<usize, TransportError>> {
+            std::future::poll_fn(move |_| std::task::Poll::Ready(Ok(buffer.len() + 1)))
         }
 
-        async fn close(&mut self) -> Result<(), TransportError> {
-            Ok(())
+        fn close(&mut self) -> impl Future<Output = Result<(), TransportError>> {
+            std::future::ready(Ok(()))
         }
     }
 
@@ -1387,7 +1400,7 @@ mod tests {
         assert_eq!(recorder.summary().file, "trial-session.jsonl");
         assert_eq!(recorder.summary().events, 1);
         assert!(recorder.summary().complete);
-        assert!(!fs::read(path)?.is_empty());
+        assert_ne!(fs::read(path)?, [0_u8; 0]);
         Ok(())
     }
 

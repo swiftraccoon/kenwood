@@ -1130,24 +1130,26 @@ struct NativeBackend {
 impl native::Backend for NativeBackend {
     type Connection = Connection;
 
-    async fn open(
+    fn open(
         &mut self,
         endpoint: &native::Endpoint,
         service: BluetoothService,
         _cancelled: &AtomicBool,
-    ) -> Result<native::Opened<Connection>, native::OpenFailure> {
-        self.services.push(service);
-        let connection = self.connections.pop_front().ok_or_else(|| {
-            native::OpenFailure::from_error(io::Error::other("no scripted native connection"))
-        })?;
-        append(&self.log, Event::Open(self.opens)).map_err(native::OpenFailure::from_error)?;
-        self.opens += 1;
-        Ok(native::Opened {
-            connection,
-            resolved: native::Resolved {
-                address: endpoint.address.to_string(),
-                rfcomm_channel: 27,
-            },
+    ) -> impl Future<Output = Result<native::Opened<Connection>, Box<native::OpenFailure>>> {
+        std::future::poll_fn(move |_| {
+            self.services.push(service);
+            let connection = self.connections.pop_front().ok_or_else(|| {
+                native::OpenFailure::from_error(io::Error::other("no scripted native connection"))
+            })?;
+            append(&self.log, Event::Open(self.opens)).map_err(native::OpenFailure::from_error)?;
+            self.opens += 1;
+            std::task::Poll::Ready(Ok(native::Opened {
+                connection,
+                resolved: native::Resolved {
+                    address: endpoint.address.to_string(),
+                    rfcomm_channel: 27,
+                },
+            }))
         })
     }
 

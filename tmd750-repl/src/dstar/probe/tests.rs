@@ -488,7 +488,7 @@ async fn cancellation_before_open_or_after_identity_prevents_further_queries() -
     harness.cancelled.store(true, Ordering::Relaxed);
     let evidence = harness.run().await?;
     assert_eq!((evidence.opens, evidence.closes), (0, 0));
-    assert!(evidence.writes.is_empty());
+    assert_eq!(evidence.writes, Vec::<Vec<u8>>::new());
     assert!(matches!(evidence.result.outcome, Outcome::Cancelled { .. }));
     let mut harness = Harness::new(cat())?;
     harness.connection()?.cancel_on_write = Some(b"ID\r");
@@ -560,7 +560,7 @@ async fn open_failure_is_recorded_without_any_protocol_or_close_attempt() -> Tes
         }
     ));
     assert_eq!((evidence.opens, evidence.closes), (1, 0));
-    assert!(evidence.writes.is_empty());
+    assert_eq!(evidence.writes, Vec::<Vec<u8>>::new());
     assert!(evidence.result.transcript.complete);
     Ok(())
 }
@@ -679,7 +679,7 @@ async fn capture_failure_before_open_suppresses_all_radio_operations() -> TestRe
     );
     let evidence = harness.run().await?;
     assert_eq!((evidence.opens, evidence.closes), (0, 0));
-    assert!(evidence.writes.is_empty());
+    assert_eq!(evidence.writes, Vec::<Vec<u8>>::new());
     assert!(matches!(
         evidence.result.outcome,
         Outcome::Failed {

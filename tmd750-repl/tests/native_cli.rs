@@ -774,6 +774,9 @@ fn failed_sdp_deadline_is_visible_and_captured_without_radio_traffic() -> TestRe
             Some("native_open_failed"),
         ]
     );
-    assert!(std::fs::read(capture.join("post-exit-transcript.jsonl"))?.is_empty());
+    assert_eq!(
+        std::fs::read(capture.join("post-exit-transcript.jsonl"))?,
+        [0_u8; 0]
+    );
     Ok(())
 }

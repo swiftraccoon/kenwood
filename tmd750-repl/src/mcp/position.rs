@@ -169,20 +169,17 @@ fn parse_degrees(text: &str, kind: CoordinateKind) -> AppResult<(bool, Coordinat
     }
     let whole: u64 = whole.parse().map_err(|_| invalid())?;
     let mut nanodegrees = whole * 1_000_000_000;
-    for (digit, scale) in fraction.bytes().zip(
-        [
-            100_000_000,
-            10_000_000,
-            1_000_000,
-            100_000,
-            10_000,
-            1_000,
-            100,
-            10,
-            1,
-        ]
-        .into_iter(),
-    ) {
+    for (digit, scale) in fraction.bytes().zip([
+        100_000_000,
+        10_000_000,
+        1_000_000,
+        100_000,
+        10_000,
+        1_000,
+        100,
+        10,
+        1,
+    ]) {
         nanodegrees += u64::from(digit - b'0') * scale;
     }
     if nanodegrees > kind.limit() * 1_000_000_000 {
@@ -261,10 +258,7 @@ impl EditRequest {
                 }
             };
             let time = now()?;
-            for fields in self.add.chunks_exact(3) {
-                let [name, latitude, longitude] = fields else {
-                    continue;
-                };
+            for [name, latitude, longitude] in self.add.as_chunks::<3>().0 {
                 let (south, latitude) = parse_degrees(latitude, CoordinateKind::Latitude)?;
                 let (west, longitude) = parse_degrees(longitude, CoordinateKind::Longitude)?;
                 after.push(StoredPosition::new(

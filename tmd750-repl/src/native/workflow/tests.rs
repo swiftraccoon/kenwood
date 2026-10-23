@@ -280,39 +280,44 @@ struct FakeBackend {
 impl Backend for FakeBackend {
     type Connection = Connection;
 
-    async fn open(
+    fn open(
         &mut self,
         endpoint: &Endpoint,
         service: BluetoothService,
         _cancelled: &AtomicBool,
-    ) -> Result<Opened<Connection>, OpenFailure> {
-        let id = self.opens;
-        self.opens += 1;
-        record(&self.log, Seen::Open(id, endpoint.address.to_string()))
-            .map_err(OpenFailure::from_error)?;
-        record(&self.log, Seen::Service(id, service)).map_err(OpenFailure::from_error)?;
-        let mut fixture = self
-            .fixtures
-            .pop_front()
-            .ok_or_else(|| OpenFailure::from_error(io::Error::other("scripted open failure")))?;
-        if let Some(error) = fixture.open_error.take() {
-            return Err(OpenFailure::from_error(error));
-        }
-        let resolved = Resolved {
-            address: fixture
-                .address
-                .clone()
-                .unwrap_or_else(|| endpoint.address.to_string()),
-            rfcomm_channel: fixture.channel,
-        };
-        Ok(Opened {
-            connection: Connection {
-                id,
-                fixture,
-                log: Arc::clone(&self.log),
-                cancelled: Arc::clone(&self.cancelled),
-            },
-            resolved,
+    ) -> impl Future<Output = Result<Opened<Connection>, Box<OpenFailure>>> {
+        std::future::poll_fn(move |_| {
+            let id = self.opens;
+            self.opens += 1;
+            if let Err(error) = record(&self.log, Seen::Open(id, endpoint.address.to_string()))
+                .and_then(|()| record(&self.log, Seen::Service(id, service)))
+            {
+                return std::task::Poll::Ready(Err(Box::new(OpenFailure::from_error(error))));
+            }
+            let Some(mut fixture) = self.fixtures.pop_front() else {
+                return std::task::Poll::Ready(Err(Box::new(OpenFailure::from_error(
+                    io::Error::other("scripted open failure"),
+                ))));
+            };
+            if let Some(error) = fixture.open_error.take() {
+                return std::task::Poll::Ready(Err(Box::new(OpenFailure::from_error(error))));
+            }
+            let resolved = Resolved {
+                address: fixture
+                    .address
+                    .clone()
+                    .unwrap_or_else(|| endpoint.address.to_string()),
+                rfcomm_channel: fixture.channel,
+            };
+            std::task::Poll::Ready(Ok(Opened {
+                connection: Connection {
+                    id,
+                    fixture,
+                    log: Arc::clone(&self.log),
+                    cancelled: Arc::clone(&self.cancelled),
+                },
+                resolved,
+            }))
         })
     }
 
@@ -676,7 +681,7 @@ async fn wrong_resolved_address_is_closed_without_cat() -> TestResult {
             .original_opening
             .is_some_and(|history| !history.succeeded())
     );
-    assert!(writes(&events, 0).is_empty());
+    assert_eq!(writes(&events, 0), Vec::<Vec<u8>>::new());
     assert_eq!(opens(&events), 1);
     assert!(position(&events, &Seen::Close(0))? < position(&events, &Seen::Drop(0))?);
     Ok(())
@@ -835,7 +840,7 @@ async fn eligible_open_retry_never_repeats_mcp_or_forgets_the_first_failure() ->
     assert!(result.succeeded(), "{result:?}");
     assert_eq!(opens(&events), 3);
     assert_eq!(writes(&events, 0).len(), 10);
-    assert!(writes(&events, 1).is_empty());
+    assert_eq!(writes(&events, 1), Vec::<Vec<u8>>::new());
     assert_eq!(
         writes(&events, 2),
         [b"ID\r".as_slice(), b"FV\r", b"TY\r", b"GW\r"]
@@ -978,7 +983,7 @@ async fn configuration_backup_recovers_on_the_discovered_channel_and_loads_offli
             .count(),
         1
     );
-    assert!(writes(&events, 1).is_empty());
+    assert_eq!(writes(&events, 1), Vec::<Vec<u8>>::new());
     assert_eq!(
         writes(&events, 2),
         [b"ID\r".as_slice(), b"FV\r", b"TY\r", b"GW\r"]

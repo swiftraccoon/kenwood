@@ -270,18 +270,21 @@ impl Backend for ReadinessBackend {
                 .map_or(Duration::ZERO, |elapsed| *elapsed)
     }
 
-    async fn wait(&mut self, duration: Duration) {
-        let result = self
-            .shared
-            .record(Observation::Wait(duration))
-            .and_then(|()| self.shared.advance(duration));
-        assert!(result.is_ok(), "record simulated wait: {result:?}");
-        self.waits += 1;
-        if let Some((ordinal, cancelled)) = &self.cancel_on_wait
-            && *ordinal == self.waits
-        {
-            cancelled.store(true, Ordering::Relaxed);
-        }
+    fn wait(&mut self, duration: Duration) -> impl Future<Output = ()> {
+        std::future::poll_fn(move |_| {
+            let result = self
+                .shared
+                .record(Observation::Wait(duration))
+                .and_then(|()| self.shared.advance(duration));
+            assert!(result.is_ok(), "record simulated wait: {result:?}");
+            self.waits += 1;
+            if let Some((ordinal, cancelled)) = &self.cancel_on_wait
+                && *ordinal == self.waits
+            {
+                cancelled.store(true, Ordering::Relaxed);
+            }
+            std::task::Poll::Ready(())
+        })
     }
 }
 

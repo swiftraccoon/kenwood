@@ -96,10 +96,7 @@ impl NamesSelection {
     fn prepare(&self, snapshot: &Snapshot) -> AppResult<Prepared> {
         let mut names = Vec::new();
         let mut entries = Vec::new();
-        for pair in self.set.chunks_exact(2) {
-            let [channel, name] = pair else {
-                continue;
-            };
+        for [channel, name] in self.set.as_chunks::<2>().0 {
             let address = parse_address(channel)?;
             names.push((
                 PhysicalChannel::from_address(address),

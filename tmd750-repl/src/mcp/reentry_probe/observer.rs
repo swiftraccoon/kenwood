@@ -65,23 +65,24 @@ fn command() -> tokio::process::Command {
 }
 
 impl Source for SystemSource {
+    #[cfg(target_os = "macos")]
     async fn sample(&mut self) -> io::Result<CommandOutput> {
-        #[cfg(target_os = "macos")]
-        {
-            let output = command().output().await?;
-            Ok(CommandOutput {
-                exit_code: output.status.code(),
-                stdout: output.stdout,
-                stderr: output.stderr,
-            })
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            Err(io::Error::new(
+        let output = command().output().await?;
+        Ok(CommandOutput {
+            exit_code: output.status.code(),
+            stdout: output.stdout,
+            stderr: output.stderr,
+        })
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn sample(&mut self) -> impl Future<Output = io::Result<CommandOutput>> + Send {
+        std::future::poll_fn(|_| {
+            std::task::Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "passive serial-registry observation requires macOS",
-            ))
-        }
+            )))
+        })
     }
 }
 

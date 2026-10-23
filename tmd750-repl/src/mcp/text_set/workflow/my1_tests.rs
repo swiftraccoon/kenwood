@@ -1504,46 +1504,52 @@ struct ReadOnlyCompletionLink<'a> {
 impl WriteLink for ReadOnlyCompletionLink<'_> {
     type Connection = <TestBackend as Backend>::Connection;
 
-    async fn open_session(
+    fn open_session(
         &mut self,
-        mut recorder: Recorder<File>,
+        recorder: Recorder<File>,
         _later: bool,
         _cancelled: &AtomicBool,
-    ) -> Opening<Self::Connection> {
-        recorder.record(CaptureEvent::OpenRequested {
-            path: &self.endpoint.path,
-            baud: kenwood_tmd750::transport::DEFAULT_BAUD,
-        });
-        let opened = recorder.synchronize().and_then(|()| {
-            let connection = self
-                .backend
-                .open(&self.endpoint, kenwood_tmd750::transport::DEFAULT_BAUD)
-                .map_err(io::Error::other)?;
-            Ok((connection, File::open(&self.transcript)?))
-        });
-        match opened {
-            Ok((connection, file)) => {
-                drop(recorder);
-                let mut completion = Recorder::named(
-                    file,
-                    Arc::clone(&self.capture_failed),
-                    "read-only-open-completion.jsonl",
-                );
-                completion.record(CaptureEvent::OpenCompleted);
-                self.first_error = completion
-                    .synchronize()
-                    .err()
-                    .map(|error| serde_json::to_value(Failure::from_error(&error)))
-                    .transpose()
-                    .ok()
-                    .flatten();
-                Opening::Opened(CaptureTransport::required(connection, completion))
-            }
-            Err(error) => Opening::Refused {
-                recorder,
-                refusal: Refusal::Open(Failure::from_error(&error)),
-            },
-        }
+    ) -> impl Future<Output = Opening<Self::Connection>> {
+        let mut recorder = Some(recorder);
+        std::future::poll_fn(move |_| {
+            let Some(mut recorder) = recorder.take() else {
+                unreachable!("completed opening future polled again");
+            };
+            recorder.record(CaptureEvent::OpenRequested {
+                path: &self.endpoint.path,
+                baud: kenwood_tmd750::transport::DEFAULT_BAUD,
+            });
+            let opened = recorder.synchronize().and_then(|()| {
+                let connection = self
+                    .backend
+                    .open(&self.endpoint, kenwood_tmd750::transport::DEFAULT_BAUD)
+                    .map_err(io::Error::other)?;
+                Ok((connection, File::open(&self.transcript)?))
+            });
+            std::task::Poll::Ready(match opened {
+                Ok((connection, file)) => {
+                    drop(recorder);
+                    let mut completion = Recorder::named(
+                        file,
+                        Arc::clone(&self.capture_failed),
+                        "read-only-open-completion.jsonl",
+                    );
+                    completion.record(CaptureEvent::OpenCompleted);
+                    self.first_error = completion
+                        .synchronize()
+                        .err()
+                        .map(|error| serde_json::to_value(Failure::from_error(&error)))
+                        .transpose()
+                        .ok()
+                        .flatten();
+                    Opening::Opened(CaptureTransport::required(connection, completion))
+                }
+                Err(error) => Opening::Refused {
+                    recorder,
+                    refusal: Refusal::Open(Failure::from_error(&error)),
+                },
+            })
+        })
     }
 
     fn take_opening_history(&mut self) -> Option<History> {
@@ -1557,29 +1563,38 @@ impl WriteLink for ReadOnlyCompletionLink<'_> {
         Radio::new(transport)
     }
 
-    async fn admit(
+    fn admit(
         &mut self,
         _radio: &mut Radio<CaptureTransport<Self::Connection, File>>,
-    ) -> Admission {
-        Admission::default()
+    ) -> impl Future<Output = Admission> {
+        std::future::ready(Admission::default())
     }
 
-    async fn hold_after_exit(
+    fn hold_after_exit(
         &mut self,
         _post_exit: &mut Recorder<File>,
         _cancelled: &AtomicBool,
-    ) -> io::Result<()> {
-        Ok(())
+    ) -> impl Future<Output = io::Result<()>> {
+        std::future::ready(Ok(()))
     }
 
-    async fn verify_post_exit(
+    fn verify_post_exit(
         &mut self,
         _identity: &Identity,
         _gateway_off: bool,
         post_exit: Recorder<File>,
         _cancelled: &AtomicBool,
-    ) -> PostExit {
-        PostExit::skipped(SkipReason::OriginalCaptureIncomplete, post_exit.summary())
+    ) -> impl Future<Output = PostExit> {
+        let mut post_exit = Some(post_exit);
+        std::future::poll_fn(move |_| {
+            let Some(post_exit) = post_exit.take() else {
+                unreachable!("completed verification future polled again");
+            };
+            std::task::Poll::Ready(PostExit::skipped(
+                SkipReason::OriginalCaptureIncomplete,
+                post_exit.summary(),
+            ))
+        })
     }
 
     fn skipped(&self, reason: SkipReason, transcript: TranscriptSummary) -> PostExit {

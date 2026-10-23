@@ -169,12 +169,15 @@ impl Backend for FakeBackend {
         self.elapsed
     }
 
-    async fn wait(&mut self, duration: Duration) {
-        self.record(Observation::Wait(duration));
-        self.elapsed = self.elapsed.saturating_add(duration);
-        if let Some(cancelled) = &self.cancel_on_wait {
-            cancelled.store(true, Ordering::Relaxed);
-        }
+    fn wait(&mut self, duration: Duration) -> impl Future<Output = ()> {
+        std::future::poll_fn(move |_| {
+            self.record(Observation::Wait(duration));
+            self.elapsed = self.elapsed.saturating_add(duration);
+            if let Some(cancelled) = &self.cancel_on_wait {
+                cancelled.store(true, Ordering::Relaxed);
+            }
+            std::task::Poll::Ready(())
+        })
     }
 }
 
@@ -837,7 +840,7 @@ async fn original_open_failure_has_no_active_retry() -> TestResult {
     ));
     let observed = observations(&harness.log)?;
     assert_no_fresh_open(&observed);
-    assert!(writes(&observed, 0).is_empty());
+    assert_eq!(writes(&observed, 0), Vec::<Vec<u8>>::new());
     assert!(!succeeded(result));
     Ok(())
 }
@@ -969,7 +972,7 @@ async fn cancellation_before_workflow_does_not_open_original() -> TestResult {
     harness.cancelled.store(true, Ordering::Relaxed);
     let result = harness.run().await?;
     assert_eq!(harness.backend.opens, 0);
-    assert!(observations(&harness.log)?.is_empty());
+    assert_eq!(observations(&harness.log)?, Vec::<Observation>::new());
     assert!(matches!(
         result.post_exit.outcome,
         VerificationOutcome::Skipped {
@@ -1017,7 +1020,10 @@ async fn fresh_open_failure_is_not_retried() -> TestResult {
         }
     ));
     assert_eq!(harness.backend.opens, 2);
-    assert!(writes(&observations(&harness.log)?, 1).is_empty());
+    assert_eq!(
+        writes(&observations(&harness.log)?, 1),
+        Vec::<Vec<u8>>::new()
+    );
     assert!(!succeeded(result));
     Ok(())
 }
