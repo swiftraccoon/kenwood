@@ -1,5 +1,7 @@
 #![doc = include_str!("../README.md")]
 
+use std::fmt::Write as _;
+
 pub use address::{
     Address, Affine, RecordBase, SlotSymbol, SymbolScope, Term, resolve_offset, resolve_record_base,
 };
@@ -41,3 +43,12 @@ mod rustgen;
 mod sources;
 mod tags;
 mod validation;
+
+/// Formats a SHA-256 digest as 64 lowercase hexadecimal digits.
+fn sha256_hex(digest: &sha2::digest::Output<sha2::Sha256>) -> String {
+    let mut encoded = String::with_capacity(64);
+    for byte in digest {
+        let _infallible = write!(encoded, "{byte:02x}");
+    }
+    encoded
+}

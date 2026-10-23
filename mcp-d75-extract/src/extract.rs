@@ -194,7 +194,7 @@ fn normalized_source_digest(sources: &Sources, source_dir: &Path) -> String {
         digest.update(source.replace("\r\n", "\n").as_bytes());
         digest.update(b"\0");
     }
-    format!("{:x}", digest.finalize())
+    crate::sha256_hex(&digest.finalize())
 }
 
 /// A nested call together with the class and slots it was made from.

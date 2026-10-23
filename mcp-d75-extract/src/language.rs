@@ -150,7 +150,7 @@ pub(crate) fn parse_language_file(
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_default(),
-        sha256: format!("{:x}", Sha256::digest(&raw)),
+        sha256: crate::sha256_hex(&Sha256::digest(&raw)),
         encoding: crate::LanguageEncoding::Utf16,
     };
     Ok((sections, Some(info)))

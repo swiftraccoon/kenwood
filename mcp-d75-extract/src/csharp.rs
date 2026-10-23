@@ -147,7 +147,7 @@ impl Patterns {
 pub(crate) fn fancy_captures<'t>(
     pattern: &fancy_regex::Regex,
     text: &'t str,
-) -> Result<Vec<fancy_regex::Captures<'t>>> {
+) -> Result<Vec<fancy_regex::Captures<'t, str>>> {
     pattern
         .captures_iter(text)
         .map(|capture| {
