@@ -636,8 +636,8 @@ mod tests {
         assert_eq!(parsed.callsign, "KQ4NIT", "unrelated settings survive");
         assert_eq!(parsed.reflector_host, "127.0.0.1");
         assert_eq!(parsed.reflector_callsign, "POLARIS");
-        assert!(parsed.favorites.is_empty());
-        assert!(parsed.recents.is_empty());
+        assert_eq!(parsed.favorites, Vec::<SavedHost>::new());
+        assert_eq!(parsed.recents, Vec::<SavedHost>::new());
 
         let migrated_raw = serialize(&parsed);
         let mut reloaded = parse(&migrated_raw).map_err(|e| format!("parse: {e}"))?;

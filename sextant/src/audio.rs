@@ -2523,8 +2523,10 @@ mod tests {
             )]
             let t = i as f32 / 8_000.0;
             let phase = 2.0 * std::f32::consts::PI * 1500.0 * t;
-            re += s * phase.cos();
-            im += s * phase.sin();
+            let real_component = s * phase.cos();
+            re += real_component;
+            let imaginary_component = s * phase.sin();
+            im += imaginary_component;
         }
         #[expect(
             clippy::cast_precision_loss,

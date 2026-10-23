@@ -7,6 +7,7 @@
 //! restarts and render as real dates. The persisted file carries the
 //! timestamp, last message, and last position alongside the counters.
 
+use std::cmp::Reverse;
 use std::fmt::Write as _;
 use std::path::PathBuf;
 
@@ -76,7 +77,7 @@ impl HeardList {
     /// without a timestamp sort last.
     pub(crate) fn recent(&self) -> Vec<&HeardStation> {
         let mut out: Vec<&HeardStation> = self.stations.iter().collect();
-        out.sort_by(|a, b| b.last_heard.cmp(&a.last_heard));
+        out.sort_by_key(|station| Reverse(station.last_heard));
         out
     }
 

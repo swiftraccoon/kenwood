@@ -151,28 +151,28 @@ fn style() -> egui::Style {
     v.panel_fill = BG_WINDOW;
     v.window_fill = BG_WINDOW;
     v.extreme_bg_color = BG_INSET;
-    v.window_stroke = Stroke::new(1.0, BORDER);
+    v.window_stroke = Stroke::new(1.0_f32, BORDER);
     v.window_rounding = Rounding::same(12.0);
     v.hyperlink_color = INFO;
     v.error_fg_color = ERR;
     v.warn_fg_color = LIVE;
     v.selection.bg_fill = Color32::from_rgba_unmultiplied(0xFF, 0xB3, 0x40, 0x30);
-    v.selection.stroke = Stroke::new(1.0, LIVE);
+    v.selection.stroke = Stroke::new(1.0_f32, LIVE);
 
-    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, HAIRLINE);
-    v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, TEXT_SECONDARY);
+    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, HAIRLINE);
+    v.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, TEXT_SECONDARY);
     v.widgets.inactive.bg_fill = BG_CONTROL;
     v.widgets.inactive.weak_bg_fill = BG_CONTROL;
-    v.widgets.inactive.bg_stroke = Stroke::new(1.0, BORDER);
-    v.widgets.inactive.fg_stroke = Stroke::new(1.0, TEXT_PRIMARY);
+    v.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, BORDER);
+    v.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, TEXT_PRIMARY);
     v.widgets.hovered.bg_fill = BG_CONTROL_HOVER;
     v.widgets.hovered.weak_bg_fill = BG_CONTROL_HOVER;
-    v.widgets.hovered.bg_stroke = Stroke::new(1.0, TEXT_TERTIARY);
-    v.widgets.hovered.fg_stroke = Stroke::new(1.0, TEXT_PRIMARY);
+    v.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, TEXT_TERTIARY);
+    v.widgets.hovered.fg_stroke = Stroke::new(1.0_f32, TEXT_PRIMARY);
     v.widgets.active.bg_fill = BG_CONTROL_HOVER;
-    v.widgets.active.fg_stroke = Stroke::new(1.0, TEXT_PRIMARY);
+    v.widgets.active.fg_stroke = Stroke::new(1.0_f32, TEXT_PRIMARY);
     v.widgets.open.bg_fill = BG_CONTROL_HOVER;
-    v.widgets.open.fg_stroke = Stroke::new(1.0, TEXT_PRIMARY);
+    v.widgets.open.fg_stroke = Stroke::new(1.0_f32, TEXT_PRIMARY);
     for w in [
         &mut v.widgets.noninteractive,
         &mut v.widgets.inactive,

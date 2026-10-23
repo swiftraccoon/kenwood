@@ -1496,13 +1496,13 @@ mod tests {
         // cribbed from the text_collector test fixture.
         let halves: [[u8; 3]; 8] = [
             [0x40, b'C', b'Q'],
-            [b' ', b'w', b'o'],
+            *b" wo",
             [0x41, b'r', b'k'],
-            [b'i', b'n', b'g'],
+            *b"ing",
             [0x42, b' ', b' '],
-            [b' ', b' ', b' '],
+            *b"   ",
             [0x43, b' ', b' '],
-            [b' ', b' ', b' '],
+            *b"   ",
         ];
         let mut emitted_message: Option<SlowDataTextMessage> = None;
         for (seq, half) in (1u8..).zip(halves.iter()) {
@@ -1542,13 +1542,13 @@ mod tests {
         };
         let halves: [[u8; 3]; 8] = [
             [0x40, b'A', 0xFF],
-            [b' ', b' ', b' '],
+            *b"   ",
             [0x41, b' ', b' '],
-            [b' ', b' ', b' '],
+            *b"   ",
             [0x42, b' ', b' '],
-            [b' ', b' ', b' '],
+            *b"   ",
             [0x43, b' ', b' '],
-            [b' ', b' ', b' '],
+            *b"   ",
         ];
         let mut completed = None;
         for (seq, half) in (1u8..).zip(halves) {
@@ -1588,7 +1588,7 @@ mod tests {
         let mut state = EventState::default();
         // Push half a message, then start a new stream; the collector
         // must drop the partial state.
-        for (seq, half) in (1u8..).zip([[0x40_u8, b'X', b'X'], [b'X', b'X', b'X']].iter()) {
+        for (seq, half) in (1u8..).zip([[0x40_u8, b'X', b'X'], *b"XXX"].iter()) {
             let _unused = decide_runtime_event(
                 RuntimeEvent::VoiceFrame {
                     seq,
@@ -1613,13 +1613,13 @@ mod tests {
         // partially-collected slot doesn't bleed in.
         let halves: [[u8; 3]; 8] = [
             [0x40, b'N', b'E'],
-            [b'W', b' ', b' '],
+            *b"W  ",
             [0x41, b' ', b' '],
-            [b' ', b' ', b' '],
+            *b"   ",
             [0x42, b' ', b' '],
-            [b' ', b' ', b' '],
+            *b"   ",
             [0x43, b' ', b' '],
-            [b' ', b' ', b' '],
+            *b"   ",
         ];
         let mut message: Option<SlowDataTextMessage> = None;
         for (seq, half) in (1u8..).zip(halves.iter()) {
