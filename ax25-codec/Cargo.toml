@@ -12,10 +12,10 @@ rust-version = "1.99"
 description = "AX.25 v2.2 frame encode/decode codec"
 
 [dependencies]
-thiserror = { version = "2", default-features = false }
+thiserror = { version = "2.0.21", default-features = false }
 
 [dev-dependencies]
-proptest = "1"
+proptest = "1.12.0"
 
 [lints]
 workspace = true
