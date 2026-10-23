@@ -713,12 +713,12 @@ for manifest in "${FUZZ_MANIFESTS[@]}"; do
         --all-targets -- -D warnings -D unsafe-code
 done
 
-# Refresh one persistent advisory database, then inspect every already-resolved
-# lockfile from the same immutable snapshot. Running several default
-# cargo-audit invocations concurrently would make each mutate
-# ~/.cargo/advisory-db.
+# Fetch one advisory database in the gate's temporary directory, then inspect
+# every resolved lockfile from that snapshot. Restored Cargo build artifacts
+# cannot supply this checkout. Concurrent default cargo-audit invocations
+# would each mutate ~/.cargo/advisory-db.
 check_cargo_audits() {
-    local advisory_db="$PWD/target/lint-advisory-db"
+    local advisory_db="$BG_DIR/advisory-db"
     local manifest
 
     cargo audit --db "$advisory_db" --file Cargo.lock || return 1

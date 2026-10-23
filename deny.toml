@@ -20,22 +20,6 @@ ignore = [
   # while compiling UniFFI. No patched release or compatible replacement exists.
   # Remove when a compatible UniFFI/Askama update replaces this dependency.
   { id = "RUSTSEC-2026-0374", reason = "basic-toml is an unmaintained build-time parser used by Askama's derive macro through UniFFI; no patched release or compatible upstream replacement is available" },
-  # RUSTSEC-2026-0192: ttf-parser is unmaintained.
-  #
-  # ttf-parser is a TrueType/OpenType font parser pulled in transitively
-  # by egui's default text stack for the sextant GUI. The author has
-  # declared the crate unmaintained and recommends skrifa (Google Fonts
-  # "oxidize"/fontations project).
-  #
-  # "Unmaintained" here is a maintenance concern, not a security concern:
-  # there is no known vulnerability and no safe upgrade path; no egui
-  # release has migrated off ttf-parser yet.
-  #
-  # Dependency path:
-  #   ttf-parser ← owned_ttf_parser ← ab_glyph ← epaint ← egui ← eframe ← sextant
-  #
-  # Recheck when egui/ab_glyph migrate to skrifa.
-  { id = "RUSTSEC-2026-0192", reason = "ttf-parser is an unmaintained font parser pulled transitively by egui/eframe for the sextant GUI; no known vulnerability, no safe upgrade; the fix requires egui migrating to skrifa upstream" },
 ]
 
 [licenses]
@@ -54,10 +38,6 @@ allow = [
   "Unicode-3.0",
   "BSL-1.0",
   "Zlib",
-  # Community Data License Agreement Permissive 2.0. Used by
-  # webpki-roots (Mozilla's web PKI root cert list, pulled in via
-  # reqwest's rustls feature). Permissive data license similar to CC0.
-  "CDLA-Permissive-2.0",
   # SIL Open Font License 1.1: used by epaint_default_fonts
   # (Ubuntu font family shipped with egui for sextant). Permissive
   # font licence that allows redistribution + derivative works.
@@ -65,17 +45,12 @@ allow = [
 ]
 confidence-threshold = 0.8
 
-# Per-crate license exceptions: used where a crate carries a
-# non-SPDX license reference (`LicenseRef-*`) that cargo-deny can't
-# match against the `allow` list.
+# Font licensing remains scoped to the crate that bundles the fonts.
 [[licenses.exceptions]]
 # epaint_default_fonts also bundles the Ubuntu fonts under the
-# Ubuntu Font Licence 1.0 (a proprietary-but-permissive licence
-# that predates the SPDX registry). `LicenseRef-UFL-1.0` is
-# cargo-deny's form for non-SPDX licences; we allow it only for
-# this specific crate since the licence text is fonts-only (no
-# source implications for our own GPL code).
-allow = ["LicenseRef-UFL-1.0"]
+# Ubuntu Font Licence 1.0, identified upstream as Ubuntu-font-1.0.
+# This exception applies to those bundled font files only.
+allow = ["Ubuntu-font-1.0"]
 name = "epaint_default_fonts"
 
 [bans]
@@ -108,9 +83,9 @@ skip = [
   # thd75-repl directory detection (dirs-next → dirs-sys-next → redox_users)
   # ─────────────────────────────────────────────────────────────────────
 
-  # redox_users 0.4 (used on Redox OS detection in dirs-next) still pins
-  # thiserror 1.x. Our workspace crates all use thiserror 2.x. Dropable
-  # when redox_users updates, or when dirs-next is replaced.
+  # winit's Wayland dependencies and dirs-next's Redox support still
+  # use thiserror 1.x. Workspace crates use 2.x. Drop when the windowing
+  # and directory-discovery stacks update their error derives.
   { crate = "thiserror@1" },
 
   # Proc-macro companion to thiserror 1.x. Tracks thiserror@1 exactly.
@@ -120,8 +95,8 @@ skip = [
   # proc-macro ecosystem syn 2 → syn 3 migration
   # ─────────────────────────────────────────────────────────────────────
 
-  # serde_derive 1.0.229 moved to syn 3 while thiserror-impl (both major
-  # lines) and most other proc-macro crates in the tree still use syn 2.
+  # serde_derive 1.0.229 uses syn 3 while tracing-attributes, UniFFI's
+  # macros and thiserror-impl 1.x still use syn 2.
   # The ecosystem split resolves upstream; dropable once every proc-macro
   # dependency has migrated and the tree converges on one syn major.
   { crate = "syn@2" },
@@ -137,13 +112,12 @@ skip = [
   { crate = "miniz_oxide@0.8" },
 
   # ─────────────────────────────────────────────────────────────────────
-  # Windows platform crates 0.52 (serialport + ring on Windows)
+  # Windows platform crates 0.52
   # ─────────────────────────────────────────────────────────────────────
   #
-  # serialport 4.x uses windows-sys 0.52 for Windows serial APIs.
-  # ring (rustls crypto) also pulls windows-sys 0.52 on Windows.
+  # serialport, winit and glutin use windows-sys 0.52 for Windows APIs.
   # Newer crates use windows-sys 0.61, built on the unified
-  # `windows-link` crate. Dropable when serialport/ring upgrade.
+  # `windows-link` crate. Drop when serialport, winit and glutin update.
 
   { crate = "windows-sys@0.52" },
 
@@ -159,74 +133,57 @@ skip = [
   # graphs. None are security-sensitive: all have the security
   # advisories checked separately by `cargo-audit`.
 
-  # winit 0.30 uses calloop 0.13 on wayland/X11; smithay-client-
-  # toolkit 0.19 (wayland toolkit) uses calloop 0.14 through a
-  # different path. Drop when winit bumps.
+  # winit uses smithay-client-toolkit 0.19 and calloop 0.13; egui's
+  # clipboard support uses the 0.20 toolkit and calloop 0.14 through
+  # smithay-clipboard. Drop when winit updates its Wayland stack.
   { crate = "calloop@0.13" },
   { crate = "calloop-wayland-source@0.3" },
   { crate = "smithay-client-toolkit@0.19" },
 
-  # cpal on macOS uses core-foundation 0.9; winit 0.30 uses 0.10.
-  # Drop when cpal updates to objc2-based path.
+  # winit 0.30 and its core-graphics bindings use core-foundation 0.9;
+  # serialport and rustls-platform-verifier use 0.10. Drop when winit
+  # and core-graphics update their bindings.
   { crate = "core-foundation@0.9" },
 
-  # winit 0.30 and eframe 0.29 use objc2 0.5 with its 0.2 app-kit and
-  # foundation bindings; arboard, glutin and webbrowser use objc2 0.6.
-  # Drop when winit and eframe move to 0.6.
+  # winit 0.30 uses objc2 0.5 with its 0.2 app-kit and foundation
+  # bindings; eframe, glutin and CPAL use objc2 0.6. Drop when winit
+  # updates to the newer bindings.
   { crate = "objc2@0.5" },
   { crate = "objc2-app-kit@0.2" },
   { crate = "objc2-foundation@0.2" },
+  { crate = "block2@0.5" },
 
-  # rand_core 0.6 chain uses getrandom 0.2; newer deps use 0.3.
-  { crate = "getrandom@0.2" },
-
-  # UniFFI 0.31 (lodestar-core Rust↔Swift FFI) pulls getrandom 0.4;
-  # older workspace crates still use 0.3. Drop when those upgrade.
+  # ahash and wezterm-blob-leases use getrandom 0.3; tempfile and
+  # jobserver use 0.4. Drop when the older consumers update.
   { crate = "getrandom@0.3" },
 
-  # toml 0.8 chain (stargazer direct + the toml_edit / toml_datetime
-  # / winnow that 0.8 pulls); UniFFI 0.31's uniffi_bindgen / trybuild
-  # pull the toml 0.9 / 1.1 chain which brings serde_spanned 1.x,
-  # toml_datetime 0.7, winnow 1.0. Drop whichever entries resolve
-  # when stargazer bumps toml or uniffi converges on one toml
-  # major.
-  { crate = "serde_spanned@0.6" },
-  { crate = "toml@0.8" },
-  { crate = "toml_datetime@0.6" },
-  { crate = "winnow@0.7" },
+  # ratatui uses itertools 0.14 while egui uses 0.15. Drop when the
+  # terminal UI stack updates its requirement.
+  { crate = "itertools@0.14" },
 
-  # scraper 0.22 uses itertools 0.13; multiple newer deps (including
-  # egui_extras) use 0.14. Drop when scraper updates.
-  { crate = "itertools@0.13" },
+  # Wayland clipboard MIME detection uses petgraph's hashbrown 0.15
+  # and foldhash 0.1; indexmap and the UI stacks use hashbrown 0.17
+  # and foldhash 0.2. Drop when petgraph updates its hash table.
+  { crate = "hashbrown@0.15" },
+  { crate = "foldhash@0.1" },
 
-  # rustix 0.38 chain from tokio-uring / mio-serial; rustix 1.x is
-  # pulled by winit. Drop when mio-serial updates.
+  # UniFFI's weedle2 parser uses nom 7; pcap-parser and the clipboard
+  # MIME detector use nom 8. Drop when weedle2 updates its parser.
+  { crate = "nom@7" },
+
+  # winit and its Wayland dependencies use rustix 0.38; the REPL and
+  # newer platform dependencies use 1.x. Drop when winit and its
+  # Wayland stack update.
   { crate = "rustix@0.38" },
   { crate = "linux-raw-sys@0.4" },
 
-  # shlex two-major duplicate, both BUILD-TIME only: bindgen pulls
-  # shlex 1.x, cc pulls shlex 2.x. No runtime code. Skip the older
-  # 1.x side; dropable when bindgen upgrades to shlex 2. Skip the
-  # whole major so patch bumps in a fresh lockfile stay covered.
-  { crate = "shlex@1" },
-
-  # windows-sys 0.59 from accesskit/winit coexists with 0.61 from newer
-  # deps.
+  # rustix 0.38 uses windows-sys 0.59 while newer platform crates use
+  # 0.61. Drop when the older rustix consumers update.
   { crate = "windows-sys@0.59" },
-  # windows-core 0.54 from older winit path; 0.62 from newer.
-  { crate = "windows-core@0.54" },
-  { crate = "windows-result@0.1" },
 
-  # ─────────────────────────────────────────────────────────────────────
-  # reqwest HTTP stack (reqwest → hyper-util)
-  # ─────────────────────────────────────────────────────────────────────
-
-  # reqwest 0.12 uses base64 0.22 directly while hyper-util 0.1.21, which
-  # reqwest also depends on, moved to base64 0.23. Both copies sit under
-  # reqwest, reached from dstar-gateway and stargazer. Skip the whole 0.22
-  # line so patch bumps in a fresh lockfile stay covered; dropable when
-  # reqwest moves to base64 0.23.
-  { crate = "base64@0.22" },
+  # serialport's io-kit-sys uses mach2 0.4 while CPAL uses 0.6. Drop
+  # when io-kit-sys updates its Mach API bindings.
+  { crate = "mach2@0.4" },
 ]
 
 [sources]

@@ -11,14 +11,4 @@ ignore = [
   # A compatible UniFFI/Askama update does not remove it. Remove this entry
   # when that build-time dependency is replaced upstream.
   "RUSTSEC-2026-0374",
-  # RUSTSEC-2024-0436: paste is unmaintained (proc-macro crate).
-  #
-  # Pulled in transitively by `metal` → `wgpu-hal` → `wgpu-core` /
-  # `wgpu` → `egui-wgpu` → `eframe` → `sextant`. paste is a
-  # compile-time-only identifier-concatenation macro; no runtime
-  # code ships. The advisory flags maintenance status, not a
-  # vulnerability. The upstream fix is the wgpu stack migrating to
-  # `pastey` or similar; sextant's egui/wgpu versions don't ship
-  # that yet. Recheck on the next eframe/wgpu bump.
-  "RUSTSEC-2024-0436",
 ]
