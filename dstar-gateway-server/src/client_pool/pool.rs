@@ -309,11 +309,17 @@ mod tests {
         assert!(pool.insert(linked_handle(Module::C)?).await.is_none());
         assert!(pool.insert(linked_handle(Module::D)?).await.is_some());
         assert_eq!(pool.len().await, 1);
-        assert!(pool.members_of_module(Module::C).await.is_empty());
+        assert_eq!(
+            pool.members_of_module(Module::C).await,
+            Vec::<SocketAddr>::new()
+        );
         assert_eq!(pool.members_of_module(Module::D).await, [PEER]);
         assert_consistent(&pool).await;
         assert!(pool.remove(&PEER).await.is_some());
-        assert!(pool.members_of_module(Module::D).await.is_empty());
+        assert_eq!(
+            pool.members_of_module(Module::D).await,
+            Vec::<SocketAddr>::new()
+        );
         assert!(pool.remove(&PEER).await.is_none());
         assert_consistent(&pool).await;
         Ok(())
@@ -336,7 +342,10 @@ mod tests {
         drop(guard);
         assert_eq!(pool.module_of(&PEER).await, Some(Module::C));
         assert_eq!(pool.members_of_module(Module::C).await, [PEER]);
-        assert!(pool.members_of_module(Module::D).await.is_empty());
+        assert_eq!(
+            pool.members_of_module(Module::D).await,
+            Vec::<SocketAddr>::new()
+        );
         assert_consistent(&pool).await;
         Ok(())
     }
@@ -406,8 +415,14 @@ mod tests {
             0,
             "a rejected first input cannot retain client capacity"
         );
-        assert!(pool.members_of_module(Module::C).await.is_empty());
-        assert!(pool.members_of_module(Module::D).await.is_empty());
+        assert_eq!(
+            pool.members_of_module(Module::C).await,
+            Vec::<SocketAddr>::new()
+        );
+        assert_eq!(
+            pool.members_of_module(Module::D).await,
+            Vec::<SocketAddr>::new()
+        );
         assert_consistent(&pool).await;
         Ok(())
     }

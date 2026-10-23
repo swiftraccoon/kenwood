@@ -4,5 +4,4 @@ error[E0599]: no method named `build` found for struct `ReflectorConfigBuilder<M
 20 |     let _config = builder.build();
    |                           ^^^^^ method not found in `ReflectorConfigBuilder<Missing, Provided, Provided>`
    |
-   = note: the method was found for
-           - `ReflectorConfigBuilder<Provided, Provided, Provided>`
+   = note: the method was found for `ReflectorConfigBuilder<Provided, Provided, Provided>`
