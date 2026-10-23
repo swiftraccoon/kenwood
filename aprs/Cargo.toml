@@ -15,10 +15,10 @@ description = "APRS codecs, checked reports, messaging and relay algorithms"
 [dependencies]
 ax25-codec = { path = "../ax25-codec" }
 kiss-tnc = { path = "../kiss-tnc" }
-thiserror = "2"
+thiserror = "2.0.21"
 
 [dev-dependencies]
-proptest = "1"
+proptest = "1.12.0"
 
 [lints]
 workspace = true
