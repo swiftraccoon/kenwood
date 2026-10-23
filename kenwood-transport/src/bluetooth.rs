@@ -1255,12 +1255,16 @@ mod inner {
         /// This future does not yield, so a Tokio timeout cannot preempt its
         /// poll. See the [execution and cleanup contract](BluetoothTransport#execution-and-cleanup)
         /// for wait budgets, deferred reaping and independent cleanup failures.
-        async fn close(&mut self) -> Result<(), TransportError> {
-            tracing::info!(pid = ?self.child.as_ref().map(Child::id), "closing Bluetooth RFCOMM helper");
-            self.terminate_helper(true);
-            self.close_outcome
-                .unwrap_or(Err(BluetoothCloseFailure::ReapPending))
-                .map_err(|failure| TransportError::BluetoothClose { failure })
+        fn close(&mut self) -> impl Future<Output = Result<(), TransportError>> {
+            std::future::poll_fn(move |_| {
+                tracing::info!(pid = ?self.child.as_ref().map(Child::id), "closing Bluetooth RFCOMM helper");
+                self.terminate_helper(true);
+                std::task::Poll::Ready(
+                    self.close_outcome
+                        .unwrap_or(Err(BluetoothCloseFailure::ReapPending))
+                        .map_err(|failure| TransportError::BluetoothClose { failure }),
+                )
+            })
         }
     }
 

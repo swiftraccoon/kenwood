@@ -945,8 +945,8 @@ mod tests {
             std::future::pending().await
         }
 
-        async fn close(&mut self) -> Result<(), TransportError> {
-            Ok(())
+        fn close(&mut self) -> impl Future<Output = Result<(), TransportError>> {
+            std::future::ready(Ok(()))
         }
     }
 
@@ -958,19 +958,21 @@ mod tests {
     struct FailingWriteTransport;
 
     impl Transport for FailingWriteTransport {
-        async fn write(&mut self, _data: &[u8]) -> Result<(), TransportError> {
-            Err(TransportError::Write(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                WriteFailureMarker,
-            )))
+        fn write(&mut self, _data: &[u8]) -> impl Future<Output = Result<(), TransportError>> {
+            std::future::poll_fn(|_| {
+                Poll::Ready(Err(TransportError::Write(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    WriteFailureMarker,
+                ))))
+            })
         }
 
         async fn read(&mut self, _buf: &mut [u8]) -> Result<usize, TransportError> {
             std::future::pending().await
         }
 
-        async fn close(&mut self) -> Result<(), TransportError> {
-            Ok(())
+        fn close(&mut self) -> impl Future<Output = Result<(), TransportError>> {
+            std::future::ready(Ok(()))
         }
     }
 
@@ -978,16 +980,16 @@ mod tests {
     struct OversizedReadTransport;
 
     impl Transport for OversizedReadTransport {
-        async fn write(&mut self, _data: &[u8]) -> Result<(), TransportError> {
-            Ok(())
+        fn write(&mut self, _data: &[u8]) -> impl Future<Output = Result<(), TransportError>> {
+            std::future::ready(Ok(()))
         }
 
-        async fn read(&mut self, buf: &mut [u8]) -> Result<usize, TransportError> {
-            Ok(buf.len() + 1)
+        fn read(&mut self, buf: &mut [u8]) -> impl Future<Output = Result<usize, TransportError>> {
+            std::future::poll_fn(move |_| Poll::Ready(Ok(buf.len() + 1)))
         }
 
-        async fn close(&mut self) -> Result<(), TransportError> {
-            Ok(())
+        fn close(&mut self) -> impl Future<Output = Result<(), TransportError>> {
+            std::future::ready(Ok(()))
         }
     }
 

@@ -324,16 +324,9 @@ impl MockTransport {
         }
         Ok(len)
     }
-}
 
-impl Default for MockTransport {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Transport for MockTransport {
-    async fn write(&mut self, data: &[u8]) -> Result<(), TransportError> {
+    /// Apply one mock write and enqueue its scripted responses.
+    fn write_exchange(&mut self, data: &[u8]) -> Result<(), TransportError> {
         tracing::debug!(bytes = data.len(), "mock: write");
         self.writes.push(data.to_vec());
 
@@ -372,6 +365,18 @@ impl Transport for MockTransport {
         tracing::debug!(reads = response.len(), "mock: read outcomes queued");
         self.pending.extend(response);
         Ok(())
+    }
+}
+
+impl Default for MockTransport {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Transport for MockTransport {
+    fn write(&mut self, data: &[u8]) -> impl Future<Output = Result<(), TransportError>> {
+        std::future::poll_fn(move |_| std::task::Poll::Ready(self.write_exchange(data)))
     }
 
     async fn read(&mut self, buf: &mut [u8]) -> Result<usize, TransportError> {
@@ -437,19 +442,23 @@ impl Transport for MockTransport {
         }
     }
 
-    async fn close(&mut self) -> Result<(), TransportError> {
-        tracing::debug!("mock: closing transport");
-        // In-flight response bytes die with the connection, but
-        // scripted future exchanges survive: they model traffic the
-        // test expects after a reopen (reconnect flows close first).
-        self.pending.clear();
-        self.delay_started = None;
-        Ok(())
+    fn close(&mut self) -> impl Future<Output = Result<(), TransportError>> {
+        std::future::poll_fn(move |_| {
+            tracing::debug!("mock: closing transport");
+            // In-flight response bytes die with the connection, but
+            // scripted future exchanges survive: they model traffic the
+            // test expects after a reopen (reconnect flows close first).
+            self.pending.clear();
+            self.delay_started = None;
+            std::task::Poll::Ready(Ok(()))
+        })
     }
 
-    async fn reopen(&mut self) -> Result<(), TransportError> {
-        tracing::debug!("mock: reopen");
-        self.reopen_script.pop_front().unwrap_or(Ok(()))
+    fn reopen(&mut self) -> impl Future<Output = Result<(), TransportError>> {
+        std::future::poll_fn(move |_| {
+            tracing::debug!("mock: reopen");
+            std::task::Poll::Ready(self.reopen_script.pop_front().unwrap_or(Ok(())))
+        })
     }
 }
 
@@ -665,14 +674,17 @@ mod tests {
     async fn default_reopen_is_unsupported() {
         struct Bare;
         impl Transport for Bare {
-            async fn write(&mut self, _d: &[u8]) -> Result<(), TransportError> {
-                Ok(())
+            fn write(&mut self, _d: &[u8]) -> impl Future<Output = Result<(), TransportError>> {
+                std::future::ready(Ok(()))
             }
-            async fn read(&mut self, _b: &mut [u8]) -> Result<usize, TransportError> {
-                Ok(0)
+            fn read(
+                &mut self,
+                _b: &mut [u8],
+            ) -> impl Future<Output = Result<usize, TransportError>> {
+                std::future::ready(Ok(0))
             }
-            async fn close(&mut self) -> Result<(), TransportError> {
-                Ok(())
+            fn close(&mut self) -> impl Future<Output = Result<(), TransportError>> {
+                std::future::ready(Ok(()))
             }
         }
         let mut t = Bare;
@@ -681,6 +693,26 @@ mod tests {
             matches!(r, Err(TransportError::ReopenUnsupported)),
             "expected ReopenUnsupported, got {r:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn unpolled_operations_preserve_exchanges_responses_and_reopen_results() -> TestResult {
+        let mut mock = MockTransport::new();
+        mock.expect(b"ID\r", b"ID TH-D75\r");
+        mock.expect_reopen(Err(TransportError::NotFound));
+
+        drop(mock.write(b"ID\r"));
+        mock.write(b"ID\r").await?;
+
+        drop(mock.close());
+        let mut bytes = [0; 32];
+        let length = mock.read(&mut bytes).await?;
+        assert_eq!(read_prefix(&bytes, length)?, b"ID TH-D75\r");
+
+        drop(mock.reopen());
+        std::assert_matches!(mock.reopen().await, Err(TransportError::NotFound));
+        mock.assert_complete();
+        Ok(())
     }
 
     #[tokio::test]
