@@ -278,17 +278,26 @@ struct FakeModem {
 impl ModemHost for FakeModem {
     type Connection = Conn;
 
-    async fn open(&mut self, _cancelled: &AtomicBool) -> Result<Conn, ModemOpenFailure> {
-        push(&self.log, Seen::ModemOpen);
-        let (tag, mock) = self.opens.pop_front().ok_or_else(|| ModemOpenFailure {
-            source: io::Error::other("unexpected modem open").into(),
-            retry_allowed: false,
-            released: true,
-        })?;
-        Ok(Conn {
-            tag,
-            mock,
-            log: Arc::clone(&self.log),
+    fn open(
+        &mut self,
+        _cancelled: &AtomicBool,
+    ) -> impl Future<Output = Result<Conn, ModemOpenFailure>> {
+        std::future::poll_fn(move |_| {
+            push(&self.log, Seen::ModemOpen);
+            let result = self
+                .opens
+                .pop_front()
+                .map(|(tag, mock)| Conn {
+                    tag,
+                    mock,
+                    log: Arc::clone(&self.log),
+                })
+                .ok_or_else(|| ModemOpenFailure {
+                    source: io::Error::other("unexpected modem open").into(),
+                    retry_allowed: false,
+                    released: true,
+                });
+            std::task::Poll::Ready(result)
         })
     }
 

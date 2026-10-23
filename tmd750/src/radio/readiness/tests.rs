@@ -280,18 +280,21 @@ impl ControlHost for FakeHost {
             .map_or(Duration::ZERO, |elapsed| *elapsed)
     }
 
-    async fn wait(&mut self, duration: Duration) {
-        let result = self
-            .shared
-            .record(Seen::Wait(duration))
-            .and_then(|()| self.shared.advance(duration));
-        assert!(result.is_ok(), "record simulated wait: {result:?}");
-        self.waits += 1;
-        if let Some((ordinal, cancelled)) = &self.cancel_on_wait
-            && *ordinal == self.waits
-        {
-            cancelled.store(true, Ordering::Relaxed);
-        }
+    fn wait(&mut self, duration: Duration) -> impl Future<Output = ()> {
+        std::future::poll_fn(move |_| {
+            let result = self
+                .shared
+                .record(Seen::Wait(duration))
+                .and_then(|()| self.shared.advance(duration));
+            assert!(result.is_ok(), "record simulated wait: {result:?}");
+            self.waits += 1;
+            if let Some((ordinal, cancelled)) = &self.cancel_on_wait
+                && *ordinal == self.waits
+            {
+                cancelled.store(true, Ordering::Relaxed);
+            }
+            std::task::Poll::Ready(())
+        })
     }
 
     fn stage(&mut self, stage: ControlStage) {
@@ -376,7 +379,7 @@ async fn silent_id_then_matching_identity_retries_only_after_release_and_reselec
     host.assert_wire(&[&[b"ID\r"], IDENTITY_WRITES])?;
     assert_eq!(report.attempts.len(), 2, "both attempts stay in the report");
     let first = report.attempts.first().ok_or("first attempt")?;
-    assert!(!first.enumerations.is_empty());
+    assert_ne!(first.enumerations, []);
     assert!(matches!(
         first.outcome,
         ReadinessOutcome::Failed(ReadinessError::Cat(Error::Timeout { .. }))
@@ -951,11 +954,11 @@ async fn the_bounded_close_helper_reports_a_timeout_and_drops_the_connection() -
 fn the_attempt_allowances_cover_their_exchanges_and_the_close() {
     assert_eq!(
         ATTEMPT_ALLOWANCE,
-        Duration::from_millis(1_500 * 6) + Duration::from_secs(2)
+        Duration::from_secs(9) + Duration::from_secs(2)
     );
     assert_eq!(
         GATEWAY_ATTEMPT_ALLOWANCE,
-        Duration::from_millis(1_500 * 8) + Duration::from_secs(2)
+        Duration::from_secs(12) + Duration::from_secs(2)
     );
     for allowance in [ATTEMPT_ALLOWANCE, GATEWAY_ATTEMPT_ALLOWANCE] {
         assert!(can_dispatch(Duration::ZERO, allowance, allowance));

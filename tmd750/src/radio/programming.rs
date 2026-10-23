@@ -210,7 +210,7 @@ impl<T: Transport> Radio<T> {
         if reply != ENTER_RESPONSE {
             return Err(ProtocolError::EntryReply {
                 expected: String::from_utf8_lossy(ENTER_RESPONSE).into_owned(),
-                reply: String::from_utf8_lossy(&reply).into_owned(),
+                reply: String::from_utf8_lossy_owned(reply),
             }
             .into());
         }

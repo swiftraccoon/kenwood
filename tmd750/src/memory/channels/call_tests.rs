@@ -272,7 +272,7 @@ fn an_unchanged_record_plans_no_write() -> TestResult {
     let channel = CallChannel::new(CallBand::Band220, CallMode::Dv);
     let plan = CallChannelPlan::new([(channel, stored_record(&image, channel)?)])?;
     assert_eq!(plan.pages().len(), 1);
-    assert!(plan.page_replacements(&image)?.is_empty());
+    assert_eq!(plan.page_replacements(&image)?, []);
     Ok(())
 }
 

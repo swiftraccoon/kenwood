@@ -161,7 +161,7 @@ fn a_clear_writes_the_slot_a_cat_clear_leaves() -> TestResult {
     assert_eq!(after, expected);
 
     let empty = MemoryImage::from_bytes(empty_tables()?)?;
-    assert!(plan.page_replacements(&empty)?.is_empty());
+    assert_eq!(plan.page_replacements(&empty)?, []);
     Ok(())
 }
 

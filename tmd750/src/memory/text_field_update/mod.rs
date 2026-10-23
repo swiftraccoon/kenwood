@@ -12,7 +12,7 @@
 
 use std::fmt;
 use std::num::NonZeroU64;
-use std::ops::Range;
+use std::range::Range;
 
 pub use channel::ChannelNameText;
 pub use my1::{ControlPage, My1Callsign, PmOffGatewayFinal, PmOffGatewayFresh, PmOffGatewayGuards};
@@ -296,7 +296,7 @@ fn replace_field(
     desired: &[u8],
     unchanged: bool,
 ) -> Result<[u8; PAGE_SIZE], TextFieldUpdateError> {
-    if original.get(range.clone()) != Some(expected) {
+    if original.get(range) != Some(expected) {
         return Err(TextFieldUpdateError::CurrentValueMismatch);
     }
     if unchanged {

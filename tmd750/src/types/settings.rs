@@ -1322,7 +1322,7 @@ impl RealTimeClock {
                 digits: Self::WIRE_DIGITS,
             });
         }
-        let mut pairs = text.as_bytes().chunks_exact(2).map(|pair| {
+        let mut pairs = text.as_bytes().as_chunks::<2>().0.iter().map(|pair| {
             pair.iter()
                 .fold(0_u8, |value, byte| value * 10 + (byte - b'0'))
         });

@@ -75,9 +75,14 @@ impl ControlHost for Host {
         self.elapsed += duration;
     }
 
-    async fn close(&mut self, connection: MockTransport) -> Result<(), CloseFailure> {
-        connection.assert_complete();
-        Ok(())
+    fn close(
+        &mut self,
+        connection: MockTransport,
+    ) -> impl Future<Output = Result<(), CloseFailure>> {
+        std::future::poll_fn(move |_| {
+            connection.assert_complete();
+            std::task::Poll::Ready(Ok(()))
+        })
     }
 
     fn stage(&mut self, stage: ControlStage) {

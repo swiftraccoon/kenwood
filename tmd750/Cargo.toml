@@ -9,7 +9,7 @@ license = "GPL-2.0-or-later"
 publish = false
 readme = "README.md"
 repository = "https://github.com/swiftraccoon/kenwood"
-rust-version = "1.94"
+rust-version = "1.99"
 description = "Async Rust library for the Kenwood TM-D750: identity, MCP region programming, and manifest-driven menu fields per Programmable-Memory slot"
 
 [dependencies]

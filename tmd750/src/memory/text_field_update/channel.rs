@@ -179,7 +179,7 @@ impl TextFieldUpdate<ChannelNameText, NoGuards> {
         let offset = channel.name_address() - page.address().as_usize();
         let desired_page = replace_field(
             &original,
-            offset..offset + CHANNEL_NAME_SIZE,
+            (offset..offset + CHANNEL_NAME_SIZE).into(),
             &encode_field(expected_current),
             &encode_field(desired),
             expected_current == desired,

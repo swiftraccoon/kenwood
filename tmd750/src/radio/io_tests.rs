@@ -81,8 +81,8 @@ impl Transport for TestTransport {
         Ok(count)
     }
 
-    async fn close(&mut self) -> Result<(), TransportError> {
-        Ok(())
+    fn close(&mut self) -> impl Future<Output = Result<(), TransportError>> {
+        std::future::ready(Ok(()))
     }
 }
 
@@ -428,9 +428,11 @@ impl HeldTransport {
 }
 
 impl Transport for HeldTransport {
-    async fn write(&mut self, _bytes: &[u8]) -> Result<(), TransportError> {
-        self.pending = self.replies.pop_front();
-        Ok(())
+    fn write(&mut self, _bytes: &[u8]) -> impl Future<Output = Result<(), TransportError>> {
+        std::future::poll_fn(move |_| {
+            self.pending = self.replies.pop_front();
+            std::task::Poll::Ready(Ok(()))
+        })
     }
 
     async fn read(&mut self, buffer: &mut [u8]) -> Result<usize, TransportError> {
@@ -445,8 +447,8 @@ impl Transport for HeldTransport {
         Ok(count)
     }
 
-    async fn close(&mut self) -> Result<(), TransportError> {
-        Ok(())
+    fn close(&mut self) -> impl Future<Output = Result<(), TransportError>> {
+        std::future::ready(Ok(()))
     }
 }
 

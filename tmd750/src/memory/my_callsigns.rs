@@ -87,7 +87,7 @@ impl MyCallsignList {
         }
         let mut decoded = Vec::with_capacity(ENTRY_COUNT as usize);
         for (number, entry) in (DstarSlot::MIN..=DstarSlot::MAX)
-            .zip(entries.chunks_exact(MY_CALLSIGN_ENTRY_SIZE as usize))
+            .zip(entries.as_chunks::<{ MY_CALLSIGN_ENTRY_SIZE as usize }>().0)
         {
             let (callsign, memo) = entry.split_at(CALLSIGN_SIZE);
             decoded.push(DstarCallsignEntry::new(

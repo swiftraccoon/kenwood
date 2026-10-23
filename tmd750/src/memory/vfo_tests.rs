@@ -180,7 +180,7 @@ fn slot_zero_decodes_to_what_fo_reported() -> TestResult {
             (lower, end)
         );
     }
-    assert!(memory.page_replacements(&image)?.is_empty());
+    assert_eq!(memory.page_replacements(&image)?, []);
     Ok(())
 }
 

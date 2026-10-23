@@ -61,14 +61,19 @@ impl Connection {
 }
 
 impl Transport for Connection {
-    async fn write(&mut self, bytes: &[u8]) -> Result<(), TransportError> {
-        record(&self.log, Seen::Write(self.id, bytes.to_vec()))?;
-        if bytes != GET_VERSION {
-            return Err(TransportError::Write(io::Error::other(
-                "only GET_VERSION belongs in this transition",
-            )));
-        }
-        Ok(())
+    fn write(&mut self, bytes: &[u8]) -> impl Future<Output = Result<(), TransportError>> {
+        std::future::poll_fn(move |_| {
+            let result = record(&self.log, Seen::Write(self.id, bytes.to_vec())).and_then(|()| {
+                if bytes == GET_VERSION {
+                    Ok(())
+                } else {
+                    Err(TransportError::Write(io::Error::other(
+                        "only GET_VERSION belongs in this transition",
+                    )))
+                }
+            });
+            std::task::Poll::Ready(result)
+        })
     }
 
     async fn read(&mut self, bytes: &mut [u8]) -> Result<usize, TransportError> {
@@ -152,11 +157,16 @@ fn open_failure(message: &str, retry_allowed: bool) -> ModemOpenFailure {
 impl ModemHost for FakeHost {
     type Connection = Connection;
 
-    async fn open(&mut self, _cancelled: &AtomicBool) -> Result<Connection, ModemOpenFailure> {
-        Err(open_failure(
-            "the transition reopens; it never performs the initial open",
-            false,
-        ))
+    fn open(
+        &mut self,
+        _cancelled: &AtomicBool,
+    ) -> impl Future<Output = Result<Connection, ModemOpenFailure>> {
+        std::future::poll_fn(|_| {
+            std::task::Poll::Ready(Err(open_failure(
+                "the transition reopens; it never performs the initial open",
+                false,
+            )))
+        })
     }
 
     async fn reopen(

@@ -260,7 +260,7 @@ async fn guarded_backup_requires_gateway_off_without_a_second_identity() -> Test
             }
         ));
         assert_eq!(report.exit, McpProbeExit::NotEntered);
-        assert!(report.segments.is_empty());
+        assert_eq!(report.segments, []);
         let mock = radio.into_transport();
         assert_eq!(mock.writes().len(), 4);
         mock.assert_complete();
@@ -493,8 +493,8 @@ async fn cancellation_before_identity_or_entry_never_enters_programming() -> Tes
         assert_eq!(report.exit, McpProbeExit::NotEntered);
         assert_eq!(report.identity.is_some(), after_identity);
         assert!(report.entry_reply.is_none());
-        assert!(report.segments.is_empty());
-        assert!(progress.is_empty());
+        assert_eq!(report.segments, []);
+        assert_eq!(progress, []);
         let transport = radio.into_transport();
         assert_eq!(transport.writes().len(), if after_identity { 3 } else { 0 });
         transport.assert_complete();
@@ -552,7 +552,7 @@ async fn rejected_entry_keeps_identity_and_sends_no_page_or_exit() -> TestResult
     ));
     assert!(report.identity.is_some());
     assert!(report.entry_reply.is_none());
-    assert!(report.segments.is_empty());
+    assert_eq!(report.segments, []);
     assert_eq!(report.exit, McpProbeExit::RecoveryRequired);
     assert_protocol_is_blocked(&mut radio).await;
     let transport = radio.into_transport();

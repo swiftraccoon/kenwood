@@ -59,7 +59,7 @@ fn home() -> Result<StoredPosition, Box<dyn std::error::Error>> {
 #[test]
 fn an_empty_memory_lists_no_positions() -> TestResult {
     let memory = PositionMemory::read(&MemoryImage::from_bytes(image(&[], &[])?)?)?;
-    assert!(memory.entries().is_empty());
+    assert_eq!(memory.entries(), []);
     Ok(())
 }
 
@@ -152,10 +152,10 @@ fn a_write_stores_the_positions_compactly_in_order() -> TestResult {
     let reread = PositionMemory::read(&MemoryImage::from_bytes(after)?)?;
     assert_eq!(reread, memory);
 
-    assert!(
+    assert_eq!(
         PositionMemory::read(&MemoryImage::from_bytes(expected.clone())?)?
-            .page_replacements(&MemoryImage::from_bytes(expected)?)?
-            .is_empty()
+            .page_replacements(&MemoryImage::from_bytes(expected)?)?,
+        []
     );
     Ok(())
 }

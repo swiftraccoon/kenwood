@@ -102,7 +102,7 @@ fn an_edit_rewrites_only_its_entry_in_the_page() -> TestResult {
     let mut tables = MicETypeCodeTables::read(&image)?;
     assert_eq!(tables.get(MicEFamily::Yaesu, 2), Some(&stored));
     assert_eq!(tables.get(MicEFamily::Yaesu, 1), None);
-    assert!(tables.page_replacements(&image)?.is_empty());
+    assert_eq!(tables.page_replacements(&image)?, []);
     let added = MicETypeCode::new('*', "TM-D750")?;
     tables.set(MicEFamily::KenwoodMobile, 4, Some(added))?;
     let replacements = tables.page_replacements(&image)?;
@@ -118,7 +118,7 @@ fn an_edit_rewrites_only_its_entry_in_the_page() -> TestResult {
         .filter(|(_, (before, after))| before != after)
         .map(|(offset, _)| 0x800 + offset)
         .collect();
-    assert!(!changed.is_empty());
+    assert_ne!(changed, Vec::<usize>::new());
     assert!(
         changed
             .iter()
@@ -126,7 +126,7 @@ fn an_edit_rewrites_only_its_entry_in_the_page() -> TestResult {
         "{changed:X?}"
     );
     tables.set(MicEFamily::KenwoodMobile, 4, None)?;
-    assert!(tables.page_replacements(&image)?.is_empty());
+    assert_eq!(tables.page_replacements(&image)?, []);
     assert_eq!(
         tables.set(MicEFamily::Yaesu, MIC_E_TABLE_ENTRIES, None),
         Err(MicETypeCodeError::PositionOutOfRange { position: 5 })

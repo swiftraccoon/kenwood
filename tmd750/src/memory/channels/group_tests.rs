@@ -117,7 +117,7 @@ fn a_plan_rewrites_only_its_groups_names() -> TestResult {
 
     let unchanged = GroupNamePlan::new([(group(29)?, ChannelNameText::new("GRP-29")?)])?;
     assert_eq!(unchanged.pages().len(), 1);
-    assert!(unchanged.page_replacements(&image)?.is_empty());
+    assert_eq!(unchanged.page_replacements(&image)?, []);
     Ok(())
 }
 
@@ -186,7 +186,7 @@ fn a_group_plan_rewrites_the_group_byte_of_stored_channels() -> TestResult {
     }
     assert_eq!(changed, [(0x2016, 12), (0x2F8E, 29)]);
     let unchanged = ChannelGroupPlan::new([(channel(995)?, group(9)?)])?;
-    assert!(unchanged.page_replacements(&image)?.is_empty());
+    assert_eq!(unchanged.page_replacements(&image)?, []);
     Ok(())
 }
 

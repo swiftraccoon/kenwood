@@ -174,7 +174,7 @@ async fn unexpected_entry_does_not_issue_a_read_or_exit() {
         "{report:?}"
     );
     assert_eq!(report.exit, McpProbeExit::RecoveryRequired);
-    assert!(report.segments.is_empty());
+    assert_eq!(report.segments, []);
     radio.into_transport().assert_complete();
 }
 
@@ -199,7 +199,7 @@ async fn partial_read_timeout_retains_identity_without_sending_exit() -> TestRes
     );
     assert_eq!(report.exit, McpProbeExit::RecoveryRequired);
     assert!(report.identity.is_some());
-    assert!(report.segments.is_empty());
+    assert_eq!(report.segments, []);
     radio.into_transport().assert_complete();
     Ok(())
 }

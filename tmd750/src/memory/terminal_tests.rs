@@ -9,7 +9,7 @@ type TestResult = Result<(), Box<dyn std::error::Error>>;
 fn a_ready_capture_reads_with_no_findings() -> TestResult {
     let slot = SlotIndex::new(0)?;
     let report = read(&fixture(slot)?, slot)?;
-    assert!(report.findings.is_empty());
+    assert_eq!(report.findings, []);
     Ok(())
 }
 

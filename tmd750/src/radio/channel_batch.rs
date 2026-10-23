@@ -27,7 +27,7 @@ pub struct ChannelBatchError {
     /// The channel whose write or clear failed; its state is unknown.
     pub failed: MemoryChannelAddress,
     /// The failure.
-    pub source: Error,
+    pub source: Box<Error>,
 }
 
 impl<T: Transport> Radio<T> {
@@ -63,7 +63,7 @@ impl<T: Transport> Radio<T> {
                     return Err(ChannelBatchError {
                         completed,
                         failed: *address,
-                        source,
+                        source: Box::new(source),
                     });
                 }
             }

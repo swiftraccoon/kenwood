@@ -549,7 +549,7 @@ async fn late_guard_conflict_prevents_writes_including_exact_restoration() -> Te
             matches!(result, Err(TerminalPlanError::Operation(Error::Mcp(McpError::Interrupted { source, .. }))) if matches!(*source, Error::Mcp(McpError::CompareMismatch { offset: 255, .. })))
         );
         assert_eq!(callbacks, 0);
-        assert!(session.journal().possibly_written.is_empty());
+        assert_eq!(session.journal().possibly_written, []);
         assert!(session.is_ready());
         session.exit().await?;
         radio.into_transport().assert_complete();
@@ -607,7 +607,7 @@ async fn failed_journal_callback_sends_no_write_and_preserves_ready_exit() -> Te
     assert!(
         matches!(result, Err(TerminalPlanError::Operation(Error::Mcp(McpError::Interrupted { source, .. }))) if matches!(*source, Error::Mcp(McpError::IntentJournal { .. })))
     );
-    assert!(session.journal().possibly_written.is_empty());
+    assert_eq!(session.journal().possibly_written, []);
     assert!(session.is_ready());
     session.exit().await?;
     radio.into_transport().assert_complete();
@@ -640,9 +640,9 @@ async fn satisfied_terminal_plan_compares_all_guards_without_intent_or_writes() 
     assert_eq!(callbacks, 0);
     assert_eq!(report.compared_pages.len(), 4);
     assert_eq!(report.unchanged_pages, report.compared_pages);
-    assert!(report.verified_pages.is_empty());
-    assert!(session.journal().possibly_written.is_empty());
-    assert!(session.journal().verified.is_empty());
+    assert_eq!(report.verified_pages, []);
+    assert_eq!(session.journal().possibly_written, []);
+    assert_eq!(session.journal().verified, []);
     session.exit().await?;
     radio.into_transport().assert_complete();
     Ok(())
@@ -677,7 +677,7 @@ async fn missing_write_ack_retains_debt_and_forbids_readback_exit_and_retry() ->
         )))
     ));
     assert_eq!(session.journal().possibly_written, [changed.page()]);
-    assert!(session.journal().verified.is_empty());
+    assert_eq!(session.journal().verified, []);
     assert!(!session.is_ready());
     assert!(matches!(
         session
@@ -721,7 +721,7 @@ async fn complete_readback_mismatch_retains_debt_but_permits_clean_exit() -> Tes
         matches!(result, Err(TerminalPlanError::Operation(Error::Mcp(McpError::Interrupted { possibly_written: 1, verified: 0, source, .. }))) if matches!(*source, Error::Mcp(McpError::VerifyMismatch { offset: 255, .. })))
     );
     assert_eq!(session.journal().possibly_written, [changed.page()]);
-    assert!(session.journal().verified.is_empty());
+    assert_eq!(session.journal().verified, []);
     assert!(session.is_ready());
     session.exit().await?;
     radio.into_transport().assert_complete();

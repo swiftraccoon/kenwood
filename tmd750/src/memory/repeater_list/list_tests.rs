@@ -393,13 +393,13 @@ fn re_encoding_a_stored_list_changes_no_page() -> TestResult {
     let kind = RepeaterListKind::Repeater;
     let captured = three_records(kind)?;
     let list = RepeaterList::read(&captured, kind)?;
-    assert!(list.page_replacements(&captured)?.is_empty());
+    assert_eq!(list.page_replacements(&captured)?, []);
     let rebuilt = RepeaterList::from_records(
         kind,
         list.iter().map(|(_, record)| record.clone()).collect(),
     )?;
     assert_eq!(rebuilt, list);
-    assert!(rebuilt.page_replacements(&captured)?.is_empty());
+    assert_eq!(rebuilt.page_replacements(&captured)?, []);
 
     let reordered = image(
         kind,
@@ -612,10 +612,9 @@ fn renamed_table_entries_rewrite_only_their_pages() -> TestResult {
         reread.group(GroupIndex::new(299)?).to_string(),
         "Last group"
     );
-    assert!(
-        RepeaterNames::read(&captured)?
-            .page_replacements(&captured)?
-            .is_empty()
+    assert_eq!(
+        RepeaterNames::read(&captured)?.page_replacements(&captured)?,
+        []
     );
     Ok(())
 }

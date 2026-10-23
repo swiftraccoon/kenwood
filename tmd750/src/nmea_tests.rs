@@ -301,7 +301,7 @@ fn direct_and_fragmented_sentence_limits_reserve_the_wire_terminator() -> TestRe
 #[test]
 fn unterminated_noise_stays_bounded_and_recovers_at_its_terminator() -> TestResult {
     let mut reader = LineReader::new();
-    assert!(reader.push(&vec![b'X'; 1_000_000]).is_empty());
+    assert_eq!(reader.push(&vec![b'X'; 1_000_000]), []);
     assert!(
         reader.line.len() <= 80,
         "noise cannot grow the partial-line allocation"

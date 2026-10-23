@@ -201,7 +201,7 @@ fn read_places_each_stored_channel_and_an_edit_rewrites_only_its_fields() -> Tes
         .filter(|&&slot| memories.dtmf(slot).is_none() && memories.echolink(slot).is_none())
         .count();
     assert_eq!(unused, 8);
-    assert!(memories.page_replacements(&image)?.is_empty());
+    assert_eq!(memories.page_replacements(&image)?, []);
 
     memories.set_echolink(channel(0)?, Some(EchoLinkMemoryEntry::new("K", "7")?));
     let replacements = memories.page_replacements(&image)?;

@@ -274,7 +274,7 @@ impl TextFieldUpdate<My1Callsign, Guards> {
         validate_stored_guards(&original, &control)?;
         let desired = replace_field(
             &original,
-            FIELD_OFFSET..FIELD_OFFSET + FIELD_LENGTH,
+            (FIELD_OFFSET..FIELD_OFFSET + FIELD_LENGTH).into(),
             &encode_field(fields.callsign, expected_current)?,
             &encode_field(fields.callsign, requested)?,
             expected_current == requested,

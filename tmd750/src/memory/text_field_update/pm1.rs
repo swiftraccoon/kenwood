@@ -161,7 +161,7 @@ impl TextFieldUpdate<Pm1Name, NoGuards> {
             - page.address().as_usize();
         let desired_page = replace_field(
             &original,
-            offset..offset + FIELD_LENGTH,
+            (offset..offset + FIELD_LENGTH).into(),
             &encode_name(field, expected_current)?,
             &encode_name(field, desired)?,
             expected_current == desired,

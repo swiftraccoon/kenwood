@@ -78,7 +78,7 @@ fn a_cleared_name_stores_sixteen_nul_bytes_and_an_unchanged_one_plans_no_write()
         Some(&[0; CHANNEL_NAME_SIZE][..])
     );
     let unchanged = ChannelNamePlan::new([(channel(17)?, name("Kept")?), (channel(18)?, None)])?;
-    assert!(unchanged.page_replacements(&captured)?.is_empty());
+    assert_eq!(unchanged.page_replacements(&captured)?, []);
     Ok(())
 }
 

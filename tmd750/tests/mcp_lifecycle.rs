@@ -235,9 +235,9 @@ async fn another_firmware_refuses_all_page_traffic_and_leaves_empty_journal() ->
             if actual.firmware.as_str() == "1.03"),
         "{result:?}"
     );
-    assert!(session.journal().possibly_written.is_empty());
-    assert!(session.journal().verified.is_empty());
-    assert!(progress.is_empty());
+    assert_eq!(session.journal().possibly_written, []);
+    assert_eq!(session.journal().verified, []);
+    assert_eq!(progress, []);
     assert!(session.is_ready());
     session.exit().await?;
     let mock = radio.into_transport();
@@ -366,7 +366,7 @@ async fn cancelled_memory_write_retains_journal_and_refuses_exit() -> TestResult
     let mut session = radio.enter_mcp().await?;
     cancel_pending(session.compare_exchange_pages(&[replacement], |_| Ok(()), |_| {})).await;
     assert_eq!(session.journal().possibly_written, [page]);
-    assert!(session.journal().verified.is_empty());
+    assert_eq!(session.journal().verified, []);
     assert!(!session.is_ready());
     let result = session.exit().await;
     assert!(

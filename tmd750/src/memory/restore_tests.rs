@@ -83,12 +83,8 @@ fn a_restore_writes_every_page_whose_bytes_differ() -> TestResult {
             (0x1_0110, 0x00, b'B')
         ]
     );
-    assert!(plan.kept().is_empty());
-    assert!(
-        RestorePlan::new(&current, &current)?
-            .replacements()
-            .is_empty()
-    );
+    assert_eq!(plan.kept(), []);
+    assert_eq!(RestorePlan::new(&current, &current)?.replacements(), []);
     Ok(())
 }
 
@@ -163,7 +159,7 @@ fn every_lifecycle_field_in_every_slot_is_kept() -> TestResult {
     let plan = RestorePlan::new(&current, &target)?;
     assert_eq!(plan.kept().len(), kept);
     let changed = changes(&plan);
-    assert!(!changed.is_empty());
+    assert_ne!(changed, Vec::<(u32, u8, u8)>::new());
     for (address, before, after) in changed {
         let mask = partial
             .get(&address)
@@ -196,7 +192,7 @@ fn a_d750_file_restores_the_standard_bytes_it_holds() -> TestResult {
     assert_eq!(file.header().radio_type_bytes(), *b"K21");
     let plan = RestorePlan::from_d750(&current, &file)?;
     assert_eq!(changes(&plan), [(0x40, 0x00, 0x31)]);
-    assert!(plan.kept().is_empty());
+    assert_eq!(plan.kept(), []);
     Ok(())
 }
 

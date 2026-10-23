@@ -594,7 +594,7 @@ async fn changed_firmware_refuses_before_entry() -> TestResult {
         result.err().and_then(|error| error.operation),
         Some(TerminalOperationError::Identity { .. })
     ));
-    assert!(events.is_empty());
+    assert_eq!(events, []);
     Ok(())
 }
 
@@ -672,7 +672,7 @@ async fn inconsistent_restoration_admission_fails_before_identity() -> TestResul
         result.err().and_then(|error| error.operation),
         Some(TerminalOperationError::RestorationMismatch)
     ));
-    assert!(events.is_empty());
+    assert_eq!(events, []);
     Ok(())
 }
 

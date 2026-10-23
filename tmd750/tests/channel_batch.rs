@@ -125,7 +125,7 @@ async fn a_batch_stops_at_its_first_failure_and_reports_what_finished() -> TestR
     assert_eq!(failed, second);
     assert!(
         matches!(
-            source,
+            source.as_ref(),
             Error::Protocol(ProtocolError::NotAvailable {
                 command: CommandName::Me
             })
