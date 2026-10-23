@@ -27,16 +27,16 @@ default = []
 
 [dependencies]
 aprs = { path = "../aprs" }
-async-trait = "0.1"
+async-trait = "0.1.92"
 ax25-codec = { path = "../ax25-codec" }
 if-dsp = { path = "../if-dsp" }
 kenwood-schema = { path = "../kenwood-schema" }
 kenwood-thd75 = { path = "../thd75" }
 kenwood-transport = { path = "../kenwood-transport", default-features = false }
 kiss-tnc = { path = "../kiss-tnc" }
-thiserror = "2"
-tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
-uniffi = { version = "0.31", features = ["tokio"] }
+thiserror = "2.0.21"
+tokio = { version = "1.54.1", features = ["macros", "rt", "sync", "time"] }
+uniffi = { version = "0.32.2", features = ["tokio"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 kenwood-transport = { path = "../kenwood-transport", default-features = false, features = [

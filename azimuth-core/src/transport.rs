@@ -36,7 +36,7 @@ pub enum ByteTransportError {
 /// propagates failure; it must never select another device. Empty writes and
 /// zero-length reads are no-ops. Implementations must serialize their native
 /// I/O safely and make `close` idempotent.
-#[uniffi::export(with_foreign)]
+#[uniffi::export(rust, foreign)]
 #[async_trait]
 pub trait ByteTransport: Send + Sync + std::fmt::Debug {
     /// Write every byte to the radio's USB CDC stream.
