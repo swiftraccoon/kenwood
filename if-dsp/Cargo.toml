@@ -8,7 +8,7 @@ keywords = ["dsp", "sdr", "ssb", "ham-radio", "amateur-radio"]
 license = "GPL-2.0-or-later"
 publish = false
 repository = "https://github.com/swiftraccoon/kenwood"
-rust-version = "1.94"
+rust-version = "1.99"
 description = "Sans-io filtering and demodulation for low-IF audio streams"
 
 [dependencies]

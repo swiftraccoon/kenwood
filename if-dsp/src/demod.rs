@@ -151,7 +151,8 @@ impl AmDemod {
         out.clear();
         for &x in input {
             let env = self.lpf.push(x).norm();
-            self.dc += self.dc_alpha * (env - self.dc);
+            let dc_step = self.dc_alpha * (env - self.dc);
+            self.dc += dc_step;
             out.push(env - self.dc);
         }
     }

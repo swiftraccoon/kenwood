@@ -383,8 +383,10 @@ mod tests {
         for (n, &t) in taps.iter().enumerate() {
             #[expect(clippy::cast_precision_loss, reason = "small tap indices")]
             let ph = omega * n as f64;
-            re += f64::from(t) * ph.cos();
-            im -= f64::from(t) * ph.sin();
+            let real_component = f64::from(t) * ph.cos();
+            let imaginary_component = f64::from(t) * ph.sin();
+            re += real_component;
+            im -= imaginary_component;
         }
         re.hypot(im)
     }

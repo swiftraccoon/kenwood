@@ -45,7 +45,8 @@ where
         let mut sum = 0.0_f64;
         let mut sign = 1.0_f64;
         for sample in samples {
-            sum += sign * f64::from(*sample.borrow());
+            let signed_sample = sign * f64::from(*sample.borrow());
+            sum += signed_sample;
             sign = -sign;
             count += 1.0;
         }
@@ -55,7 +56,8 @@ where
     let coeff = 2.0 * omega.cos();
     let (mut s1, mut s2) = (0.0_f64, 0.0_f64);
     for sample in samples {
-        let s0 = f64::from(*sample.borrow()) + coeff * s1 - s2;
+        let feedback = coeff * s1;
+        let s0 = f64::from(*sample.borrow()) + feedback - s2;
         s2 = s1;
         s1 = s0;
         count += 1.0;
@@ -226,9 +228,7 @@ impl SpectrumEstimator {
     /// Discard partial input, powers and segment count, retaining all allocations.
     pub fn reset(&mut self) {
         self.pending.clear();
-        for a in &mut self.acc {
-            *a = 0.0;
-        }
+        self.acc.fill(0.0);
         self.segments = 0;
     }
 }

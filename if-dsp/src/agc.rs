@@ -159,7 +159,8 @@ impl Agc {
             } else {
                 self.decay
             };
-            self.env += coeff * (a - self.env);
+            let envelope_step = coeff * (a - self.env);
+            self.env += envelope_step;
             let gain = (self.target / self.env.max(1e-6)).min(self.max_gain);
             *s *= gain;
         }
