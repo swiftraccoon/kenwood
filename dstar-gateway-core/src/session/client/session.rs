@@ -591,7 +591,7 @@ mod tests {
     #[test]
     fn diagnostics_drain_starts_empty() {
         let mut session = new_dextra_configured();
-        assert!(session.diagnostics().is_empty());
+        assert_eq!(session.diagnostics(), []);
     }
 
     // ─── Voice TX on Session<P, Connected> ─────────────────────

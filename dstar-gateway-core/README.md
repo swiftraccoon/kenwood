@@ -22,6 +22,8 @@ This executable example exchanges bytes with a codec-generated peer and
 performs no network I/O:
 
 ```rust
+use std::assert_matches;
+
 use dstar_gateway_core::{
     Callsign, Configured, DExtra, Driver, DstarHeader, Event, FrameSequence,
     Module, RelayRouting, RepeaterIdentity, RoutingCallsign, Session, StreamId, Suffix, VoiceFrame,
@@ -48,7 +50,7 @@ let local = RepeaterIdentity { callsign: station, module: Module::B };
 let length = dextra::encode_connect_ack(&mut reply, local, Module::C)?;
 connecting.handle_input(now, peer, reply.get(..length).ok_or("ACK length")?)?;
 let mut connected = connecting.promote()?;
-assert!(matches!(connected.poll_event(), Some(Event::Connected { .. })));
+assert_matches!(connected.poll_event(), Some(Event::Connected { .. }));
 
 let header = DstarHeader::for_relay(RelayRouting {
     operator: station,
@@ -202,6 +204,6 @@ document radio firmware and interface contracts separately.
 
 The workspace [contributor workflow](https://github.com/swiftraccoon/kenwood/blob/main/CONTRIBUTING.md)
 defines validation. Unit, golden-wire, property, compile-fail and doctest
-suites run on pinned Rust 1.94.0. The independent fuzz workspace has ten
+suites run on pinned Rust 1.99.1. The independent fuzz workspace has ten
 targets, its own inherited lint policy and formatter check. Stable fuzz
 compilation and nightly fuzz execution are separate checks.

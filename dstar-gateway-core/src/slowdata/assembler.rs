@@ -186,8 +186,8 @@ mod tests {
     fn text_block_waits_for_both_halves() -> TestResult {
         let mut asm = SlowDataAssembler::new();
         assert!(push_descrambled(&mut asm, [0x40, b'H', b'E']).is_none());
-        let block = push_descrambled(&mut asm, [b'L', b'L', b'O'])
-            .ok_or("expected text block after second half")?;
+        let block =
+            push_descrambled(&mut asm, *b"LLO").ok_or("expected text block after second half")?;
         assert!(
             matches!(&block, SlowDataBlock::Text(t) if t.as_bytes() == b"HELLO"),
             "expected Text(HELLO), got {block:?}"
@@ -201,8 +201,8 @@ mod tests {
         let mut asm = SlowDataAssembler::new();
         assert!(push_descrambled(&mut asm, [0x43, b'H', b'E']).is_none());
         // Frame 2: ['L', 'L', 'O'] = remaining 3 payload bytes
-        let block = push_descrambled(&mut asm, [b'L', b'L', b'O'])
-            .ok_or("expected block after second frame")?;
+        let block =
+            push_descrambled(&mut asm, *b"LLO").ok_or("expected block after second frame")?;
         assert!(
             matches!(&block, SlowDataBlock::Text(t) if t.as_bytes() == b"HELLO" && t.text() == Ok("HELLO")),
             "expected Text(\"HELLO\"), got {block:?}"
@@ -302,12 +302,12 @@ mod tests {
         let header = test_header();
         let encoded = header.encode();
         let mut asm = SlowDataAssembler::new();
-        for chunk in encoded
+        for &[first, second, third, fourth, fifth] in encoded
             .get(..40)
             .ok_or("header prefix missing")?
-            .chunks_exact(BLOCK_PAYLOAD_LEN)
+            .as_chunks::<BLOCK_PAYLOAD_LEN>()
+            .0
         {
-            let [first, second, third, fourth, fifth] = <[u8; BLOCK_PAYLOAD_LEN]>::try_from(chunk)?;
             let block = [0x55, first, second, third, fourth, fifth];
             assert!(push_block(&mut asm, block).is_none());
         }
@@ -324,12 +324,12 @@ mod tests {
         let final_byte = encoded.get_mut(40).ok_or("final header byte missing")?;
         *final_byte ^= 0x80;
         let mut asm = SlowDataAssembler::new();
-        for chunk in encoded
+        for &[first, second, third, fourth, fifth] in encoded
             .get(..40)
             .ok_or("header prefix missing")?
-            .chunks_exact(BLOCK_PAYLOAD_LEN)
+            .as_chunks::<BLOCK_PAYLOAD_LEN>()
+            .0
         {
-            let [first, second, third, fourth, fifth] = <[u8; BLOCK_PAYLOAD_LEN]>::try_from(chunk)?;
             let block = [0x55, first, second, third, fourth, fifth];
             assert!(push_block(&mut asm, block).is_none());
         }
@@ -346,8 +346,8 @@ mod tests {
         assert!(push_descrambled(&mut asm, [0x40, b'B', b'A']).is_none());
         assert!(asm.push([0x55, 0x2D, 0x16], 0).is_none());
         assert!(push_descrambled(&mut asm, [0x40, b'H', b'E']).is_none());
-        let block = push_descrambled(&mut asm, [b'L', b'L', b'O'])
-            .ok_or("text after sync did not complete")?;
+        let block =
+            push_descrambled(&mut asm, *b"LLO").ok_or("text after sync did not complete")?;
         assert!(matches!(block, SlowDataBlock::Text(text) if text.as_bytes() == b"HELLO"));
         Ok(())
     }

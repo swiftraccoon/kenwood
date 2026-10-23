@@ -91,9 +91,7 @@ mod tests {
 
     #[test]
     fn unknown_connect_tag_display() {
-        let err = DExtraError::UnknownConnectTag {
-            tag: [b'F', b'O', b'O'],
-        };
+        let err = DExtraError::UnknownConnectTag { tag: *b"FOO" };
         assert!(err.to_string().contains("46"));
     }
 }

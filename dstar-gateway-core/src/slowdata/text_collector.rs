@@ -217,13 +217,13 @@ mod tests {
             &mut c,
             &[
                 [0x40, b'C', b'Q'],
-                [b' ', b'w', b'o'],
+                *b" wo",
                 [0x41, b'r', b'k'],
-                [b'i', b'n', b'g'],
+                *b"ing",
                 [0x42, b' ', b' '],
-                [b' ', b' ', b' '],
+                *b"   ",
                 [0x43, b' ', b' '],
-                [b' ', b' ', b' '],
+                *b"   ",
             ],
         );
         let msg = c.take_message().ok_or("complete message")?;
@@ -238,13 +238,13 @@ mod tests {
             &mut c,
             &[
                 [0x42, b'C', b'C'],
-                [b'C', b'C', b'C'],
+                *b"CCC",
                 [0x40, b'A', b'A'],
-                [b'A', b'A', b'A'],
+                *b"AAA",
                 [0x43, b'D', b'D'],
-                [b'D', b'D', b'D'],
+                *b"DDD",
                 [0x41, b'B', b'B'],
-                [b'B', b'B', b'B'],
+                *b"BBB",
             ],
         );
         let msg = c.take_message().ok_or("complete message")?;
@@ -257,12 +257,7 @@ mod tests {
         let mut c = SlowDataTextCollector::new();
         feed(
             &mut c,
-            &[
-                [0x40, b'A', b'B'],
-                [b'C', b'D', b'E'],
-                [0x41, b'F', b'G'],
-                [b'H', b'I', b'J'],
-            ],
+            &[[0x40, b'A', b'B'], *b"CDE", [0x41, b'F', b'G'], *b"HIJ"],
         );
         assert!(c.message().is_none());
         assert!(c.take_message().is_none());
@@ -273,22 +268,12 @@ mod tests {
         let mut c = SlowDataTextCollector::new();
         feed(
             &mut c,
-            &[
-                [0x40, b'X', b'Y'],
-                [b'Z', b'!', b'!'],
-                [0x41, b'1', b'2'],
-                [b'3', b'4', b'5'],
-            ],
+            &[[0x40, b'X', b'Y'], *b"Z!!", [0x41, b'1', b'2'], *b"345"],
         );
         c.reset();
         feed(
             &mut c,
-            &[
-                [0x40, b'N', b'E'],
-                [b'W', b' ', b' '],
-                [0x41, b' ', b' '],
-                [b' ', b' ', b' '],
-            ],
+            &[[0x40, b'N', b'E'], *b"W  ", [0x41, b' ', b' '], *b"   "],
         );
         assert!(c.message().is_none());
     }
@@ -302,13 +287,13 @@ mod tests {
             &mut c,
             &[
                 [0x40, b'H', b'I'],
-                [b'!', b'!', b'!'],
+                *b"!!!",
                 [0x41, b' ', b' '],
-                [b' ', b' ', b' '],
+                *b"   ",
                 [0x42, b' ', b' '],
-                [b' ', b' ', b' '],
+                *b"   ",
                 [0x43, b' ', b' '],
-                [b' ', b' ', b' '],
+                *b"   ",
             ],
         );
         let msg = c.take_message().ok_or("message after resync")?;
@@ -323,9 +308,9 @@ mod tests {
             &mut c,
             &[
                 [0x55, b'V', b'E'],
-                [b'3', b'O', b'E'],
+                *b"3OE",
                 [0x35, b'$', b'G'],
-                [b'P', b'G', b'G'],
+                *b"PGG",
                 [0xC0, 0x12, 0x34],
                 [0x56, 0x78, 0x9A],
             ],
@@ -338,12 +323,7 @@ mod tests {
         let mut c = SlowDataTextCollector::new();
         feed(
             &mut c,
-            &[
-                [0x44, b'X', b'X'],
-                [b'X', b'X', b'X'],
-                [0x4F, b'Y', b'Y'],
-                [b'Y', b'Y', b'Y'],
-            ],
+            &[[0x44, b'X', b'X'], *b"XXX", [0x4F, b'Y', b'Y'], *b"YYY"],
         );
         assert!(c.message().is_none());
     }
@@ -355,13 +335,13 @@ mod tests {
             &mut c,
             &[
                 [0x40, b'H', b'e'],
-                [b'l', b'l', b'o'],
+                *b"llo",
                 [0x41, b' ', b'w'],
-                [b'o', b'r', b'l'],
+                *b"orl",
                 [0x42, b'd', b' '],
-                [b' ', b' ', b' '],
+                *b"   ",
                 [0x43, b' ', b' '],
-                [b' ', b' ', b' '],
+                *b"   ",
             ],
         );
         let taken = c.take_message().ok_or("message ready")?;

@@ -6,11 +6,7 @@ use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
     let mut asm = SlowDataAssembler::default();
-    for (index, chunk) in data.chunks_exact(3).enumerate() {
-        let [first, second, third] = chunk else {
-            unreachable!("chunks_exact yields complete three-byte chunks");
-        };
-        let arr = [*first, *second, *third];
+    for (index, &arr) in data.as_chunks::<3>().0.iter().enumerate() {
         assert_eq!(
             descramble(scramble(arr)),
             arr,

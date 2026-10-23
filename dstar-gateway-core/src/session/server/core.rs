@@ -478,7 +478,6 @@ impl ServerSessionCore {
                 });
                 // Enqueue an 8-byte OKRW reply.
                 self.enqueue_dplus_link2_reply(now, Link2Result::Accept)?;
-                Ok(())
             }
             InternalState::Linked | InternalState::Streaming => {
                 // Already linked. If it's the same callsign, idempotent
@@ -488,15 +487,14 @@ impl ServerSessionCore {
                 } else {
                     self.enqueue_dplus_link2_reply(now, Link2Result::Busy)?;
                 }
-                Ok(())
             }
             InternalState::Unknown | InternalState::Unlinking | InternalState::Closed => {
                 // LINK2 without LINK1: drop silently. The real client
                 // will retransmit LINK1 on its own retry timer. Safest
                 // path: do nothing.
-                Ok(())
             }
         }
+        Ok(())
     }
 
     fn enqueue_dplus_link2_reply(

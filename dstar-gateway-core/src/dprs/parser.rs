@@ -202,7 +202,7 @@ mod tests {
         assert!(south.latitude().degrees() < 0.0 && south.longitude().degrees() > 0.0);
         assert_eq!(south.symbol().table(), SymbolTable::Alternate);
         assert_eq!(south.symbol().code().as_char(), 'K');
-        assert!(south.comment().as_str().is_empty());
+        assert_eq!(south.comment().as_str(), "");
         Ok(())
     }
 

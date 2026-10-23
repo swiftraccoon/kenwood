@@ -90,9 +90,7 @@ mod tests {
 
     #[test]
     fn voice_magic_missing_display() {
-        let err = DcsError::VoiceMagicMissing {
-            got: [b'X', b'X', b'X', b'X'],
-        };
+        let err = DcsError::VoiceMagicMissing { got: *b"XXXX" };
         let s = err.to_string();
         assert!(s.contains("58"), "display should contain hex of 'X' (0x58)");
     }
@@ -105,9 +103,7 @@ mod tests {
 
     #[test]
     fn unknown_connect_tag_display() {
-        let err = DcsError::UnknownConnectTag {
-            tag: [b'F', b'O', b'O'],
-        };
+        let err = DcsError::UnknownConnectTag { tag: *b"FOO" };
         assert!(
             err.to_string().contains("46"),
             "display should contain hex of 'F'"

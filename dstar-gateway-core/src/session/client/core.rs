@@ -853,7 +853,6 @@ impl SessionCore {
                     // DPlus servers echo the 5-byte packet on unlink too.
                     self.finalize_disconnect(DisconnectReason::UnlinkAcked);
                 }
-                Ok(())
             }
             dplus::ServerPacket::Link2Reply { result } => {
                 if self.state == ClientStateKind::Connecting {
@@ -866,7 +865,6 @@ impl SessionCore {
                         }
                     }
                 }
-                Ok(())
             }
             dplus::ServerPacket::Link2Echo { callsign } => {
                 // Some DPlus servers echo the full 28-byte LINK2 instead
@@ -875,23 +873,19 @@ impl SessionCore {
                 {
                     self.finalize_connected(peer, now);
                 }
-                Ok(())
             }
             dplus::ServerPacket::UnlinkAck => {
                 if self.state == ClientStateKind::Disconnecting {
                     self.finalize_disconnect(DisconnectReason::UnlinkAcked);
                 }
-                Ok(())
             }
             dplus::ServerPacket::PollEcho => {
                 self.arm_keepalive_inactivity(now);
                 self.events.push_back(RawEvent::PollEcho { peer });
-                Ok(())
             }
             dplus::ServerPacket::VoiceHeader { stream_id, header } => {
                 self.arm_keepalive_inactivity(now);
                 self.emit_voice_start_if_new(now, stream_id, header);
-                Ok(())
             }
             dplus::ServerPacket::VoiceData {
                 stream_id,
@@ -900,14 +894,13 @@ impl SessionCore {
             } => {
                 self.arm_keepalive_inactivity(now);
                 self.emit_voice_frame(now, stream_id, seq, frame);
-                Ok(())
             }
             dplus::ServerPacket::VoiceEot { stream_id, seq: _ } => {
                 self.arm_keepalive_inactivity(now);
                 self.emit_voice_end(stream_id, VoiceEndReason::Eot);
-                Ok(())
             }
         }
+        Ok(())
     }
 
     #[expect(
@@ -959,7 +952,6 @@ impl SessionCore {
                 {
                     self.finalize_connected(peer, now);
                 }
-                Ok(())
             }
             dextra::ServerPacket::ConnectNak {
                 callsign,
@@ -982,17 +974,14 @@ impl SessionCore {
                     // module-space. Treat it as the unlink ACK.
                     self.finalize_disconnect(DisconnectReason::UnlinkAcked);
                 }
-                Ok(())
             }
             dextra::ServerPacket::PollEcho { .. } => {
                 self.arm_keepalive_inactivity(now);
                 self.events.push_back(RawEvent::PollEcho { peer });
-                Ok(())
             }
             dextra::ServerPacket::VoiceHeader { stream_id, header } => {
                 self.arm_keepalive_inactivity(now);
                 self.emit_voice_start_if_new(now, stream_id, header);
-                Ok(())
             }
             dextra::ServerPacket::VoiceData {
                 stream_id,
@@ -1001,14 +990,13 @@ impl SessionCore {
             } => {
                 self.arm_keepalive_inactivity(now);
                 self.emit_voice_frame(now, stream_id, seq, frame);
-                Ok(())
             }
             dextra::ServerPacket::VoiceEot { stream_id, seq: _ } => {
                 self.arm_keepalive_inactivity(now);
                 self.emit_voice_end(stream_id, VoiceEndReason::Eot);
-                Ok(())
             }
         }
+        Ok(())
     }
 
     #[expect(
@@ -1057,7 +1045,6 @@ impl SessionCore {
                 {
                     self.finalize_connected(peer, now);
                 }
-                Ok(())
             }
             dcs::ServerPacket::ConnectNak {
                 callsign,
@@ -1078,12 +1065,10 @@ impl SessionCore {
                 {
                     self.finalize_disconnect(DisconnectReason::UnlinkAcked);
                 }
-                Ok(())
             }
             dcs::ServerPacket::PollEcho { .. } => {
                 self.arm_keepalive_inactivity(now);
                 self.events.push_back(RawEvent::PollEcho { peer });
-                Ok(())
             }
             dcs::ServerPacket::Voice {
                 header,
@@ -1107,9 +1092,9 @@ impl SessionCore {
                     self.emit_voice_start_if_new(now, stream_id, header);
                     self.emit_voice_frame(now, stream_id, seq, frame);
                 }
-                Ok(())
             }
         }
+        Ok(())
     }
 
     /// Queue only the active stream's frame and renew its activity timer.
@@ -2056,7 +2041,7 @@ mod tests {
     #[test]
     fn drain_diagnostics_is_empty_on_fresh_core() {
         let mut core = new_dextra();
-        assert!(core.drain_diagnostics().is_empty());
+        assert_eq!(core.drain_diagnostics(), []);
     }
 
     // ── Error paths ───────────────────────────────────────────
