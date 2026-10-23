@@ -14,14 +14,9 @@ options:
 
 settings:
   base:
-    # Swift 5 language mode because UniFFI 0.31's generated
-    # callback-interface vtable declares a non-Sendable public static
-    # (`static let vtablePtr: UnsafePointer<UniffiVTable...>`), which
-    # fails under Swift 6 language mode regardless of strict-concurrency
-    # level. Our hand-written code already targets Swift 6 idioms
-    # (async/await, actors, `@Observable`); the language mode only
-    # relaxes the "all publics Sendable" rule. Revisit when UniFFI
-    # ships a Swift 6 compatible bindgen.
+    # Compile generated callback interfaces in Swift 5 mode with complete
+    # strict concurrency. Check language-mode changes against regenerated
+    # bindings on both native app targets.
     SWIFT_VERSION: "5.10"
     SWIFT_STRICT_CONCURRENCY: complete
     DEVELOPMENT_TEAM: ""

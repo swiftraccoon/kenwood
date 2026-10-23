@@ -18,4 +18,4 @@ Never run window-hosting GUI experiments unattended; the reason is in
 - One CAT/MCP owner is active at a time. Connection probing never changes Menu 650: an MMDVM answer leads to a same-radio transport handoff or a separately confirmed recovery, never an automatic Menu 650 write.
 - The on-device model proposes catalog setting identifiers and typed values only, never raw CAT bytes or memory offsets, and nothing reaches the radio until the operator accepts the validated diff.
 - Hardware tests are opt-in by environment variable: `AZIMUTH_HARDWARE_IPAD_MMDVM_PROMPT=1`, `AZIMUTH_HARDWARE_BLUETOOTH_PRIMARY=1` and the destructive `AZIMUTH_HARDWARE_BLUETOOTH_RECOVERY=1`. `AZIMUTH_VERBOSE_USB_TRACE=1` enables packet-level tracing.
-- `SWIFT_VERSION` is 5 with complete strict concurrency; read the UniFFI 0.31 Swift 6 limitation in `lodestar/AGENTS.md` before changing it.
+- `SWIFT_VERSION` is 5 with complete strict concurrency. A language-mode change requires regenerating the UniFFI bindings and checking both app targets.

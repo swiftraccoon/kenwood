@@ -78,7 +78,7 @@ unit tests (`RailState`-style), and that is the only automated layout-test layer
 
 ## Swift and FFI
 
-- `SWIFT_VERSION: "5.10"` with `SWIFT_STRICT_CONCURRENCY: complete`. Forced by UniFFI 0.31, whose callback-interface scaffolding fails under Swift 6 language mode regardless of strict-concurrency level. Hand-written Swift still uses Swift 6 idioms.
+- Compile generated callback bindings with `SWIFT_VERSION: "5.10"` and `SWIFT_STRICT_CONCURRENCY: complete`. A language-mode change requires regenerating bindings and checking both app targets. Hand-written Swift still uses Swift 6 idioms.
 - The CAT, reflector and UniFFI contracts are owned by `lodestar-core/AGENTS.md`; do not restate them here. Swift-side consequence worth keeping: proc-macro exports map `Vec<u8>` to `Data` while UDL `sequence<u8>` maps to `[UInt8]`. Bridge at call sites with `Array(data)` / `Data(array)`.
 - `ReflectorObserver` callbacks arrive on a background tokio task: hop to the main actor before touching `@Observable` state, and never block inside a callback.
 - Switch over `ReflectorEvent` exhaustively; new variants are a Swift-side breaking change.
