@@ -25,9 +25,9 @@ if-dsp = { path = "../if-dsp" }
 kenwood-thd75 = { path = "../thd75" }
 # Matches sextant's cpal pin: two cpal majors cannot coexist (the
 # alsa-sys `links = "alsa"` value must be unique in the graph).
-cpal = "0.15"
-rustyline = "18"
-tokio = { version = "1", features = ["rt", "time"] }
+cpal = "0.18.2"
+rustyline = "19.0.0"
+tokio = { version = "1.54.1", features = ["rt", "time"] }
 
 [dev-dependencies]
 thd75-repl = { path = "../thd75-repl" }

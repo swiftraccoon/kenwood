@@ -139,8 +139,8 @@ fn find_audio_devices() -> Result<(cpal::Device, cpal::Device), String> {
         .input_devices()
         .map_err(|e| format!("listing audio inputs: {e}"))?;
     for device in devices {
-        if let Ok(name) = device.name()
-            && name.contains("ADC stream IN")
+        if let Ok(description) = device.description()
+            && description.name().contains("ADC stream IN")
         {
             input = Some(device);
             break;
@@ -336,10 +336,10 @@ fn run_session(
     let in_config = input_dev
         .default_input_config()
         .map_err(|e| format!("input config: {e}"))?;
-    if in_config.sample_rate().0 != 48_000 {
+    if in_config.sample_rate() != 48_000 {
         return Err(format!(
             "the radio's audio interface reports {} hertz; expected 48000",
-            in_config.sample_rate().0
+            in_config.sample_rate()
         ));
     }
     if in_config.sample_format() != cpal::SampleFormat::F32 {
@@ -352,7 +352,7 @@ fn run_session(
     let in_shared = Arc::clone(&shared);
     let input_stream = input_dev
         .build_input_stream(
-            &in_config.into(),
+            in_config.into(),
             move |data: &[f32], _info: &cpal::InputCallbackInfo| {
                 let _ = in_shared.in_blocks.fetch_add(1, Ordering::Relaxed);
                 // Mono IF: keep the first channel of each frame.
@@ -379,7 +379,7 @@ fn run_session(
         ));
     }
     let out_channels = usize::from(out_config.channels());
-    let out_rate = out_config.sample_rate().0;
+    let out_rate = out_config.sample_rate();
     if out_rate != 48_000 {
         return Err(format!(
             "the output device runs at {out_rate} hertz; set it to 48000 in Audio MIDI Setup"
@@ -389,7 +389,7 @@ fn run_session(
     let mut pending: VecDeque<f32> = VecDeque::new();
     let output_stream = output_dev
         .build_output_stream(
-            &out_config.into(),
+            out_config.into(),
             move |data: &mut [f32], _info: &cpal::OutputCallbackInfo| {
                 let _ = out_shared.out_blocks.fetch_add(1, Ordering::Relaxed);
                 while let Ok(chunk) = rx_out.try_recv() {
@@ -594,6 +594,6 @@ fn print_restore_report(report: &IfTapRestoreReport) {
 ///
 /// Callback counters and underruns remain available through `status`; this
 /// hook does not record a separate device-error count.
-const fn tracing_error(e: &cpal::StreamError) {
+const fn tracing_error(e: &cpal::Error) {
     let _ = e;
 }
