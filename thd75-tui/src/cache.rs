@@ -158,7 +158,7 @@ fn reserve_temporary(path: &Path, parent: &Path) -> Result<(PathBuf, File), Cach
     let name = path.file_name().ok_or(CacheError::MissingFileName)?;
     for _ in 0..32 {
         let sequence = TEMP_SEQUENCE
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                 value.checked_add(1)
             })
             .map_err(|_exhausted| CacheError::NameExhausted)?;
@@ -226,7 +226,7 @@ mod tests {
         fn new() -> std::io::Result<Self> {
             for _ in 0..32 {
                 let sequence = TEMP_SEQUENCE
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
                         value.checked_add(1)
                     })
                     .map_err(|_error| std::io::Error::other("fixture names exhausted"))?;

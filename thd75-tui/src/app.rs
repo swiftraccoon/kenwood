@@ -1384,10 +1384,8 @@ impl App {
                 KeyCode::Backspace => {
                     let _ = buf.pop();
                 }
-                KeyCode::Char(c) => {
-                    if buf.len().saturating_add(c.len_utf8()) <= INPUT_CAPACITY {
-                        buf.push(c);
-                    }
+                KeyCode::Char(c) if buf.len().saturating_add(c.len_utf8()) <= INPUT_CAPACITY => {
+                    buf.push(c);
                 }
                 _ => {}
             }
@@ -1421,10 +1419,10 @@ impl App {
                 KeyCode::Backspace => {
                     let _ = buf.pop();
                 }
-                KeyCode::Char(c) => {
-                    if buf.len().saturating_add(c.len_utf8()) <= DstarCallsign::MAX_LEN {
-                        buf.push(c.to_ascii_uppercase());
-                    }
+                KeyCode::Char(c)
+                    if buf.len().saturating_add(c.len_utf8()) <= DstarCallsign::MAX_LEN =>
+                {
+                    buf.push(c.to_ascii_uppercase());
                 }
                 _ => {}
             }
@@ -1453,13 +1451,11 @@ impl App {
                 KeyCode::Backspace => {
                     let _ = buf.pop();
                 }
-                KeyCode::Char(c) => {
-                    // Only characters that can appear in a reflector spec:
-                    // rejecting non-ASCII here keeps the buffer single-byte
-                    // per char, so parsing can never split a char boundary.
-                    if buf.len() < INPUT_CAPACITY && (c.is_ascii_alphanumeric() || c == ' ') {
-                        buf.push(c.to_ascii_uppercase());
-                    }
+                // Reflector specifications use one-byte ASCII characters.
+                KeyCode::Char(c)
+                    if buf.len() < INPUT_CAPACITY && (c.is_ascii_alphanumeric() || c == ' ') =>
+                {
+                    buf.push(c.to_ascii_uppercase());
                 }
                 _ => {}
             }
@@ -3145,7 +3141,7 @@ impl App {
     /// Sort stations by most recently heard.
     fn sort_aprs_stations(&mut self) {
         self.aprs_stations
-            .sort_by(|a, b| b.last_heard.cmp(&a.last_heard));
+            .sort_by_key(|station| std::cmp::Reverse(station.last_heard));
         self.aprs_stations.truncate(APRS_STATION_CAPACITY);
         self.aprs_station_index = self
             .aprs_station_index

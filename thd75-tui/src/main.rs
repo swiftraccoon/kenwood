@@ -164,7 +164,10 @@ fn apply_ui_message(app: &mut App, message: app::Message) -> io::Result<bool> {
     }
 }
 
-async fn run_app(cli: &Cli, retry: Option<radio_task::Endpoint>) -> Result<RunOutcome, RunFailure> {
+async fn run_app(
+    cli: &Cli,
+    retry: Option<radio_task::Endpoint>,
+) -> Result<RunOutcome, Box<RunFailure>> {
     let request = retry.map_or_else(
         || radio_task::ConnectionRequest::Discover {
             port: cli.port.clone(),
@@ -182,10 +185,10 @@ async fn run_app(cli: &Cli, retry: Option<radio_task::Endpoint>) -> Result<RunOu
             )));
         }
         Err(error) => {
-            return Err(RunFailure {
+            return Err(Box::new(RunFailure {
                 operation: Some(Box::new(error)),
                 ..RunFailure::default()
-            });
+            }));
         }
     };
     let (mut events, commands) = event::EventHandler::new();
@@ -194,7 +197,7 @@ async fn run_app(cli: &Cli, retry: Option<radio_task::Endpoint>) -> Result<RunOu
             .await
         {
             Ok(connected) => connected,
-            Err(error) => return Ok(RunOutcome::ConnectFailed(Box::new(error))),
+            Err(error) => return Ok(RunOutcome::ConnectFailed(error)),
         };
     let mut failure = RunFailure::default();
     let mut session = terminal::TerminalSession::default();
@@ -236,7 +239,7 @@ async fn run_app(cli: &Cli, retry: Option<radio_task::Endpoint>) -> Result<RunOu
     if failure.is_empty() {
         Ok(RunOutcome::Quit)
     } else {
-        Err(failure)
+        Err(Box::new(failure))
     }
 }
 

@@ -365,13 +365,13 @@ pub(crate) async fn spawn_with_transport(
     transport: EitherTransport,
     tx: mpsc::UnboundedSender<Message>,
     cmd_rx: mpsc::Receiver<RadioCommand>,
-) -> Result<(String, RadioWorker), ConnectFailure> {
+) -> Result<(String, RadioWorker), Box<ConnectFailure>> {
     let endpoint = Endpoint::from_transport(path.clone(), baud, &transport);
     let mut radio = Radio::new(transport);
     if let Err(error) = radio.identify().await {
         let diagnosis = radio.probe_silent_link().await;
         let release = radio.disconnect().await.err();
-        return Err(ConnectFailure {
+        return Err(Box::new(ConnectFailure {
             message: format!(
                 "Could not establish CAT control: {error}. {}",
                 diagnosis.guidance()
@@ -380,28 +380,28 @@ pub(crate) async fn spawn_with_transport(
             diagnosis: Some(diagnosis),
             release,
             retry: Some(endpoint),
-        });
+        }));
     }
     let serial = match radio.get_serial_information().await {
         Ok(identity) => identity.serial_number().clone(),
         Err(error) => {
-            return Err(ConnectFailure {
+            return Err(Box::new(ConnectFailure {
                 message: format!("CAT serial identity unavailable: {error}"),
                 cause: ConnectionCause::Radio(error),
                 diagnosis: None,
                 release: radio.disconnect().await.err(),
                 retry: Some(endpoint),
-            });
+            }));
         }
     };
     if let Err(error) = radio.set_auto_info(true).await {
-        return Err(ConnectFailure {
+        return Err(Box::new(ConnectFailure {
             message: format!("Auto-information setup failed: {error}"),
             cause: ConnectionCause::Radio(error),
             diagnosis: None,
             release: radio.disconnect().await.err(),
             retry: Some(endpoint),
-        });
+        }));
     }
     let (stop, stopped) = watch::channel(false);
     let inputs = WorkerInputs {
@@ -451,7 +451,7 @@ where
     T: Transport,
     F: FnMut(Endpoint, SerialNumber, mpsc::UnboundedSender<Message>, watch::Receiver<bool>) -> Fut
         + Send,
-    Fut: Future<Output = Result<Option<Radio<T>>, WorkerCompletion>> + Send,
+    Fut: Future<Output = Result<Option<Radio<T>>, Box<WorkerCompletion>>> + Send,
 {
     let WorkerInputs {
         endpoint,
@@ -496,7 +496,7 @@ where
                 let _send = tx.send(Message::Reconnected);
             }
             Ok(None) => return completion,
-            Err(failure) => return failure,
+            Err(failure) => return *failure,
         }
     }
     completion.release = radio.disconnect().await.err();
@@ -665,7 +665,7 @@ async fn reconnect(
     serial: &SerialNumber,
     tx: &mpsc::UnboundedSender<Message>,
     stop: &mut watch::Receiver<bool>,
-) -> Result<Option<Radio<EitherTransport>>, WorkerCompletion> {
+) -> Result<Option<Radio<EitherTransport>>, Box<WorkerCompletion>> {
     loop {
         if *stop.borrow() || tx.is_closed() {
             return Ok(None);
@@ -682,10 +682,10 @@ async fn reconnect(
                 Vec::new()
             }
             Err(error) => {
-                return Err(WorkerCompletion {
+                return Err(Box::new(WorkerCompletion {
                     task: Some(error),
                     ..WorkerCompletion::default()
-                });
+                }));
             }
         };
         // Each candidate is opened only after the previous candidate is closed.
@@ -698,19 +698,19 @@ async fn reconnect(
                 Ok(Ok(transport)) => transport,
                 Ok(Err(error)) => {
                     if error.prevents_replacement() {
-                        return Err(WorkerCompletion {
+                        return Err(Box::new(WorkerCompletion {
                             open: Some(error),
                             ..WorkerCompletion::default()
-                        });
+                        }));
                     }
                     let _send = tx.send(Message::ConnectionError(Arc::new(error)));
                     continue;
                 }
                 Err(error) => {
-                    return Err(WorkerCompletion {
+                    return Err(Box::new(WorkerCompletion {
                         task: Some(error),
                         ..WorkerCompletion::default()
-                    });
+                    }));
                 }
             };
             let mut radio = Radio::new(transport);
@@ -724,11 +724,11 @@ async fn reconnect(
                     if let Err(error) = radio.set_auto_info(true).await {
                         let release = radio.disconnect().await.err();
                         if let Some(release) = release {
-                            return Err(WorkerCompletion {
+                            return Err(Box::new(WorkerCompletion {
                                 operations: vec![error],
                                 release: Some(release),
                                 ..WorkerCompletion::default()
-                            });
+                            }));
                         }
                         let _send = tx.send(Message::RadioError(RadioFailure(Arc::new(error))));
                         continue;
@@ -745,10 +745,10 @@ async fn reconnect(
                 }
             }
             if let Err(error) = radio.disconnect().await {
-                return Err(WorkerCompletion {
+                return Err(Box::new(WorkerCompletion {
                     release: Some(error),
                     ..WorkerCompletion::default()
-                });
+                }));
             }
             if *stop.borrow() {
                 return Ok(None);
@@ -905,7 +905,8 @@ async fn enter_aprs_session<T: Transport>(
 ) -> (Radio<T>, Vec<Error>) {
     let mut client = match kenwood_thd75::AprsClient::start(radio, config).await {
         Ok(client) => client,
-        Err((radio, error)) => {
+        Err(failure) => {
+            let (radio, error) = *failure;
             let _send = tx.send(Message::AprsRecoveryFailed(error.to_string()));
             return (radio, vec![error]);
         }
@@ -930,7 +931,8 @@ async fn enter_aprs_session<T: Transport>(
             let _send = tx.send(Message::AprsStopped);
             (radio, errors)
         }
-        Err((desynced, error)) => {
+        Err(failure) => {
+            let (desynced, error) = *failure;
             errors.push(error);
             let _send = tx.send(Message::AprsRecoveryFailed(
                 "CAT restoration failed; connection must close".to_owned(),
@@ -982,26 +984,35 @@ mod tests {
         fail: bool,
     }
     impl Transport for CloseProbe {
-        async fn write(&mut self, _bytes: &[u8]) -> Result<(), TransportError> {
-            let _previous = self.writes.fetch_add(1, Ordering::AcqRel);
-            Err(TransportError::Write(std::io::Error::other(
-                "unexpected fixture write",
-            )))
+        fn write(&mut self, _bytes: &[u8]) -> impl Future<Output = Result<(), TransportError>> {
+            std::future::poll_fn(move |_| {
+                let _previous = self.writes.fetch_add(1, Ordering::AcqRel);
+                std::task::Poll::Ready(Err(TransportError::Write(std::io::Error::other(
+                    "unexpected fixture write",
+                ))))
+            })
         }
-        async fn read(&mut self, _bytes: &mut [u8]) -> Result<usize, TransportError> {
-            Err(TransportError::Read(std::io::Error::other(
-                "unexpected fixture read",
-            )))
+        fn read(
+            &mut self,
+            _bytes: &mut [u8],
+        ) -> impl Future<Output = Result<usize, TransportError>> {
+            std::future::poll_fn(|_| {
+                std::task::Poll::Ready(Err(TransportError::Read(std::io::Error::other(
+                    "unexpected fixture read",
+                ))))
+            })
         }
-        async fn close(&mut self) -> Result<(), TransportError> {
-            let _previous = self.closes.fetch_add(1, Ordering::AcqRel);
-            if self.fail {
-                Err(TransportError::Disconnected(std::io::Error::other(
-                    "fixture close failure",
-                )))
-            } else {
-                Ok(())
-            }
+        fn close(&mut self) -> impl Future<Output = Result<(), TransportError>> {
+            std::future::poll_fn(move |_| {
+                let _previous = self.closes.fetch_add(1, Ordering::AcqRel);
+                std::task::Poll::Ready(if self.fail {
+                    Err(TransportError::Disconnected(std::io::Error::other(
+                        "fixture close failure",
+                    )))
+                } else {
+                    Ok(())
+                })
+            })
         }
     }
 
@@ -1034,10 +1045,10 @@ mod tests {
                 radio,
                 inputs,
                 |_endpoint, _serial, _messages, _stop| async {
-                    Err(WorkerCompletion {
+                    Err(Box::new(WorkerCompletion {
                         operations: vec![Error::CatRecoveryRequired],
                         ..WorkerCompletion::default()
-                    })
+                    }))
                 },
             )
             .await;
