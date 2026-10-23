@@ -63,19 +63,12 @@ fn decode_utf16(raw: &[u8], path: &Path) -> Result<String> {
     if payload.len() % 2 != 0 {
         return Err(invalid());
     }
-    let units: Vec<u16> = payload
-        .chunks_exact(2)
-        .map(|pair| {
-            let low = pair.first().copied().unwrap_or_default();
-            let high = pair.get(1).copied().unwrap_or_default();
-            if big_endian {
-                u16::from_be_bytes([low, high])
-            } else {
-                u16::from_le_bytes([low, high])
-            }
-        })
-        .collect();
-    String::from_utf16(&units).map_err(|error| {
+    let decoded = if big_endian {
+        String::from_utf16be(payload)
+    } else {
+        String::from_utf16le(payload)
+    };
+    decoded.map_err(|error| {
         crate::ExtractError::source(
             format!("decode UTF-16 language file {}", path.display()),
             error,

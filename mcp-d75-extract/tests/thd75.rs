@@ -108,7 +108,10 @@ fn discovers_anchors_without_pinned_names() -> TestResult {
             .map(|(_, method)| method.method.as_str()),
         Some("a0")
     );
-    assert!(manifest.source().detail_classes.is_empty());
+    assert_eq!(
+        manifest.source().detail_classes,
+        Vec::<(String, String)>::new()
+    );
     Ok(())
 }
 
@@ -121,7 +124,7 @@ fn manifest_is_a_v4_superset_with_absolute_addresses() -> TestResult {
     assert_eq!(manifest.model().image_length, 500_480);
     assert_eq!(manifest.release().assembly_version, "1.0.8717.20367");
     assert_eq!(manifest.release().mcp_version, "1.03");
-    assert!(manifest.dimensions().is_empty());
+    assert_eq!(manifest.dimensions(), []);
     assert_eq!(manifest.summary().dimension_count, 0);
     assert_eq!(manifest.summary().slot_relative_field_count, 0);
     for operation in manifest

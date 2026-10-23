@@ -574,7 +574,7 @@ mod tests {
         base.stride = 1;
         assert!(base.bases(2).is_err());
         assert_eq!(base.bases(1)?, [u64::MAX]);
-        assert!(base.bases(0)?.is_empty());
+        assert_eq!(base.bases(0)?, Vec::<u64>::new());
         Ok(())
     }
 

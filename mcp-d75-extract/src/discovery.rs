@@ -923,8 +923,8 @@ mod tests {
         let radio = summary.menus.first().ok_or("no menus")?;
         assert_eq!(radio.write_method, "a0(m6 A_0)");
         assert!(radio.detail_class.is_none());
-        assert!(radio.slot_symbols.is_empty());
-        assert!(radio.record_lists.is_empty());
+        assert_eq!(radio.slot_symbols, Vec::<String>::new());
+        assert_eq!(radio.record_lists, Vec::<String>::new());
         Ok(())
     }
 

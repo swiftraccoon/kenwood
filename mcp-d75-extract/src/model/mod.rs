@@ -394,7 +394,7 @@ mod tests {
     #[test]
     fn thd75_spec_matches_the_reviewed_layout() {
         assert_eq!(THD75.menus.len(), 4);
-        assert!(THD75.dimensions.is_empty());
+        assert_eq!(THD75.dimensions, []);
         assert_eq!(THD75.records.len(), 7);
         assert_eq!(THD75.records_for("aprs").len(), 4);
         assert_eq!(THD75.private_writers_for("radio").len(), 2);
@@ -410,6 +410,6 @@ mod tests {
         assert!(THD75.record_domain("ObjectData", "ObjectSymbol").is_some());
         assert_eq!(THD75.record_symbols("MyPositionData").len(), 14);
         assert_eq!(THD75.record_symbols("ObjectData").len(), 12);
-        assert!(THD75.record_symbols("StatusTextData").is_empty());
+        assert_eq!(THD75.record_symbols("StatusTextData"), []);
     }
 }
