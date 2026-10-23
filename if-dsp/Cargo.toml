@@ -12,10 +12,10 @@ rust-version = "1.99"
 description = "Sans-io filtering and demodulation for low-IF audio streams"
 
 [dependencies]
-rustfft = "6"
+rustfft = "6.4.1"
 
 [dev-dependencies]
-proptest = "1"
+proptest = "1.12.0"
 
 [lints]
 workspace = true
