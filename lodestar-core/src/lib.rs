@@ -112,7 +112,7 @@ pub enum LogLevel {
 /// event to `os_log` with subsystem `org.swiftraccoon.lodestar.rust`
 /// so the crate's `tracing::debug!` / `tracing::trace!` calls end up in
 /// Apple's Unified Log and the app's Log Viewer.
-#[uniffi::export(with_foreign)]
+#[uniffi::export(rust, foreign)]
 pub trait LogSink: Send + Sync + std::fmt::Debug {
     /// Called once per tracing event. `target` is the
     /// `tracing::Event::metadata().target()` (usually the module path

@@ -23,7 +23,7 @@ path = "src/bin/uniffi-bindgen.rs"
 [dependencies]
 # UniFFI `tokio` feature enables `#[uniffi::export(async_runtime = "tokio")]`
 # which we need for the reflector session's async FFI surface.
-uniffi = { version = "0.31", features = ["cli", "tokio"] }
+uniffi = { version = "0.32.2", features = ["cli", "tokio"] }
 # Sans-io D-STAR types (Callsign, Module, ProtocolKind, hosts file parsing, etc.)
 dstar-gateway-core = { path = "../dstar-gateway-core" }
 # Async tokio shell for reflector sessions (UDP socket + session loop).
@@ -34,20 +34,20 @@ mmdvm-core = { path = "../mmdvm-core" }
 # always-enhanced on-device reflector audio monitoring.
 mbelib-rs = { path = "../mbelib-rs", features = ["wave-enhance"] }
 # Runtime: reused across FFI calls that drive reflector I/O.
-tokio = { version = "1", features = ["net", "time", "sync", "rt", "macros", "io-util"] }
+tokio = { version = "1.54.1", features = ["net", "time", "sync", "rt", "macros", "io-util"] }
 # Error wrapping for the FFI-visible ReflectorError enum.
-thiserror = "2"
+thiserror = "2.0.21"
 # Tracing for diagnostics inside the async session tasks.
-tracing = { version = "0.1", default-features = false }
+tracing = { version = "0.1.44", default-features = false }
 # Registry + filter layers used when we configure a subscriber.
-tracing-subscriber = { version = "0.3", features = ["registry", "env-filter"] }
+tracing-subscriber = { version = "0.3.23", features = ["registry", "env-filter"] }
 
 [build-dependencies]
-uniffi = { version = "0.31", features = ["build"] }
+uniffi = { version = "0.32.2", features = ["build"] }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["test-util"] }
-uniffi = { version = "0.31", features = ["bindgen-tests"] }
+tokio = { version = "1.54.1", features = ["test-util"] }
+uniffi = { version = "0.32.2", features = ["bindgen-tests"] }
 
 # KNOWN DIVERGENCE FROM WORKSPACE: inherit workspace strictness but opt
 # out of `unsafe_code` enforcement because UniFFI's generated scaffolding

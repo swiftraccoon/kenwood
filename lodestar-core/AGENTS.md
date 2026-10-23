@@ -32,8 +32,8 @@ workspace root from its own location.
 ## UniFFI gotchas (single owner for the workspace)
 
 - Mixed UDL plus `#[uniffi::export]` crates require `uniffi-bindgen generate --library <path/to/lib.a>`. UDL-only mode silently omits proc-macro items, and the generated Swift simply will not contain them.
+- Crate-local `uniffi.toml` is discovered through the enabled `cargo-metadata` feature. The `--config` argument accepts a global configuration, not the crate-local file.
 - `uniffi::export(async_runtime = "tokio")` needs the `"tokio"` feature on the `uniffi` dependency. Async methods on `#[derive(uniffi::Object)]` types take `self: Arc<Self>`.
-- UniFFI 0.31 pulls `getrandom` 0.4 alongside the 0.2 and 0.3 lines other dependencies use; `deny.toml` skips the two older release lines (`getrandom@0.2`, `getrandom@0.3`).
 
 ## Lint opt-outs versus the workspace
 

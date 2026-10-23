@@ -228,7 +228,6 @@ env CARGO_TARGET_DIR="${BINDGEN_TARGET_DIR}" \
     cargo run --manifest-path "${CRATE_DIR}/Cargo.toml" \
     --bin uniffi-bindgen -- generate \
     --library "${STAGING_DIR}/ios-device/${LIB_NAME}" \
-    --config "${CRATE_DIR}/uniffi.toml" \
     --language swift \
     --out-dir "${HEADERS_DIR}"
 

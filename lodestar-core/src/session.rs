@@ -436,7 +436,7 @@ pub enum ReflectorEvent {
 /// Swift implements this protocol and passes an instance when calling
 /// [`ReflectorSession::connect`]. The background task holds the observer via
 /// `Arc<dyn ReflectorObserver>` and releases it when the session ends.
-#[uniffi::export(with_foreign)]
+#[uniffi::export(rust, foreign)]
 pub trait ReflectorObserver: Send + Sync + std::fmt::Debug {
     /// Called once per reflector event. Must not block for long: the
     /// session task awaits completion before pumping the next event.
